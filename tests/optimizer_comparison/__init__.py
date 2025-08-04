@@ -1,1 +1,0 @@
-"""Optimizer comparison tests."""

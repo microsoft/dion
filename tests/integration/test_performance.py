@@ -274,7 +274,16 @@ class TestPerformance:
         # Sequential
         start_time = time.perf_counter()
         for model in models:
-            opt = DionReference(model.parameters(), lr=0.01)
+            # Separate matrix parameters (2D) from vector parameters (1D)
+            matrix_params = [p for p in model.parameters() if p.ndim == 2]  
+            vector_params = [p for p in model.parameters() if p.ndim != 2]
+            
+            param_groups = [
+                dict(params=matrix_params),  # uses dion algorithm by default
+                dict(params=vector_params, algorithm="lion")  # use lion for 1D params
+            ]
+            
+            opt = DionReference(param_groups, lr=0.01)
             for _ in range(10):
                 x = torch.randn(32, 512, device=device)
                 loss = model(x).sum()
