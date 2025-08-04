@@ -92,6 +92,9 @@ state = train_state.TrainState.create(
 2. **Parallelism**: Leverages JAX's `vmap`, `pmap`, and `jit` for automatic optimization
 3. **Random Number Generation**: Uses JAX's explicit RNG handling
 4. **Gradients**: Works with JAX's functional gradient computation
+5. **Static Parameters**: Some parameters like `oversample` must be static for JIT compilation
+   - In RCQR, the sketch matrix size is computed using a ceiling operation for stability
+   - This may use slightly more memory than PyTorch but has negligible impact on performance
 
 ### Performance Considerations
 

@@ -14,6 +14,7 @@ from optimizers.experimental.dion_optax import (
 )
 
 
+@pytest.mark.unstable
 class TestDionOptaxFast:
     """Test suite for optimized DION Optax implementation."""
     

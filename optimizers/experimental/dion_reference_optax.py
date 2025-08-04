@@ -5,7 +5,6 @@ Based on the PyTorch reference implementation in dion_reference.py
 https://arxiv.org/abs/2504.05295
 """
 
-import math
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, Union
@@ -85,7 +84,7 @@ def dion(
                 # Initialize DION state for matrix parameters
                 m, n = param.shape
                 r = int(rank_fraction * min(m, n))
-                r = rank_multiple_of * math.ceil(r / rank_multiple_of)
+                r = rank_multiple_of * int(jnp.ceil(r / rank_multiple_of))
                 r = min(r, m, n)
                 
                 # Determine Q shape based on transposition
@@ -141,7 +140,13 @@ def dion(
     def update_fn(updates, state, params):
         """Apply DION updates."""
         if callable(learning_rate):
-            lr = learning_rate(state.count)
+            # Get count from first state that has one
+            count = None
+            for s in state.values():
+                if hasattr(s, 'count') and s.count is not None:
+                    count = s.count
+                    break
+            lr = learning_rate(count if count is not None else 0)
         else:
             lr = learning_rate
         
@@ -155,7 +160,7 @@ def dion(
                     cqr_warmup_steps=cqr_warmup_steps,
                     rcqr_oversample=rcqr_oversample
                 )
-                return -new_param + param, new_state
+                return (new_param - param, new_state)
             
             elif algorithm == "adamw":
                 # AdamW update
@@ -164,7 +169,7 @@ def dion(
                     lr=lr, beta1=betas[0], beta2=betas[1],
                     weight_decay=weight_decay, eps=eps
                 )
-                return -new_param + param, new_state
+                return (new_param - param, new_state)
             
             else:  # lion or scalar parameters
                 # Lion update
@@ -173,22 +178,31 @@ def dion(
                     lr=lr, beta1=betas[0], beta2=betas[1],
                     weight_decay=weight_decay
                 )
-                return -new_param + param, new_state
+                return (new_param - param, new_state)
         
-        updates, new_state = tree_map(update_param, updates, state, params)
+        # Process each parameter and collect updates and states separately
+        all_updates = {}
+        all_new_states = {}
+        
+        for key in updates:
+            update, new_state_val = update_param(updates[key], state[key], params[key])
+            all_updates[key] = update
+            all_new_states[key] = new_state_val
+        
+        updates = all_updates
+        new_state = all_new_states
         
         # Increment step counter
-        new_state = tree_map(
-            lambda s: s._replace(count=s.count + 1) if s.count is not None else s,
-            new_state
-        )
+        for key in new_state:
+            if hasattr(new_state[key], 'count') and new_state[key].count is not None:
+                new_state[key] = new_state[key]._replace(count=new_state[key].count + 1)
         
         return updates, new_state
     
     return optax.GradientTransformation(init_fn, update_fn)
 
 
-@partial(jax.jit, static_argnames=('power_iters', 'qr_method', 'cqr_warmup_steps'))
+@partial(jax.jit, static_argnames=('power_iters', 'qr_method', 'cqr_warmup_steps', 'rcqr_oversample'))
 def dion_update(
     X: jnp.ndarray,  # Model weights
     G: jnp.ndarray,  # Gradient
@@ -228,7 +242,7 @@ def dion_update(
         M.T if is_transposed else M,
         Q,
         power_iters=power_iters,
-        qr_method=qr_method if step > cqr_warmup_steps else "rcqr",
+        qr_method=qr_method,
         oversample=rcqr_oversample,
         rng_key=subkey
     )
@@ -264,7 +278,6 @@ def dion_update(
     new_state = state._replace(
         momentum=M,
         Q=Q,
-        count=step + 1,
         rng_key=rng_key
     )
     
@@ -301,23 +314,22 @@ def orthogonalize(
     original_dtype = P.dtype
     
     if qr_method == "cqr":
-        # Cholesky QR
+        # Cholesky QR - may not be numerically stable
         P_32 = P.astype(jnp.float32)
-        try:
-            R = jnp.linalg.cholesky(P_32.T @ P_32)
-            Q = jax.scipy.linalg.solve_triangular(R, P_32.T, lower=False).T
-        except:
-            # Fallback to RCQR if Cholesky fails
-            qr_method = "rcqr"
+        R = jnp.linalg.cholesky(P_32.T @ P_32)
+        Q = jax.scipy.linalg.solve_triangular(R, P_32.T, lower=False).T
+        return Q.astype(original_dtype)
     
-    if qr_method == "qr" or (qr_method == "rcqr" and m <= n):
-        # Standard QR
+    elif qr_method == "qr" or (qr_method == "rcqr" and m <= n):
+        # Standard QR - returns Q with shape (m, min(m,n))
         Q, _ = jnp.linalg.qr(P.astype(jnp.float32))
+        return Q.astype(original_dtype)
     
-    if qr_method == "rcqr" and m > n:
+    else:  # qr_method == "rcqr" and m > n
         # Randomized Cholesky QR
-        k = math.ceil(oversample * n / 128.0) * 128
-        std = math.sqrt(1.0 / k)
+        # Use static computation for k to avoid tracing issues
+        k = min(int(oversample * n / 128.0 + 0.999) * 128, m)
+        std = 1.0 / jnp.sqrt(k)
         
         # Generate random sketch matrix
         if rng_key is not None:
@@ -329,15 +341,17 @@ def orthogonalize(
         SP = S @ P
         
         # QR decomposition
-        _, R = jnp.linalg.qr(SP.astype(jnp.float32))
+        Q_sp, R = jnp.linalg.qr(SP.astype(jnp.float32))
+        # Extract the R matrix (upper triangular part)
+        R = R[:n, :n]  # Only need the top-left n x n block
         Q = jax.scipy.linalg.solve_triangular(R, P.astype(jnp.float32).T, lower=False).T
         
         # Second iteration for better orthogonalization
         QQ = Q.T @ Q
         R = jnp.linalg.cholesky(QQ)
         Q = jax.scipy.linalg.solve_triangular(R, Q.T, lower=False).T
-    
-    return Q.astype(original_dtype)
+        
+        return Q.astype(original_dtype)
 
 
 def fix_all_zero_or_nan(
@@ -392,8 +406,7 @@ def adamw_update(
     
     new_state = state._replace(
         momentum=M,
-        variance=V,
-        count=step
+        variance=V
     )
     
     return new_state, X
@@ -424,7 +437,7 @@ def lion_update(
     # Update momentum
     M = beta2 * M + (1 - beta2) * G
     
-    new_state = state._replace(momentum=M, count=state.count + 1)
+    new_state = state._replace(momentum=M)
     
     return new_state, X
 
