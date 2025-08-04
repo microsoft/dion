@@ -67,7 +67,8 @@ class TestScalarUpdateFunctions:
         
         # Parameters
         lr = torch.tensor(0.001)
-        beta = torch.tensor(0.9)
+        beta1 = torch.tensor(0.9)
+        beta2 = torch.tensor(0.99)
         weight_decay = torch.tensor(0.01)
         
         # Store original for comparison
@@ -75,7 +76,7 @@ class TestScalarUpdateFunctions:
         
         # Call update function
         try:
-            lion_update(X, G, M, lr, beta, weight_decay)
+            lion_update(X, G, M, lr, beta1, beta2, weight_decay)
             
             # Check that parameters were updated
             assert not torch.allclose(X, X_orig), "Parameters were not updated"
@@ -112,8 +113,8 @@ class TestScalarUpdateFunctions:
                 beta1=torch.tensor(0.9),
                 beta2=torch.tensor(0.999),
                 weight_decay=torch.tensor(0.1),
-                epsilon=torch.tensor(1e-8),
-                step=torch.tensor(1)
+                step=1,
+                epsilon=1e-8
             )
             
             # Weight should decrease due to decay
@@ -132,7 +133,8 @@ class TestScalarUpdateFunctions:
             lion_update(
                 X_lion, G, M_lion,
                 lr=torch.tensor(0.1),
-                beta=torch.tensor(0.9),
+                beta1=torch.tensor(0.9),
+                beta2=torch.tensor(0.99),
                 weight_decay=torch.tensor(0.1)
             )
             
