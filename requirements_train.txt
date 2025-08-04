@@ -1,9 +1,5 @@
-numpy
-torch>=2.7.1
-triton
 huggingface-hub
 wandb
-einops 
 omegaconf
 datasets
 tiktoken

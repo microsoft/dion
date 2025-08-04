@@ -1,0 +1,4 @@
+setuptools
+pytest
+pytest-cov
+pylint

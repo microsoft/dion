@@ -41,9 +41,14 @@ This code is written for modern PyTorch (version 2.7 or newer) using DTensor-bas
 
 ## Quick Start
 
-Install dependencies:
+Install dependencies for Dion and training script:
 ```bash
-pip install -r requirements.txt
+pip install -e .[train]
+```
+
+Optimizers can also be installed in a standalone mode without the training script:
+```bash
+pip install git+https://github.com/microsoft/dion.git
 ```
 
 Download pretokenized FineWeb dataset:

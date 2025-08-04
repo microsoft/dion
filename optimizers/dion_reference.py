@@ -20,7 +20,7 @@ except ImportError:
 
 
 @dataclass
-class DionParamConfig:
+class _DionParamConfig:
     """
     Per-parameter configuration for Dion optimizer.
     """
@@ -191,7 +191,7 @@ class Dion(Optimizer):
 
         # This is intentionally not in self.state so it doesn't get checkpointed
         # State here may change upon resharding a checkpoint, so we recompute it
-        self._param_config: Dict[Tensor, DionParamConfig] = {}
+        self._param_config: Dict[Tensor, _DionParamConfig] = {}
 
         self._replicate_mesh = replicate_mesh
         self._outer_shard_mesh = outer_shard_mesh
@@ -393,7 +393,7 @@ class Dion(Optimizer):
             result = all_reduce(tensor, self._replicate_mesh)
             tensor.copy_(result)
 
-    def _get_dion_param_config(self, x: Tensor) -> DionParamConfig:
+    def _get_dion_param_config(self, x: Tensor) -> _DionParamConfig:
         """
         Get the Dion-specific parameter configuration for a given tensor.
         If the configuration is not already initialized, it will be created.
@@ -424,7 +424,7 @@ class Dion(Optimizer):
             )
 
         # State is initialized for both matrix and scalar parameters
-        config = DionParamConfig()
+        config = _DionParamConfig()
 
         # By default, we transpose matrices so that dim0 >= dim1
         # This can change depending on sharding
