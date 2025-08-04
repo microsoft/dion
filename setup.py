@@ -45,7 +45,7 @@ setup(
     # Version of the package:
     version=version,
     # Find the package automatically (include everything):
-    packages=find_packages(include=["optimizers", "optimizers.*"]),
+    packages=find_packages(include=["dion", "dion.*"]),
     ## uncomment the following line to include version file
     # package_data={
     #     "dion": ["VERSION"],  # Add the VERSION file
