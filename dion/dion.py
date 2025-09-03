@@ -11,23 +11,20 @@ from torch.distributed.tensor import randn as dtensor_randn
 from torch.optim.optimizer import Optimizer, ParamsT
 from typing import Any, Dict, Generator, List, Tuple, Optional, Union
 
-from .opt_utils import (
-    AsyncTask,
-    AsyncRuntime,
-    to_local,
-    dtensor_from_local,
-    create_param_batches,
-    pad_batch,
-)
-from .scalar_opts import (
-    adamw_update_foreach,
-    lion_update_foreach,
-)
-
 try:
     from torch.distributed.tensor.placement_types import _StridedShard
 except ImportError:
     _StridedShard = None
+
+from .opt_utils import (
+    AsyncRuntime,
+    AsyncTask,
+    create_param_batches,
+    dtensor_from_local,
+    pad_batch,
+    to_local,
+)
+from .scalar_opts import adamw_update_foreach, lion_update_foreach
 
 
 @dataclass
