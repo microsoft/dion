@@ -2,19 +2,25 @@ import torch
 from torch import Tensor
 from torch.optim.optimizer import Optimizer, ParamsT
 from torch.distributed.tensor import DTensor
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, Optional
+from dataclasses import dataclass 
 
 from .scalar_opts import adamw_update, lion_update
+
+@dataclass
+class DionMixedPrecisionConfig:
+    momentum_dtype: Optional[torch.dtype] = None  # None => use param.dtype
+    Q_dtype: Optional[torch.dtype] = None         # None => use param.dtype
 
 
 @torch.compile()
 def dion_update(
-    X: Tensor,  # Model weights (modified in place)
-    G: Tensor,  # Gradient
-    M: Tensor,  # Momentum buffer (modified in place)
-    Q: Tensor,  # Q matrix for power iteration (modified in place)
-    lr: float,  # Learning rate
-    mu: float,  # Momentum factor
+    X: Tensor,
+    G: Tensor,
+    M: Tensor,
+    Q: Tensor,
+    lr: float,
+    mu: float,
     weight_decay: float,
     epsilon: float = 1e-8,
 ):
@@ -22,11 +28,15 @@ def dion_update(
     Dion optimizer algorithm.
     """
     # Add new gradient to momentum
-    M.add_(G)
+    M.add_(G.to(M.dtype))
 
     # Compute low-rank approximation of M = P @ Q^T
-    P = M @ Q
-    P, _ = torch.linalg.qr(P)
+    P = (M @ Q.to(M.dtype))
+    # orthonormalize in fp32 then cast back to M.dtype
+    P32, _ = torch.linalg.qr(P.to(torch.float32))
+    P = P32.to(M.dtype)
+
+    # 2) R = M^T @ P  (state dtype)
     R = M.T @ P
 
     # Error feedback
@@ -34,12 +44,13 @@ def dion_update(
     M.addmm_(P, R.T, alpha=-(1 - mu))
 
     # Column normalize R to get new Q
-    Q_new = R / (R.norm(dim=0, keepdim=True) + epsilon)
+    R32 = R.to(torch.float32)
+    den = R32.norm(dim=0, keepdim=True) + float(epsilon)
+    Q_new = (R32 / den).to(Q.dtype)
     Q.copy_(Q_new)
 
     # Compute update scale factor based on matrix shape
-    fan_out = X.size(0)
-    fan_in = X.size(1)
+    fan_out, fan_in = X.size(0), X.size(1)
     scaled_lr = lr * ((fan_out / fan_in) ** 0.5)
 
     # Apply weight decay
@@ -47,7 +58,9 @@ def dion_update(
 
     # Apply the weight update
     # X = X - scaled_lr * (P @ Q.T)
-    X.addmm_(P, Q.T, alpha=-scaled_lr)
+    Pd = P.to(X.dtype)
+    QdT = Q.T.to(X.dtype)
+    X.addmm_(Pd, QdT, alpha=-scaled_lr)
 
 
 class Dion(Optimizer):
@@ -60,6 +73,7 @@ class Dion(Optimizer):
         weight_decay: float = 0.01,
         rank: int = 768,
         epsilon: float = 1e-8,
+        mixed_precision_config: Optional[DionMixedPrecisionConfig] = None,
     ):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -85,6 +99,7 @@ class Dion(Optimizer):
 
         self.rank = rank
         self.epsilon = torch.tensor(epsilon)
+        self._mixed_precision_config = mixed_precision_config or DionMixedPrecisionConfig()
 
         # Check that all Dion parameters are 2D tensors
         for group in self.param_groups:
@@ -191,12 +206,14 @@ class Dion(Optimizer):
         return loss
 
     def _init_opt_state_dion(self, param: Tensor, state: Dict[str, Any]):
-        # Initialize momentum and Q for a 2D matrix parameter
-        state["momentum"] = torch.zeros_like(param)
+        # momentum in configured dtype
+        mom_dtype = self._mixed_precision_config.momentum_dtype or param.dtype
+        state["momentum"] = torch.zeros_like(param, dtype=mom_dtype)
+
+        # Q in configured dtype
+        q_dtype = self._mixed_precision_config.Q_dtype or param.dtype
         r = min(self.rank, min(param.shape))
-        state["Q"] = torch.randn(
-            (param.size(1), r), device=param.device, dtype=param.dtype
-        )
+        state["Q"] = torch.randn((param.size(1), r), device=param.device, dtype=q_dtype)
 
     def _init_opt_state_adam(self, param: Tensor, state: Dict[str, Any]):
         state["momentum"] = torch.zeros_like(param)
