@@ -433,6 +433,7 @@ def init_optimizer(
             mu=hp.mu,
             weight_decay=hp.weight_decay,
             rank=round(hp.rank_fraction * hp.model_dim),
+            mixed_precision_config=dion_mixed_precision_config, 
         )
 
     elif hp.optimizer == "muon_reference":
