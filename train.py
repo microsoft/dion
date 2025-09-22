@@ -707,7 +707,10 @@ def main():
 
     # If no device mesh, we are using DDP
     if device_mesh is None:
-        model = DDP(model, device_ids=[data_parallel_rank])
+        # Use LOCAL_RANK here (per-node GPU index)
+        # This ensures each process is pinned to the correct local GPU
+        local_rank = int(os.environ["LOCAL_RANK"])
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
         raw_model = model.module  # the underlying model
 
     # Ensure parameters are contiguous
