@@ -760,7 +760,7 @@ def main():
     # Create a name to identify this run
     run_name = f"({hp.optimizer}+{hp.scalar_opt})"
     if "dion" in hp.optimizer:
-        run_name += f"_sp={hp.rank_fraction}"
+        run_name += f"_rank={hp.rank_fraction}"
     if cli_args.dp_size is not None:
         run_name += f"_dp={cli_args.dp_size}_fs={cli_args.fs_size}_tp={cli_args.tp_size}_gradsync={cli_args.replicate_mesh_grad_sync}"
     if cli_args.wandb_job_name:
