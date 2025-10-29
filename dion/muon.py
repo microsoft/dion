@@ -211,6 +211,7 @@ class Muon(Optimizer):
                 world_size=self._world_size,
                 process_group=self._process_group,
                 newton_schulz_func=self._newton_schulz_func,
+                cautious_wd=group.get("cautious_wd", False),
             )
 
             # Create batches of parameters of size self._world_size
@@ -325,6 +326,7 @@ class Muon(Optimizer):
             beta1 = torch.tensor(group["beta1"])
             beta2 = torch.tensor(group["beta2"])
             weight_decay = torch.tensor(group["weight_decay"])
+            cautious_wd = group.get("cautious_wd", False)
 
             yield AsyncTask(
                 lion_update_foreach_async(
@@ -335,6 +337,7 @@ class Muon(Optimizer):
                     beta1=beta1,
                     beta2=beta2,
                     weight_decay=weight_decay,
+                    cautious_wd=cautious_wd,
                 )
             )
 
@@ -363,6 +366,7 @@ class Muon(Optimizer):
             beta1 = torch.tensor(group["beta1"])
             beta2 = torch.tensor(group["beta2"])
             weight_decay = torch.tensor(group["weight_decay"])
+            cautious_wd = group.get("cautious_wd", False)
             epsilon = torch.tensor(group["epsilon"])
             step = torch.tensor(group["step"])
 
@@ -378,6 +382,7 @@ class Muon(Optimizer):
                     weight_decay=weight_decay,
                     step=step,
                     epsilon=epsilon,
+                    cautious_wd=cautious_wd,
                 )
             )
 
@@ -398,6 +403,7 @@ def muon_update_batch_async(
     shard_dim: Optional[int] = None,  # Shard dimension for DTensor (if applicable)
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
+    cautious_wd: bool = False,
 ) -> Generator[None, None, None]:
     """
     Batched version of Muon update. Batch size should be equal to number of GPUs.
@@ -519,6 +525,7 @@ def muon_update_batch_async(
         base_lr=lr,
         adjusted_lr=adjusted_lr,
         weight_decay=weight_decay,
+        cautious_wd=cautious_wd,
     )
 
 
@@ -533,11 +540,12 @@ def adamw_update_foreach_async(
     weight_decay: Tensor,  # Weight decay (scalar tensor)
     step: int,
     epsilon: float,
+    cautious_wd: bool = False,
 ) -> Generator[None, None, None]:
     """
     Async wrapper around foreach AdamW update.
     """
-    adamw_update_foreach(X, G, M, V, lr, beta1, beta2, weight_decay, step, epsilon)
+    adamw_update_foreach(X, G, M, V, lr, beta1, beta2, weight_decay, step, epsilon, cautious_wd)
     yield
 
 
@@ -549,11 +557,12 @@ def lion_update_foreach_async(
     beta1: Tensor,  # Beta 1 (scalar tensor)
     beta2: Tensor,  # Beta 2 (scalar tensor)
     weight_decay: Tensor,  # Weight decay (scalar tensor)
+    cautious_wd: bool = False,
 ) -> Generator[None, None, None]:
     """
     Async wrapper around foreach Lion update.
     """
-    lion_update_foreach(X, G, M, lr, beta1, beta2, weight_decay)
+    lion_update_foreach(X, G, M, lr, beta1, beta2, weight_decay, cautious_wd)
     yield
 
 
@@ -595,14 +604,24 @@ def muon_update_post_orthogonalize(
     base_lr: Tensor,
     adjusted_lr: Tensor,
     weight_decay: Tensor,
+    cautious_wd: bool = False,
 ):
     """
     Apply weight decay and weight update after orthogonalization.
     Inputs and outputs should be lists of regular Tensor, not DTensor.
     This is a separate function for compatibility with torch.compile().
     """
-    # Apply weight decay
-    torch._foreach_mul_(X, 1 - base_lr * weight_decay)
+    if cautious_wd:
+        # Apply cautious weight decay: only where update and parameter signs align
+        # Reference: https://arxiv.org/pdf/2510.12402
+        coeff = base_lr * weight_decay
+        decay_masks = [(u * x >= 0).to(dtype=x.dtype) for x, u in zip(X, U)]
+        decay_terms = torch._foreach_mul(X, decay_masks)
+        decay_terms = torch._foreach_mul(decay_terms, coeff)
+        torch._foreach_sub_(X, decay_terms)
+    else:
+        # Apply weight decay
+        torch._foreach_mul_(X, 1 - base_lr * weight_decay)
 
     # Weight update
     U = torch._foreach_mul(U, adjusted_lr)
