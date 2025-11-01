@@ -438,7 +438,7 @@ def init_optimizer(
             comm_method = "all-gather"
         print0(f"LR adjust method: {hp.adjust_lr}")
         print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
-        print0(f"Distributed Fron using: {comm_method}")
+        print0(f"Distributed Fron (Fractional Orthonormalization) using: {comm_method}")
         opt = Fron(
             param_groups,
             distributed_mesh=distributed_mesh,

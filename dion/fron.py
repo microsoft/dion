@@ -204,18 +204,28 @@ class Fron(Optimizer):
                 st["momentum_local"] = torch.zeros_like(param)
         return st
 
-
+    def _get_or_initialize_state(self, param: Tensor, algo: str) -> dict:
+        """
+        Get optimizer state for the given parameter tensor,
+        or lazy-initialize it if it doesn't exist.
+        """
+        state = self.state[param]
+        if not state:
+            state["momentum"] = torch.zeros_like(param)
+            if algo == "adamw":
+                state["variance"] = torch.zeros_like(param)
+        return state
 
     def _pad_states(self, states: List[dict], n: int) -> List[dict]:
         """
-        Pad to length n. Real entries get is_pad=False; padded entries get is_pad=True.
+        Pad states to length n. Real entries get is_pad=False; padded entries get is_pad=True.
         """
         out = list(states)
-        # mark existing entries explicitly as not padded
+        # Mark existing entries explicitly as not padded
         for st in out:
             if "is_pad" not in st:
                 st["is_pad"] = False
-        # append padded placeholders
+        # Append padded placeholders
         while len(out) < n:
             out.append({"momentum_full": None, "is_pad": True})
         return out
@@ -314,10 +324,16 @@ class Fron(Optimizer):
                             f"DTensor has mesh: {params[0].device_mesh}, placements: {params[0].placements}, but optimizer was created with mesh: {self._distributed_mesh}."
                         )
                 
+                # Special case for 3D tensors sharded along batch dimension
+                # As long as matrix dimensions are not sharded, each device will have whole matrices
+                # Each device already has different matrices of the batch, so we can't parallelize further
                 if is_batch_sharded and not is_matrix_sharded:
-                    # No ownership, no padding, no collectives. Local momentum per shard.
+
+                    # For this case, we use local momentum per shard
                     for x, g in zip(batch_params, grads):
                         st = self._get_or_initialize_fron_state_local(x)
+
+                        # Create task for non-communicating local update
                         yield AsyncTask(
                             fron_update_local_async(
                                 X=[x],
@@ -331,8 +347,7 @@ class Fron(Optimizer):
                 # Otherwise we use layer-sharded momentum and owner mapping
                 states = [self._get_or_initialize_fron_state_layer(p) for p in batch_params]
 
-                
-                 
+                # Create task for communicating batch update
                 yield AsyncTask(
                     fron_update_batch_async(
                         X=pad_batch(batch_params, self._world_size),
@@ -345,17 +360,7 @@ class Fron(Optimizer):
  
     
 
-    def _get_or_initialize_state(self, param: Tensor, algo: str) -> dict:
-        """
-        Get optimizer state for the given parameter tensor,
-        or lazy-initialize it if it doesn't exist.
-        """
-        state = self.state[param]
-        if not state:
-            state["momentum"] = torch.zeros_like(param)
-            if algo == "adamw":
-                state["variance"] = torch.zeros_like(param)
-        return state
+    
     
     def _create_lion_tasks(
         self,
@@ -447,9 +452,9 @@ class Fron(Optimizer):
 
 
 def fron_update_local_async(
-    X: List[Tensor],             # [x], DTensor or local Tensor
-    G: List[Tensor],             # [g], local shard gradient (regular Tensor)
-    STATE: dict,                 # contains 'momentum_local'
+    X: List[Tensor],              
+    G: List[Tensor],              
+    STATE: dict,                 # Should put local momentum state here
     lr: Tensor,
     ef_decay: Tensor,
     fraction: Tensor,
@@ -463,8 +468,7 @@ def fron_update_local_async(
     x = X[0]
     g = to_local(G)[0]                       # local shard grad
     M = STATE["momentum_local"]              # local shard momentum
-
-    # LR scaling uses matrix dims.
+ 
     if adjust_lr is None:
         adjusted_lr = lr
     elif adjust_lr == "spectral_norm":
@@ -481,7 +485,7 @@ def fron_update_local_async(
         flatten=flatten, epsilon=epsilon, newton_schulz_func=newton_schulz_func
     )
 
-    # Apply update locally (no collectives)
+    # Apply update locally 
     fron_update_post_orthogonalize(
         X=to_local([x]),
         U=[O_local],
@@ -510,9 +514,9 @@ def fron_update_batch_async(
 ) -> Generator[None, None, None]:
     """
     FRON layer-sharded path:
-      - Matrix-dim sharded (A): all_to_all shards <-> full, compute once on owner, all_to_all back.
-      - Replicated/unsharded (C): compute once on owner (index=device_rank), all_gather dense updates.
-      - Single-GPU: compute once on owner, apply locally.
+      - Matrix-dim sharded: all_to_all shards <-> full, compute once on owner, all_to_all back.
+      - Replicated/unsharded: compute once on owner (index=device_rank), all_gather dense updates.
+      - Single-GPU (batch size=1): compute once on owner, apply locally.
     """
 
     # Ownership-by-index: owner of batch index j is rank j.
@@ -520,7 +524,8 @@ def fron_update_batch_async(
     assert len(X) == len(STATES) == world_size  # Guaranteed by padding
 
 
-    G_local = to_local(G)   # convert gradients to local shards
+    # convert gradients to local shards
+    G_local = to_local(G)   
     frac = float(fraction)
 
     # Compute adjusted lr from global shape (matrix dims last)
@@ -533,9 +538,7 @@ def fron_update_batch_async(
     else:
         raise ValueError(f"Unknown adjust_lr value: {adjust_lr}")
 
-    # -------------------------------
-    # A) Matrix-dimension sharded path
-    # -------------------------------
+    # Matrix-dimension sharded path 
     if shard_dim is not None:
         assert len(X) == world_size, "Batch size must equal world size"
         assert process_group is not None, "process_group must be provided for sharded DTensors"
@@ -545,7 +548,7 @@ def fron_update_batch_async(
             f"is not divisible by world size {world_size}."
         )
 
-        # 1) shards -> single full gradient on owner (bf16 comm)
+        # Shards -> single full gradient on owner (bf16 comm)
         G_bf16 = [g.to(dtype=torch.bfloat16) for g in G_local]
         recv_shards = [torch.empty_like(g) for g in G_bf16]
         work = dist.all_to_all(recv_shards, G_bf16, group=process_group, async_op=True)
@@ -555,19 +558,19 @@ def fron_update_batch_async(
 
         
         # Ownership-by-index contract:
-        # For layer-sharded path, the "owner" of batch index j is rank j (device_rank).
-        # We index directly by device_rank; no 'owner' flags are stored.
+        # For layer-sharded path, the "owner" of batch index j is rank j (device_rank). 
         owner_state = STATES[device_rank]
         owner_is_pad = owner_state.get("is_pad", False)
         
         if owner_is_pad:
-            # Do NOT allocate momentum_full or run NS. Just return zero shards.
+            # For pads, do NOT allocate momentum_full or run NS. 
+            # Just return zero shards.
             send_shards = [torch.zeros_like(g) for g in G_bf16]  # bf16 payloads
             U = [torch.empty_like(g) for g in G_bf16]
             work = dist.all_to_all(U, send_shards, group=process_group, async_op=True)
             yield; work.wait()
         else:
-            # (existing) allocate momentum_full, accumulate, NS, split, all_to_all
+            # For non-pads allocate momentum_full, accumulate, NS, split, all_to_all
             if owner_state["momentum_full"] is None:
                 full_shape, param_dtype, param_device = _full_dtype_and_shape(X[device_rank])
                 owner_state["momentum_full"] = torch.zeros(full_shape, dtype=param_dtype, device=param_device)
@@ -586,7 +589,7 @@ def fron_update_batch_async(
             yield; work.wait()
  
 
-    #  Replicated / unsharded (including single-GPU case)
+    # Replicated / unsharded
     else:
         # Owner index is device_rank
         x_owner = X[device_rank]
@@ -595,17 +598,17 @@ def fron_update_batch_async(
         owner_is_pad = st_owner.get("is_pad", False)
 
         if owner_is_pad:
+            # For pads, do NOT allocate momentum_full or run NS.
             if process_group is not None and world_size > 1:
-                # broadcast zeros
                 zero_full_bf16 = torch.zeros_like(g_owner, dtype=torch.bfloat16).contiguous()
                 U = [torch.empty_like(zero_full_bf16) for _ in range(world_size)]
                 work = dist.all_gather(U, zero_full_bf16, group=process_group, async_op=True)
                 yield; work.wait()
             else:
-                # single-GPU: produce a local zero update
+                # Single-GPU: produce a local zero update
                 U = [torch.zeros_like(x_owner)]
         else:
-            # (existing) allocate momentum_full, accumulate, NS, and gather
+            # For non-pads allocate momentum_full, accumulate, NS, and gather
             if st_owner["momentum_full"] is None:
                 full_shape, param_dtype, param_device = _full_dtype_and_shape(x_owner)
                 st_owner["momentum_full"] = torch.zeros(full_shape, dtype=param_dtype, device=param_device)
@@ -623,6 +626,7 @@ def fron_update_batch_async(
                 work = dist.all_gather(U, O_full_bf16, group=process_group, async_op=True)
                 yield; work.wait()
             else:
+                # Single-GPU: produce a local update
                 U = [O_full]
 
 
@@ -683,9 +687,9 @@ def topk_and_orthonormalize(
     M_sel = torch.index_select(M_work, dim=-1, index=K)   # [I, k]
     O_sel = muon_update_newton_schulz(M_sel, newton_schulz_func,
                                         flatten=flatten, epsilon=epsilon)
-    # In-place EF decay only on selected columns: 
+    # In-place error-feedback decay only on selected columns: 
     M_work[..., K] *= ef_decay
-    # Scatter O_sel into dense O_full efficiently
+    # Construct the full update matrix
     O_full = torch.zeros_like(M_work, dtype=O_sel.dtype)
     O_full.index_copy_(dim=-1, index=K, source=O_sel)
     return O_full 
