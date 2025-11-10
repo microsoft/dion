@@ -29,6 +29,7 @@ from dion import Muon
 from dion import MuonReference
 from dion.fron import Fron
 
+
 @dataclass
 class Hyperparameters:
     # Data directory
@@ -443,12 +444,12 @@ def init_optimizer(
             param_groups,
             distributed_mesh=distributed_mesh,
             lr=hp.lr,
-            fraction=hp.rank_fraction, 
+            fraction=hp.rank_fraction,
             ef_decay=hp.mu,
-            weight_decay=hp.weight_decay, 
-            adjust_lr=hp.adjust_lr, 
+            weight_decay=hp.weight_decay,
+            adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
-        ) 
+        )
 
     elif hp.optimizer == "dion_simple":
         assert device_mesh is None, f"{hp.optimizer} does not support device mesh"
@@ -459,7 +460,7 @@ def init_optimizer(
             mu=hp.mu,
             weight_decay=hp.weight_decay,
             rank=round(hp.rank_fraction * hp.model_dim),
-            mixed_precision_config=dion_mixed_precision_config, 
+            mixed_precision_config=dion_mixed_precision_config,
         )
 
     elif hp.optimizer == "muon_reference":
