@@ -17,7 +17,7 @@ from .opt_utils import (
     pad_batch,
     to_local,
 )
-from .scalar_opts import adamw_update_foreach, lion_update_foreach
+from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
 
 # Reuse Muon's helper functions
 from .muon import (
@@ -197,8 +197,12 @@ class Fron(Optimizer):
         if "momentum_local" not in st:
             if isinstance(param, DTensor):
                 lp = param.to_local()
-                st["momentum_local"] = torch.zeros(
-                    lp.shape, dtype=param.dtype, device=lp.device
+                m_local = torch.zeros_like(lp)
+                st["momentum_local"] = DTensor.from_local(
+                    m_local,
+                    param.device_mesh,
+                    param.placements,
+                    shape=param.size(),
                 )
             else:
                 st["momentum_local"] = torch.zeros_like(param)
@@ -571,16 +575,13 @@ def fron_update_batch_async(
         owner_state = STATES[device_rank]
         owner_is_pad = owner_state.get("is_pad", False)
 
+        # Build the shards to send (bf16), but only do actual work if not "pad"
         if owner_is_pad:
             # For pads, do NOT allocate momentum_full or run NS.
             # Just return zero shards.
             send_shards = [torch.zeros_like(g) for g in G_bf16]  # bf16 payloads
-            U = [torch.empty_like(g) for g in G_bf16]
-            work = dist.all_to_all(U, send_shards, group=process_group, async_op=True)
-            yield
-            work.wait()
         else:
-            # For non-pads allocate momentum_full, accumulate, NS, split, all_to_all
+            # Non-pads: allocate/accumulate, run NS, split to bf16 shards
             if owner_state["momentum_full"] is None:
                 full_shape, param_dtype, param_device = _full_dtype_and_shape(
                     X[device_rank]
@@ -600,14 +601,17 @@ def fron_update_batch_async(
                 epsilon=epsilon,
                 newton_schulz_func=newton_schulz_func,
             )
+            # Split back to shards
             send_shards = [
                 t.contiguous().to(torch.bfloat16)
                 for t in torch.tensor_split(O_full, world_size, dim=shard_dim)
             ]
-            U = [torch.empty_like(g) for g in G_bf16]
-            work = dist.all_to_all(U, send_shards, group=process_group, async_op=True)
-            yield
-            work.wait()
+
+        # All-to-all back to shards
+        U = [torch.empty_like(g) for g in G_bf16]
+        work = dist.all_to_all(U, send_shards, group=process_group, async_op=True)
+        yield
+        work.wait()
 
     # Replicated / unsharded
     else:
@@ -617,23 +621,48 @@ def fron_update_batch_async(
         st_owner = STATES[device_rank]
         owner_is_pad = st_owner.get("is_pad", False)
 
-        if owner_is_pad:
-            # For pads, do NOT allocate momentum_full or run NS.
-            if process_group is not None and world_size > 1:
-                zero_full_bf16 = torch.zeros_like(
+        # Check whether we are in multi-GPU setting
+        multi_gpu = process_group is not None and world_size > 1
+
+        if multi_gpu:
+
+            # For pads, do not allocate momentum_full or run NS.
+            if owner_is_pad:
+                payload_bf16 = torch.zeros_like(
                     g_owner, dtype=torch.bfloat16
                 ).contiguous()
-                U = [torch.empty_like(zero_full_bf16) for _ in range(world_size)]
-                work = dist.all_gather(
-                    U, zero_full_bf16, group=process_group, async_op=True
-                )
-                yield
-                work.wait()
+            # Non-pads: allocate/accumulate, run NS, prepare bf16 payload
             else:
-                # Single-GPU: produce a local zero update
-                U = [torch.zeros_like(x_owner)]
+                if st_owner["momentum_full"] is None:
+                    full_shape, param_dtype, param_device = _full_dtype_and_shape(
+                        x_owner
+                    )
+                    st_owner["momentum_full"] = torch.zeros(
+                        full_shape, dtype=param_dtype, device=param_device
+                    )
+                M_full = st_owner["momentum_full"]
+                M_full.add_(g_owner.to(dtype=M_full.dtype))
+
+                O_full = fractional_orthonormalize_update(
+                    M_full=M_full,
+                    fraction=frac,
+                    ef_decay=ef_decay,
+                    flatten=flatten,
+                    epsilon=epsilon,
+                    newton_schulz_func=newton_schulz_func,
+                )
+                payload_bf16 = O_full.to(dtype=torch.bfloat16).contiguous()
+
+            # One all_gather regardless of pad/non-pad
+            U = [torch.empty_like(payload_bf16) for _ in range(world_size)]
+            work = dist.all_gather(U, payload_bf16, group=process_group, async_op=True)
+            yield
+            work.wait()
         else:
-            # For non-pads allocate momentum_full, accumulate, NS, and gather
+
+            # Single-GPU case: produce local update directly.
+            # No padding case handling required.
+
             if st_owner["momentum_full"] is None:
                 full_shape, param_dtype, param_device = _full_dtype_and_shape(x_owner)
                 st_owner["momentum_full"] = torch.zeros(
@@ -650,18 +679,7 @@ def fron_update_batch_async(
                 epsilon=epsilon,
                 newton_schulz_func=newton_schulz_func,
             )
-
-            if process_group is not None and world_size > 1:
-                O_full_bf16 = O_full.to(dtype=torch.bfloat16).contiguous()
-                U = [torch.empty_like(O_full_bf16) for _ in range(world_size)]
-                work = dist.all_gather(
-                    U, O_full_bf16, group=process_group, async_op=True
-                )
-                yield
-                work.wait()
-            else:
-                # Single-GPU: produce a local update
-                U = [O_full]
+            U = [O_full]
 
     # Ensure foreach dtypes match parameter shards for the update
     X_local = to_local(X)
@@ -694,11 +712,13 @@ def fractional_orthonormalize_update(
     M_work, transposed = make_work_view(M_full)
     I, J = M_work.size(-2), M_work.size(-1)
     if fraction >= 1.0:
+        # Full orthonormalization
         ortho_update = muon_update_newton_schulz(
             M_work, newton_schulz_func, flatten=flatten, epsilon=epsilon
         )
         M_work.mul_(ef_decay)
     else:
+        # Fractional orthonormalization
         k = int(math.ceil(fraction * J))
         ortho_update = topk_and_orthonormalize(
             M_work,
@@ -720,7 +740,7 @@ def topk_and_orthonormalize(
     newton_schulz_func,
 ) -> Tensor:
     """ """
-    # Compute once
+    # Compute the top-k columns by L1 norm
     alpha = M_work.abs().sum(dim=-2)  # [J]
     K = torch.topk(alpha, k, sorted=False).indices  # [k]
     # Select and orthonormalize
@@ -754,32 +774,3 @@ def fron_update_post_orthogonalize(
     # Weight update
     U = torch._foreach_mul(U, adjusted_lr)
     torch._foreach_sub_(X, U)
-
-
-def adamw_update_foreach_async(
-    X: List[Tensor],
-    G: List[Tensor],
-    M: List[Tensor],
-    V: List[Tensor],
-    lr: Tensor,
-    beta1: Tensor,
-    beta2: Tensor,
-    weight_decay: Tensor,
-    step: int,
-    epsilon: float,
-) -> Generator[None, None, None]:
-    adamw_update_foreach(X, G, M, V, lr, beta1, beta2, weight_decay, step, epsilon)
-    yield
-
-
-def lion_update_foreach_async(
-    X: List[Tensor],
-    G: List[Tensor],
-    M: List[Tensor],
-    lr: Tensor,
-    beta1: Tensor,
-    beta2: Tensor,
-    weight_decay: Tensor,
-) -> Generator[None, None, None]:
-    lion_update_foreach(X, G, M, lr, beta1, beta2, weight_decay)
-    yield

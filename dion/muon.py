@@ -16,7 +16,7 @@ from .opt_utils import (
     pad_batch,
     to_local,
 )
-from .scalar_opts import adamw_update_foreach, lion_update_foreach
+from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
 
 
 class Muon(Optimizer):
@@ -520,41 +520,6 @@ def muon_update_batch_async(
         adjusted_lr=adjusted_lr,
         weight_decay=weight_decay,
     )
-
-
-def adamw_update_foreach_async(
-    X: List[Tensor],  # Model weights (modified in place)
-    G: List[Tensor],  # Gradient
-    M: List[Tensor],  # Momentum buffer (modified in place)
-    V: List[Tensor],  # Variance buffer (modified in place)
-    lr: Tensor,  # Learning rate (scalar tensor)
-    beta1: Tensor,  # Beta 1 (scalar tensor)
-    beta2: Tensor,  # Beta 2 (scalar tensor)
-    weight_decay: Tensor,  # Weight decay (scalar tensor)
-    step: int,
-    epsilon: float,
-) -> Generator[None, None, None]:
-    """
-    Async wrapper around foreach AdamW update.
-    """
-    adamw_update_foreach(X, G, M, V, lr, beta1, beta2, weight_decay, step, epsilon)
-    yield
-
-
-def lion_update_foreach_async(
-    X: List[Tensor],  # Model weights (modified in place)
-    G: List[Tensor],  # Gradient
-    M: List[Tensor],  # Momentum buffer (modified in place)
-    lr: Tensor,  # Learning rate (scalar tensor)
-    beta1: Tensor,  # Beta 1 (scalar tensor)
-    beta2: Tensor,  # Beta 2 (scalar tensor)
-    weight_decay: Tensor,  # Weight decay (scalar tensor)
-) -> Generator[None, None, None]:
-    """
-    Async wrapper around foreach Lion update.
-    """
-    lion_update_foreach(X, G, M, lr, beta1, beta2, weight_decay)
-    yield
 
 
 @torch.compile(fullgraph=True)

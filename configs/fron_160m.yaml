@@ -1,7 +1,7 @@
 
 # — Model —
 model_dim: 768
-n_layer: 13
+n_layer: 12
 n_head: 6
 sequence_length: 1024
 
@@ -31,7 +31,7 @@ no_wandb: false
 # — Distributed training —
 dp_size: null      # data‐parallel size
 fs_size: null      # FSDP size
-tp_size: null      # tensor‐parallel size
+tp_size: null     # tensor‐parallel size
 
 # — Miscellaneous flags —
 debug: false
