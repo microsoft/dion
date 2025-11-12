@@ -653,7 +653,7 @@ def fron_update_batch_async(
                 )
                 payload_bf16 = O_full.to(dtype=torch.bfloat16).contiguous()
 
-            # One all_gather regardless of pad/non-pad
+            # All-gather the computed updates
             U = [torch.empty_like(payload_bf16) for _ in range(world_size)]
             work = dist.all_gather(U, payload_bf16, group=process_group, async_op=True)
             yield
