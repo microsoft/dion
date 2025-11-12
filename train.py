@@ -27,7 +27,7 @@ from dion import DionReference
 from dion import DionSimple
 from dion import Muon
 from dion import MuonReference
-from dion.fron import Fron
+from dion import Fron
 
 
 @dataclass
