@@ -195,17 +195,7 @@ class Fron(Optimizer):
         """
         st = self.state[param]
         if "momentum_local" not in st:
-            if isinstance(param, DTensor):
-                lp = param.to_local()
-                m_local = torch.zeros_like(lp)
-                st["momentum_local"] = DTensor.from_local(
-                    m_local,
-                    param.device_mesh,
-                    param.placements,
-                    shape=param.size(),
-                )
-            else:
-                st["momentum_local"] = torch.zeros_like(param)
+            st["momentum_local"] = torch.zeros_like(param)
         return st
 
     def _get_or_initialize_state(self, param: Tensor, algo: str) -> dict:
