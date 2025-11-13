@@ -3,14 +3,15 @@ from torch import Tensor
 from torch.optim.optimizer import Optimizer, ParamsT
 from torch.distributed.tensor import DTensor
 from typing import Any, Dict, Tuple, Optional
-from dataclasses import dataclass 
+from dataclasses import dataclass
 
 from .scalar_opts import adamw_update, lion_update
+
 
 @dataclass
 class DionMixedPrecisionConfig:
     momentum_dtype: Optional[torch.dtype] = None  # None => use param.dtype
-    Q_dtype: Optional[torch.dtype] = None         # None => use param.dtype
+    Q_dtype: Optional[torch.dtype] = None  # None => use param.dtype
 
 
 @torch.compile()
@@ -31,7 +32,7 @@ def dion_update(
     M.add_(G.to(M.dtype))
 
     # Compute low-rank approximation of M = P @ Q^T
-    P = (M @ Q.to(M.dtype))
+    P = M @ Q.to(M.dtype)
     # orthonormalize in fp32 then cast back to M.dtype
     P32, _ = torch.linalg.qr(P.to(torch.float32))
     P = P32.to(M.dtype)
@@ -99,7 +100,9 @@ class Dion(Optimizer):
 
         self.rank = rank
         self.epsilon = torch.tensor(epsilon)
-        self._mixed_precision_config = mixed_precision_config or DionMixedPrecisionConfig()
+        self._mixed_precision_config = (
+            mixed_precision_config or DionMixedPrecisionConfig()
+        )
 
         # Check that all Dion parameters are 2D tensors
         for group in self.param_groups:

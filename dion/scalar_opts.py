@@ -1,6 +1,6 @@
 import torch
 from torch import Tensor
-from typing import List
+from typing import Generator, List
 
 
 @torch.compile(fullgraph=True)
@@ -231,3 +231,32 @@ def lion_update_foreach(
     # X = X - lr * U
     torch._foreach_mul_(U, lr)
     torch._foreach_sub_(X, U)
+
+
+def adamw_update_foreach_async(
+    X: List[Tensor],
+    G: List[Tensor],
+    M: List[Tensor],
+    V: List[Tensor],
+    lr: Tensor,
+    beta1: Tensor,
+    beta2: Tensor,
+    weight_decay: Tensor,
+    step: int,
+    epsilon: float,
+) -> Generator[None, None, None]:
+    adamw_update_foreach(X, G, M, V, lr, beta1, beta2, weight_decay, step, epsilon)
+    yield
+
+
+def lion_update_foreach_async(
+    X: List[Tensor],
+    G: List[Tensor],
+    M: List[Tensor],
+    lr: Tensor,
+    beta1: Tensor,
+    beta2: Tensor,
+    weight_decay: Tensor,
+) -> Generator[None, None, None]:
+    lion_update_foreach(X, G, M, lr, beta1, beta2, weight_decay)
+    yield
