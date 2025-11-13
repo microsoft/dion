@@ -615,7 +615,6 @@ def fron_update_batch_async(
         multi_gpu = process_group is not None and world_size > 1
 
         if multi_gpu:
-
             # For pads, do not allocate momentum_full or run NS.
             if owner_is_pad:
                 payload_bf16 = torch.zeros_like(
@@ -648,11 +647,10 @@ def fron_update_batch_async(
             work = dist.all_gather(U, payload_bf16, group=process_group, async_op=True)
             yield
             work.wait()
-        else:
 
+        else:
             # Single-GPU case: produce local update directly.
             # No padding case handling required.
-
             if st_owner["momentum_full"] is None:
                 full_shape, param_dtype, param_device = _full_dtype_and_shape(x_owner)
                 st_owner["momentum_full"] = torch.zeros(
