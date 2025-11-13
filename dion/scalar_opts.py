@@ -256,8 +256,9 @@ def adamw_update_foreach_async(
     weight_decay: Tensor,
     step: int,
     epsilon: float,
+    cautious_wd: bool = False,
 ) -> Generator[None, None, None]:
-    adamw_update_foreach(X, G, M, V, lr, beta1, beta2, weight_decay, step, epsilon)
+    adamw_update_foreach(X, G, M, V, lr, beta1, beta2, weight_decay, step, epsilon, cautious_wd)
     yield
 
 
@@ -269,6 +270,7 @@ def lion_update_foreach_async(
     beta1: Tensor,
     beta2: Tensor,
     weight_decay: Tensor,
+    cautious_wd: bool = False,
 ) -> Generator[None, None, None]:
-    lion_update_foreach(X, G, M, lr, beta1, beta2, weight_decay)
+    lion_update_foreach(X, G, M, lr, beta1, beta2, weight_decay, cautious_wd)
     yield
