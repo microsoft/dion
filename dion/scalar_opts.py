@@ -168,9 +168,6 @@ def adamw_update_foreach(
         # Reference: https://arxiv.org/pdf/2510.12402
         coeff = lr * weight_decay
         
-        # decay_masks = [
-        #     (m_div * x >= 0).to(dtype=x.dtype) for x, m_div in zip(X, M_div)
-        # ]
         decay_masks = torch._foreach_mul(X, M_div)
         decay_masks = torch._foreach_sign(decay_masks)  # {-1, 0, 1}
         decay_masks = torch._foreach_add(decay_masks, 1)  # {0, 1, 2}
@@ -224,9 +221,6 @@ def lion_update_foreach(
         # Reference: https://arxiv.org/pdf/2510.12402
         coeff = lr * weight_decay
         
-        # decay_masks = [
-        #     (u * x >= 0).to(dtype=x.dtype) for x, u in zip(X, U)
-        # ]
         decay_masks = torch._foreach_mul(X, U)
         decay_masks = torch._foreach_sign(decay_masks)  # {-1, 0, 1}
         decay_masks = torch._foreach_add(decay_masks, 1)  # {0, 1, 2}
