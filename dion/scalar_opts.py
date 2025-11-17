@@ -15,6 +15,7 @@ def adamw_update(
     weight_decay: Tensor,  # Weight decay (scalar tensor)
     step: int,
     epsilon: float,
+    cautious_wd: bool = False,
 ):
     """
     AdamW optimizer algorithm.
@@ -44,8 +45,19 @@ def adamw_update(
     # Adjust learning rate to include bias correction 1
     adj_lr = lr / bias_correction1
 
-    # Apply weight decay
-    X.mul_(1 - lr * weight_decay)
+    if cautious_wd:
+        # Compute update direction (pre-LR) for CWD mask
+        update_dir = M / denom
+
+        # Apply cautious weight decay: only where update and parameter signs align
+        # Reference: https://arxiv.org/pdf/2510.12402
+        coeff = lr * weight_decay
+        decay_mask = (update_dir * X >= 0).to(dtype=X.dtype)
+        decay = (X * decay_mask) * coeff
+        X.sub_(decay)
+    else:
+        # Apply weight decay
+        X.mul_(1 - lr * weight_decay)
 
     # Weight update
     # X = X - adj_lr * M / denom
@@ -61,6 +73,7 @@ def lion_update(
     beta1: Tensor,  # Beta 1 (scalar tensor)
     beta2: Tensor,  # Beta 2 (scalar tensor)
     weight_decay: Tensor,  # Weight decay (scalar tensor)
+    cautious_wd: bool = False,
 ):
     """
     Lion optimizer algorithm. Sign update should guarantee RMS norm equal to 1.
@@ -78,8 +91,16 @@ def lion_update(
     # M = beta2 * M + (1 - beta2) * G
     M.lerp_(G, 1 - beta2)
 
-    # Apply weight decay
-    X.mul_(1 - lr * weight_decay)
+    if cautious_wd:
+        # Apply cautious weight decay: only where update and parameter signs align
+        # Reference: https://arxiv.org/pdf/2510.12402
+        coeff = lr * weight_decay
+        decay_mask = (U * X >= 0).to(dtype=X.dtype)
+        decay = (X * decay_mask) * coeff
+        X.sub_(decay)
+    else:
+        # Apply weight decay
+        X.mul_(1 - lr * weight_decay)
 
     # Weight update
     # X = X - lr * U
@@ -98,6 +119,7 @@ def adamw_update_foreach(
     weight_decay: Tensor,  # Weight decay (scalar tensor)
     step: int,
     epsilon: float,
+    cautious_wd: bool = False,
 ):
     """
     AdamW optimizer algorithm (foreach implementation).
@@ -139,12 +161,27 @@ def adamw_update_foreach(
     # Adjust learning rate to include bias correction 1
     adj_lr = lr / bias_correction1
 
-    # Apply weight decay
-    torch._foreach_mul_(X, 1 - lr * weight_decay)
+    M_div = torch._foreach_div(M, denom)
+
+    if cautious_wd:
+        # Apply cautious weight decay: only where update and parameter signs align
+        # Reference: https://arxiv.org/pdf/2510.12402
+        coeff = lr * weight_decay
+        
+        decay_masks = torch._foreach_mul(X, M_div)
+        decay_masks = torch._foreach_sign(decay_masks)  # {-1, 0, 1}
+        decay_masks = torch._foreach_add(decay_masks, 1)  # {0, 1, 2}
+        decay_masks = torch._foreach_minimum(decay_masks, 1)  # {0, 1, 1}
+
+        decay_terms = torch._foreach_mul(X, decay_masks)
+        torch._foreach_mul_(decay_terms, coeff)
+        torch._foreach_sub_(X, decay_terms)
+    else:
+        # Apply weight decay
+        torch._foreach_mul_(X, 1 - lr * weight_decay)
 
     # Weight update
     # X = X - adj_lr * M / denom
-    M_div = torch._foreach_div(M, denom)
     torch._foreach_mul_(M_div, adj_lr)
     torch._foreach_sub_(X, M_div)
 
@@ -158,6 +195,7 @@ def lion_update_foreach(
     beta1: Tensor,  # Beta 1 (scalar tensor)
     beta2: Tensor,  # Beta 2 (scalar tensor)
     weight_decay: Tensor,  # Weight decay (scalar tensor)
+    cautious_wd: bool = False,
 ):
     """
     Lion optimizer algorithm (foreach implementation).
@@ -178,8 +216,22 @@ def lion_update_foreach(
     # M = beta2 * M + (1 - beta2) * G
     torch._foreach_lerp_(M, G, [1 - beta2] * batch_size)
 
-    # Apply weight decay
-    torch._foreach_mul_(X, 1 - lr * weight_decay)
+    if cautious_wd:
+        # Apply cautious weight decay: only where update and parameter signs align
+        # Reference: https://arxiv.org/pdf/2510.12402
+        coeff = lr * weight_decay
+        
+        decay_masks = torch._foreach_mul(X, U)
+        decay_masks = torch._foreach_sign(decay_masks)  # {-1, 0, 1}
+        decay_masks = torch._foreach_add(decay_masks, 1)  # {0, 1, 2}
+        decay_masks = torch._foreach_minimum(decay_masks, 1)  # {0, 1, 1}
+        
+        decay_terms = torch._foreach_mul(X, decay_masks)
+        torch._foreach_mul_(decay_terms, coeff)
+        torch._foreach_sub_(X, decay_terms)
+    else:
+        # Apply weight decay
+        torch._foreach_mul_(X, 1 - lr * weight_decay)
 
     # Weight update
     # X = X - lr * U
@@ -198,8 +250,9 @@ def adamw_update_foreach_async(
     weight_decay: Tensor,
     step: int,
     epsilon: float,
+    cautious_wd: bool = False,
 ) -> Generator[None, None, None]:
-    adamw_update_foreach(X, G, M, V, lr, beta1, beta2, weight_decay, step, epsilon)
+    adamw_update_foreach(X, G, M, V, lr, beta1, beta2, weight_decay, step, epsilon, cautious_wd)
     yield
 
 
@@ -211,6 +264,7 @@ def lion_update_foreach_async(
     beta1: Tensor,
     beta2: Tensor,
     weight_decay: Tensor,
+    cautious_wd: bool = False,
 ) -> Generator[None, None, None]:
-    lion_update_foreach(X, G, M, lr, beta1, beta2, weight_decay)
+    lion_update_foreach(X, G, M, lr, beta1, beta2, weight_decay, cautious_wd)
     yield
