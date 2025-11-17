@@ -167,7 +167,7 @@ def adamw_update_foreach(
         # Apply cautious weight decay: only where update and parameter signs align
         # Reference: https://arxiv.org/pdf/2510.12402
         coeff = lr * weight_decay
-        
+
         decay_masks = torch._foreach_mul(X, M_div)
         decay_masks = torch._foreach_sign(decay_masks)  # {-1, 0, 1}
         decay_masks = torch._foreach_add(decay_masks, 1)  # {0, 1, 2}
@@ -220,12 +220,12 @@ def lion_update_foreach(
         # Apply cautious weight decay: only where update and parameter signs align
         # Reference: https://arxiv.org/pdf/2510.12402
         coeff = lr * weight_decay
-        
+
         decay_masks = torch._foreach_mul(X, U)
         decay_masks = torch._foreach_sign(decay_masks)  # {-1, 0, 1}
         decay_masks = torch._foreach_add(decay_masks, 1)  # {0, 1, 2}
         decay_masks = torch._foreach_minimum(decay_masks, 1)  # {0, 1, 1}
-        
+
         decay_terms = torch._foreach_mul(X, decay_masks)
         torch._foreach_mul_(decay_terms, coeff)
         torch._foreach_sub_(X, decay_terms)
@@ -252,7 +252,9 @@ def adamw_update_foreach_async(
     epsilon: float,
     cautious_wd: bool = False,
 ) -> Generator[None, None, None]:
-    adamw_update_foreach(X, G, M, V, lr, beta1, beta2, weight_decay, step, epsilon, cautious_wd)
+    adamw_update_foreach(
+        X, G, M, V, lr, beta1, beta2, weight_decay, step, epsilon, cautious_wd
+    )
     yield
 
 

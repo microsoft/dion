@@ -27,7 +27,7 @@ from dion import DionReference
 from dion import DionSimple
 from dion import Muon
 from dion import MuonReference
-from dion import Fron
+from dion import Dion2
 
 
 @dataclass
@@ -424,11 +424,11 @@ def init_optimizer(
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
         )
-    elif hp.optimizer == "fron":
+    elif hp.optimizer == "dion2":
         if device_mesh is not None:
-            # Ensure that we have a supported device mesh configuration for Fron
+            # Ensure that we have a supported device mesh configuration for dion2
             if inner_shard_mesh is not None and inner_shard_mesh.size() > 1:
-                raise ValueError("Tensor parallel is not supported by Fron.")
+                raise ValueError("Tensor parallel is not supported by dion2.")
             distributed_mesh = (
                 outer_shard_mesh if outer_shard_mesh.size() > 1 else replicate_mesh
             )
@@ -439,8 +439,8 @@ def init_optimizer(
             comm_method = "all-gather"
         print0(f"LR adjust method: {hp.adjust_lr}")
         print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
-        print0(f"Distributed Fron (Fractional Orthonormalization) using: {comm_method}")
-        opt = Fron(
+        print0(f"Distributed Dion2 using: {comm_method}")
+        opt = Dion2(
             param_groups,
             distributed_mesh=distributed_mesh,
             lr=hp.lr,
@@ -786,7 +786,7 @@ def main():
     # Load hyperparameters and update with CLI arguments
     # Create a name to identify this run
     run_name = f"({hp.optimizer}+{hp.scalar_opt})"
-    if "dion" in hp.optimizer or "fron" in hp.optimizer:
+    if "dion" in hp.optimizer or "dion2" in hp.optimizer:
         run_name += f"frac={hp.rank_fraction}"
     if cli_args.dp_size is not None:
         run_name += f"_dp={cli_args.dp_size}_fs={cli_args.fs_size}_tp={cli_args.tp_size}_gradsync={cli_args.replicate_mesh_grad_sync}"

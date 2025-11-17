@@ -35,26 +35,26 @@ def _full_dtype_and_shape(p: Tensor) -> Tuple[torch.Size, torch.dtype, torch.dev
     return p.size(), p.dtype, p.device
 
 
-class Fron(Optimizer):
+class Dion2(Optimizer):
     """
-    Distributed Fractional Orthonormalization optimizer for PyTorch FSDP2. Also compatible with DDP.
+    Distributed Dion2 optimizer for PyTorch FSDP2. Also compatible with DDP.
 
     Args:
         params: Parameters for the optimizer.
         distributed_mesh: DeviceMesh or ProcessGroup for distributed training.
             Use DeviceMesh for FSDP2 and ProcessGroup for DistributedDataParallel.
-        lr: Base learning rate. For Fron, this will be scaled based on the matrix dimensions.
+        lr: Base learning rate. For dion2, this will be scaled based on the matrix dimensions.
             For element-wise update rules, this is the actual learning rate and no additional scaling is done.
         fraction: Fraction of rows/columns to orthogonalize per update (0 < fraction <= 1).
-        ef_decay: Error-feedback decay factor for Fron algorithm.
+        ef_decay: Error-feedback decay factor for dion2 algorithm.
         betas: Tuple of (beta1, beta2) for AdamW and Lion algorithms.
         weight_decay: Weight decay factor.
         epsilon: Small value to avoid division by zero.
-        adjust_lr: How to adjust the learning rate for Fron updates ("spectral_norm" or "rms_norm" or None).
+        adjust_lr: How to adjust the learning rate for dion2 updates ("spectral_norm" or "rms_norm" or None).
             "spectral_norm": Adjust based on spectral norm, for learning rate transfer across model scale.
             "rms_norm": Adjust based on RMS norm, for learning rate compatibility with Adam/AdamW.
             None: Do not adjust the learning rate.
-        flatten: Whether to flatten 3D+ tensors to 2D for Fron updates.
+        flatten: Whether to flatten 3D+ tensors to 2D for dion2 updates.
             True: Tensors with 3+ dimensions are flattened to 2D. Use this for convolutional layers.
             False: Tensors are not flattened. 3D+ tensors are treated as batches of 2D matrices.
         use_triton: Whether to use Triton kernel for Newton-Schulz. Ignored if custom function is provided.
@@ -100,7 +100,7 @@ class Fron(Optimizer):
             epsilon=epsilon,
             flatten=flatten,
             adjust_lr=adjust_lr,
-            algorithm="fron",
+            algorithm="dion2",
             step=0,
             fraction=fraction,
         )
@@ -149,7 +149,7 @@ class Fron(Optimizer):
                 loss = closure()
 
         # Group by optimizers
-        fron_groups = []
+        dion2_groups = []
         lion_groups = []
         adamw_groups = []
 
@@ -158,8 +158,8 @@ class Fron(Optimizer):
 
             # Split parameter groups by algorithm
             algo = group["algorithm"]
-            if algo == "fron":
-                fron_groups.append(group)
+            if algo == "dion2":
+                dion2_groups.append(group)
             elif algo == "lion":
                 lion_groups.append(group)
             elif algo == "adamw":
@@ -168,19 +168,19 @@ class Fron(Optimizer):
                 raise ValueError(f"Unknown algorithm: {algo}")
 
         # Create async tasks for each algorithm
-        fron_tasks = self._create_fron_tasks(fron_groups)
+        dion2_tasks = self._create_dion2_tasks(dion2_groups)
         lion_tasks = self._create_lion_tasks(lion_groups)
         adamw_tasks = self._create_adamw_tasks(adamw_groups)
 
-        all_tasks = chain(fron_tasks, lion_tasks, adamw_tasks)
+        all_tasks = chain(dion2_tasks, lion_tasks, adamw_tasks)
         runtime = AsyncRuntime(all_tasks, max_concurrent_tasks=3)
         runtime.run()
 
         return loss
 
-    def _get_or_initialize_fron_state_layer(self, param: Tensor) -> dict:
+    def _get_or_initialize_dion2_state_layer(self, param: Tensor) -> dict:
         """
-        Layer-sharded momentum state for FRON:
+        Layer-sharded momentum state for dion2:
         - 'momentum_full' lives only on the owner rank (owner is implicitly device_rank).
         """
         st = self.state[param]
@@ -188,9 +188,9 @@ class Fron(Optimizer):
             st["momentum_full"] = None
         return st
 
-    def _get_or_initialize_fron_state_local(self, param: Tensor) -> dict:
+    def _get_or_initialize_dion2_state_local(self, param: Tensor) -> dict:
         """
-        Local-shard momentum state for FRON:
+        Local-shard momentum state for dion2:
         - Each rank keeps 'momentum_local' matching its local shard shape.
         """
         st = self.state[param]
@@ -224,10 +224,10 @@ class Fron(Optimizer):
             out.append({"momentum_full": None, "is_pad": True})
         return out
 
-    def _create_fron_tasks(
+    def _create_dion2_tasks(
         self,
         param_groups: List[dict],
-        algo_name: str = "fron",
+        algo_name: str = "dion2",
     ) -> Generator["AsyncTask", None, None]:
         """
         Helper function to create batches of matrices and generate
@@ -237,14 +237,14 @@ class Fron(Optimizer):
             assert group["algorithm"] == algo_name
             assert all(
                 p.ndim >= 2 for p in group["params"]
-            ), "Fron optimizer only supports matrix parameters."
+            ), "dion2 optimizer only supports matrix parameters."
 
             params = [p for p in group["params"] if p.grad is not None]
             if not params:
                 continue
 
             # Wrap hyperparameters as tensors for torch.compile
-            fron_args = dict(
+            dion2_args = dict(
                 lr=torch.tensor(group["lr"]),
                 ef_decay=torch.tensor(group["ef_decay"]),
                 fraction=torch.tensor(group["fraction"]),
@@ -309,7 +309,7 @@ class Fron(Optimizer):
                         sharded_tensor_dim = shard_placements[0][1].dim
                     elif len(shard_placements) > 1:
                         raise NotImplementedError(
-                            "Fron does not support parameters with multiple sharded dimensions."
+                            "dion2 does not support parameters with multiple sharded dimensions."
                         )
 
                     # Check that the sharded mesh dimension matches optimizer's device mesh
@@ -330,32 +330,32 @@ class Fron(Optimizer):
 
                     # For this case, we use local momentum per shard
                     for x, g in zip(batch_params, grads):
-                        st = self._get_or_initialize_fron_state_local(x)
+                        st = self._get_or_initialize_dion2_state_local(x)
 
                         # Create task for non-communicating local update
                         yield AsyncTask(
-                            fron_update_local_async(
+                            dion2_update_local_async(
                                 X=[x],
                                 G=[g],
                                 STATE=st,
-                                **fron_args,
+                                **dion2_args,
                             )
                         )
                     continue
 
                 # Otherwise we use layer-sharded momentum and owner mapping
                 states = [
-                    self._get_or_initialize_fron_state_layer(p) for p in batch_params
+                    self._get_or_initialize_dion2_state_layer(p) for p in batch_params
                 ]
 
                 # Create task for communicating batch update
                 yield AsyncTask(
-                    fron_update_batch_async(
+                    dion2_update_batch_async(
                         X=pad_batch(batch_params, self._world_size),
                         G=pad_batch(grads, self._world_size),
                         STATES=self._pad_states(states, self._world_size),
                         shard_dim=sharded_tensor_dim,
-                        **fron_args,
+                        **dion2_args,
                     )
                 )
 
@@ -448,7 +448,7 @@ class Fron(Optimizer):
             )
 
 
-def fron_update_local_async(
+def dion2_update_local_async(
     X: List[Tensor],
     G: List[Tensor],
     STATE: dict,  # Should put local momentum state here
@@ -487,7 +487,7 @@ def fron_update_local_async(
     )
 
     # Apply update locally
-    fron_update_post_orthogonalize(
+    dion2_update_post_orthogonalize(
         X=to_local([x]),
         U=[O_local],
         base_lr=lr,
@@ -497,7 +497,7 @@ def fron_update_local_async(
     yield
 
 
-def fron_update_batch_async(
+def dion2_update_batch_async(
     X: List[Tensor],  # DTensors or local Tensors
     G: List[Tensor],  # local shards (regular Tensors)
     STATES: List[dict],  # layer-sharded optimizer states (each has 'momentum_full')
@@ -515,7 +515,7 @@ def fron_update_batch_async(
     newton_schulz_func: Optional[Callable] = None,
 ) -> Generator[None, None, None]:
     """
-    FRON layer-sharded path:
+    dion2 layer-sharded path:
       - Matrix-dim sharded: all_to_all shards <-> full, compute once on owner, all_to_all back.
       - Replicated/unsharded: compute once on owner (index=device_rank), all_gather dense updates.
       - Single-GPU (batch size=1): compute once on owner, apply locally.
@@ -673,7 +673,7 @@ def fron_update_batch_async(
     X_local = to_local(X)
     U = [u.to(dtype=xi.dtype) for u, xi in zip(U, X_local)]
 
-    fron_update_post_orthogonalize(
+    dion2_update_post_orthogonalize(
         X=X_local,
         U=U,
         base_lr=lr,
@@ -744,7 +744,7 @@ def topk_and_orthonormalize(
     return O_full
 
 
-def fron_update_post_orthogonalize(
+def dion2_update_post_orthogonalize(
     X: List[Tensor],
     U: List[Tensor],
     base_lr: Tensor,

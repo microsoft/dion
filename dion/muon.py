@@ -581,7 +581,7 @@ def muon_update_post_orthogonalize(
         # Apply cautious weight decay: only where update and parameter signs align
         # Reference: https://arxiv.org/pdf/2510.12402
         coeff = base_lr * weight_decay
-        
+
         decay_masks = torch._foreach_mul(X, U)
         decay_masks = torch._foreach_sign(decay_masks)  # {-1, 0, 1}
         decay_masks = torch._foreach_add(decay_masks, 1)  # {0, 1, 2}

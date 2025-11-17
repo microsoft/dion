@@ -38,7 +38,7 @@ debug: false
 no_compile: false
 no_triton: false
 
-optimizer: fron
+optimizer: dion2
 rank_fraction: 0.5 
 scalar_opt: lion
 adjust_lr: spectral_norm
