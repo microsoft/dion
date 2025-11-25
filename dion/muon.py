@@ -238,9 +238,32 @@ class Muon(Optimizer):
                         sharded_mesh_dim = shard_placements[0][0]
                         sharded_tensor_dim = shard_placements[0][1].dim
                     elif len(shard_placements) > 1:
-                        raise NotImplementedError(
-                            "Muon does not support parameters with multiple sharded dimensions."
-                        )
+                        # Experts case: EP (dim 0) + FSDP (dim 1)
+                        # EP shards on dim 0 (num_experts) - no gradient sync needed)
+                        # FSDP shards on dim 1 - gradients reduce over FSDP mesh
+                        # Use FSDP sharding (non-dim-0)
+                        fsdp_placements = [
+                            (i, p) for i, p in shard_placements 
+                            if p.dim != 0  # EP shards on dim 0, FSDP on other dims
+                        ]
+                        
+                        if len(fsdp_placements) != 1:
+                            raise RuntimeError(
+                                f"Expected exactly one FSDP sharding (non-dim-0) for experts, "
+                                f"but got {len(fsdp_placements)}. Shard placements: {shard_placements}"
+                            )
+                        
+                        sharded_mesh_dim = fsdp_placements[0][0]
+                        sharded_tensor_dim = fsdp_placements[0][1].dim
+                        
+                        # Verify FSDP sharding matches optimizer mesh
+                        fsdp_mesh_group = params[0].device_mesh.get_group(sharded_mesh_dim)
+                        if fsdp_mesh_group != self._process_group:
+                            raise RuntimeError(
+                                f"FSDP sharding (mesh_dim={sharded_mesh_dim}) process group "
+                                f"({fsdp_mesh_group}) does not match optimizer's process group "
+                                f"({self._process_group})"
+                            )
 
                     # Check that the sharded mesh dimension matches optimizer's device mesh
                     if (
