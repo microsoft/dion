@@ -30,6 +30,7 @@ class Muon(Optimizer):
         params: Parameters for the optimizer.
         distributed_mesh: DeviceMesh or ProcessGroup for distributed training.
             Use DeviceMesh for FSDP2 and ProcessGroup for DistributedDataParallel.
+            Can be overridden per parameter group by setting "distributed_mesh" in the group dict.
         lr: Base learning rate. For Muon, this will be scaled based on the matrix dimensions.
             For element-wise update rules, this is the actual learning rate and no additional scaling is done.
         mu: Momentum factor for Muon algorithm.
@@ -182,6 +183,35 @@ class Muon(Optimizer):
                 state["variance"] = torch.zeros_like(param)
         return state
 
+    def _get_group_mesh_info(self, group: dict) -> Tuple[int, int, Optional[ProcessGroup], Optional[Union[DeviceMesh, ProcessGroup]]]:
+        """
+        Get mesh-related info for a parameter group.
+        Returns (device_rank, world_size, process_group, distributed_mesh).
+        Falls back to default mesh if group doesn't specify one.
+        """
+        group_mesh = group.get("distributed_mesh", None)
+        if group_mesh is None:
+            return (self._device_rank, self._world_size, self._process_group, self._distributed_mesh)
+        
+        # Parse group-specific mesh
+        if isinstance(group_mesh, DeviceMesh):
+            if group_mesh.ndim != 1:
+                raise ValueError(
+                    f"Only 1D DeviceMesh is supported, but got {group_mesh.ndim}D. For HSDP, provide the 1D sharded sub-mesh."
+                )
+            device_rank = group_mesh.get_local_rank()
+            world_size = group_mesh.size()
+            process_group = group_mesh.get_group()
+            return (device_rank, world_size, process_group, group_mesh)
+        elif isinstance(group_mesh, ProcessGroup):
+            device_rank = dist.get_rank(group_mesh)
+            world_size = dist.get_world_size(group_mesh)
+            return (device_rank, world_size, group_mesh, group_mesh)
+        else:
+            raise TypeError(
+                f"Invalid distributed_mesh type in group: {type(group_mesh)}. Expected DeviceMesh or ProcessGroup."
+            )
+
     def _create_muon_tasks(
         self,
         param_groups: List[dict],
@@ -201,6 +231,9 @@ class Muon(Optimizer):
             if not group_params:
                 continue
 
+            # Get group-specific mesh info
+            device_rank, world_size, process_group, distributed_mesh = self._get_group_mesh_info(group)
+
             # Wrap hyperparameters in tensors for torch.compile
             lr = torch.tensor(group["lr"])
             mu = torch.tensor(group["mu"])
@@ -210,9 +243,9 @@ class Muon(Optimizer):
             flatten = group["flatten"]
             adjust_lr = group["adjust_lr"]
 
-            # Create batches of parameters of size self._world_size
+            # Create batches of parameters of size world_size
             for params in create_param_batches(
-                group_params, batch_size=self._world_size
+                group_params, batch_size=world_size
             ):
                 gradients = [p.grad for p in params]
                 states = [self._get_or_initialize_state(p, algo_name) for p in params]
@@ -222,7 +255,7 @@ class Muon(Optimizer):
                 sharded_mesh_dim = None
                 sharded_tensor_dim = None
                 if isinstance(params[0], DTensor):
-                    if not isinstance(self._distributed_mesh, DeviceMesh):
+                    if not isinstance(distributed_mesh, DeviceMesh):
                         raise RuntimeError(
                             "Must create optimizer with DeviceMesh if using DTensor parameters."
                         )
@@ -242,21 +275,21 @@ class Muon(Optimizer):
                             "Muon does not support parameters with multiple sharded dimensions."
                         )
 
-                    # Check that the sharded mesh dimension matches optimizer's device mesh
+                    # Check that the sharded mesh dimension matches group's device mesh
                     if (
                         sharded_mesh_dim is not None
                         and params[0].device_mesh.get_group(sharded_mesh_dim)
-                        != self._process_group
+                        != process_group
                     ):
                         raise RuntimeError(
-                            f"Got DTensor sharded over mesh dimension {sharded_mesh_dim} different from the optimizer's device mesh"
+                            f"Got DTensor sharded over mesh dimension {sharded_mesh_dim} different from the group's device mesh"
                         )
 
                 yield AsyncTask(
                     muon_update_batch_async(
-                        X=pad_batch(params, self._world_size),
-                        G=pad_batch(gradients, self._world_size),
-                        M=pad_batch(momentums, self._world_size),
+                        X=pad_batch(params, world_size),
+                        G=pad_batch(gradients, world_size),
+                        M=pad_batch(momentums, world_size),
                         lr=lr,
                         momentum=mu,
                         weight_decay=weight_decay,
@@ -264,10 +297,10 @@ class Muon(Optimizer):
                         nesterov=nesterov,
                         flatten=flatten,
                         adjust_lr=adjust_lr,
-                        device_rank=self._device_rank,
-                        world_size=self._world_size,
+                        device_rank=device_rank,
+                        world_size=world_size,
                         shard_dim=sharded_tensor_dim,
-                        process_group=self._process_group,
+                        process_group=process_group,
                         newton_schulz_func=self._newton_schulz_func,
                     )
                 )
