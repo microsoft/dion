@@ -271,19 +271,21 @@ class Muon(Optimizer):
                         sharded_mesh_dim = shard_placements[0][0]
                         sharded_tensor_dim = shard_placements[0][1].dim
                     elif len(shard_placements) > 1:
-                        raise NotImplementedError(
-                            "Muon does not support parameters with multiple sharded dimensions."
+                        # print(f"HERREE {shard_placements=}")
+                        # Multiple shards (e.g., FSDP + EP): assume mesh_dim=0 is FSDP dimension
+                        # When dp_mod_ep_mesh is used, FSDP is typically the first mesh dimension
+                        matching_shard = next(
+                            ((mesh_dim, p) for mesh_dim, p in shard_placements if mesh_dim == 0),
+                            None
                         )
+                        if matching_shard is None:
+                            raise RuntimeError(
+                                f"Expected mesh_dim=0 to be sharded for FSDP, but found sharded mesh dims: {[d for d, _ in shard_placements]}"
+                            )
+                        
+                        sharded_mesh_dim = matching_shard[0]
+                        sharded_tensor_dim = matching_shard[1].dim
 
-                    # Check that the sharded mesh dimension matches group's device mesh
-                    if (
-                        sharded_mesh_dim is not None
-                        and params[0].device_mesh.get_group(sharded_mesh_dim)
-                        != process_group
-                    ):
-                        raise RuntimeError(
-                            f"Got DTensor sharded over mesh dimension {sharded_mesh_dim} different from the group's device mesh"
-                        )
 
                 yield AsyncTask(
                     muon_update_batch_async(
