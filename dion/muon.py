@@ -56,6 +56,7 @@ class Muon(Optimizer):
     def __init__(
         self,
         params: ParamsT,
+        fsdp_mesh_dim: int,
         distributed_mesh: Optional[Union[DeviceMesh, ProcessGroup]] = None,
         lr: float = 0.01,
         mu: float = 0.95,
@@ -79,6 +80,9 @@ class Muon(Optimizer):
             raise ValueError(
                 f"Invalid adjust_lr value: {adjust_lr}. Must be 'spectral_norm', 'rms_norm', 'keller_muon', or None."
             )
+            
+            
+        self.fsdp_mesh_dim = fsdp_mesh_dim
 
         # Default arguments for each param group
         defaults = dict(
@@ -271,17 +275,31 @@ class Muon(Optimizer):
                         sharded_mesh_dim = shard_placements[0][0]
                         sharded_tensor_dim = shard_placements[0][1].dim
                     elif len(shard_placements) > 1:
+                    
                         # print(f"HERREE {shard_placements=}")
+                        # most of the time it should look like this
+                        # shard_placements=[(0, _StridedShard(dim=0, sf=2)), (1, Shard(dim=0))]
+                        # matching_shard = shard_placements[0]
+                        
+                        
+                        # if low experts count aka  dp_mod_ep * ep > num_experts (in this case experts will shard for fsdp on dim 1)
+                        # shard_placements=[(0, Shard(dim=1)), (1, Shard(dim=0))]
+                        
+                        
+                        # if dp replicate and low experts count aka  dp_mod_ep * ep > num_experts (in this case experts will shard for fsdp on dim 1)
+                        # shard_placements=[(1, Shard(dim=1)), (2, Shard(dim=0))] 
+                                                
                         # Multiple shards (e.g., FSDP + EP): assume mesh_dim=0 is FSDP dimension
                         # When dp_mod_ep_mesh is used, FSDP is typically the first mesh dimension
                         matching_shard = next(
-                            ((mesh_dim, p) for mesh_dim, p in shard_placements if mesh_dim == 0),
+                            ((mesh_dim, p) for mesh_dim, p in shard_placements if mesh_dim == self.fsdp_mesh_dim),
                             None
                         )
                         if matching_shard is None:
                             raise RuntimeError(
                                 f"Expected mesh_dim=0 to be sharded for FSDP, but found sharded mesh dims: {[d for d, _ in shard_placements]}"
                             )
+                            
                         
                         sharded_mesh_dim = matching_shard[0]
                         sharded_tensor_dim = matching_shard[1].dim
