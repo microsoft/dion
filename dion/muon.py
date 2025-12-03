@@ -57,6 +57,7 @@ class Muon(Optimizer):
         self,
         params: ParamsT,
         fsdp_mesh_dim: int,
+        world_mesh: DeviceMesh,
         distributed_mesh: Optional[Union[DeviceMesh, ProcessGroup]] = None,
         lr: float = 0.01,
         mu: float = 0.95,
@@ -83,6 +84,7 @@ class Muon(Optimizer):
             
             
         self.fsdp_mesh_dim = fsdp_mesh_dim
+        self._world_mesh = world_mesh
 
         # Default arguments for each param group
         defaults = dict(
@@ -193,11 +195,12 @@ class Muon(Optimizer):
         Returns (device_rank, world_size, process_group, distributed_mesh).
         Falls back to default mesh if group doesn't specify one.
         """
-        group_mesh = group.get("distributed_mesh", None)
-        if group_mesh is None:
+        group_mesh_name = group.get("distributed_mesh_name", None)
+        if group_mesh_name is None:
             return (self._device_rank, self._world_size, self._process_group, self._distributed_mesh)
         
         # Parse group-specific mesh
+        group_mesh = self._world_mesh[group_mesh_name]
         if isinstance(group_mesh, DeviceMesh):
             if group_mesh.ndim != 1:
                 raise ValueError(
