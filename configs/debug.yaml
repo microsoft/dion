@@ -1,0 +1,42 @@
+
+# — Model —
+model_dim: 768
+n_layer: 12
+n_head: 6
+sequence_length: 128 
+
+# — Batching & Training — 
+num_iterations: 3000
+batch_size: 1024
+device_batch_size: 256
+
+# — Learning‐rate schedule —
+warmup_ratio: 0.0
+warmdown_ratio: 0.2
+
+# — Validation & Checkpointing —
+val_loss_every: 125
+val_tokens: 10485760 
+
+# — Weights & Biases logging —
+wandb_project_name: debug
+wandb_job_name: null
+no_wandb: false
+
+# — Miscellaneous flags —
+debug: false
+no_compile: false
+
+# — Distributed training — 
+fs_size: 4     # FSDP size 
+
+# — Optimizer & Hyperparameters —
+optimizer: dion2
+scalar_opt: lion
+mu: 0.95
+weight_decay: 0.01
+ortho_fraction: 0.25
+lr: 0.02 
+  
+shard_independent: true
+no_validation: false

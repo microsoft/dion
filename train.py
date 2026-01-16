@@ -52,6 +52,7 @@ class Hyperparameters:
     # Evaluation and logging
     val_loss_every: int = 125
     val_tokens: int = 10485760
+    no_validation: bool = False
     checkpoint_freq: int = 0
     checkpoint_dir: str = None
     wandb_project_name: str = "dion-test"
@@ -75,7 +76,7 @@ class Hyperparameters:
     adjust_lr: str = "spectral_norm"  # for Muon only
 
     # For printing out selection choice in Dion2
-    verbose: bool = True
+    shard_independent: bool = False
 
 
 # Helper function to only print on global rank 0
@@ -418,7 +419,7 @@ def init_optimizer(
             lr=hp.lr,
             mu=hp.mu,
             weight_decay=hp.weight_decay,
-            nesterov=True,
+            nesterov=False,
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
         )
@@ -431,13 +432,30 @@ def init_optimizer(
                 outer_shard_mesh if outer_shard_mesh.size() > 1 else replicate_mesh
             )
             comm_method = "all-to-all" if outer_shard_mesh.size() > 1 else "all-gather"
+            is_sharded = outer_shard_mesh.size() > 1
         else:
             assert ddp_model is not None
             distributed_mesh = ddp_model.process_group  # using ProcessGroup for DDP
             comm_method = "all-gather"
+            is_sharded = False
         print0(f"LR adjust method: {hp.adjust_lr}")
         print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
         print0(f"Distributed Dion2 using: {comm_method}")
+        if is_sharded:
+            if hp.shard_independent:
+                print0(
+                    "Using shard-independent Dion2 path.\n"
+                    "  - Selects top-k rows/cols on the FULL matrix\n"
+                    "  - Algorithm behavior is identical regardless of sharding configuration"
+                )
+            else:
+                print0(
+                    "Using shard-dependent Dion2 path.\n"
+                    "  - Selects top-k rows/cols on LOCAL shards\n"
+                    "  - Algorithm behavior may vary with different sharding configurations\n"
+                    "  - Benefit: Only communicates selected submatrices (less communication)"
+                )
+        
         opt = Dion2(
             param_groups,
             distributed_mesh=distributed_mesh,
@@ -447,7 +465,7 @@ def init_optimizer(
             weight_decay=hp.weight_decay,
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
-            verbose=hp.verbose,
+            shard_independent=hp.shard_independent,
         )
     elif hp.optimizer == "normuon":
         if device_mesh is not None:
@@ -472,7 +490,7 @@ def init_optimizer(
             mu=hp.mu,
             muon_beta2=0.95,
             weight_decay=hp.weight_decay,
-            nesterov=True,
+            nesterov=False,
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
         )
@@ -496,7 +514,7 @@ def init_optimizer(
             lr=hp.lr,
             mu=hp.mu,
             weight_decay=hp.weight_decay,
-            nesterov=True,
+            nesterov=False,
             adjust_lr=hp.adjust_lr,
         )
 
@@ -813,10 +831,13 @@ def main():
         optimizer_name = f"{hp.ortho_fraction}-{hp.optimizer}"
 
     run_name = f"({optimizer_name}+{hp.scalar_opt})"
+    
 
     if device_mesh is not None:
         dp, fs, tp = device_mesh.size(0), device_mesh.size(1), device_mesh.size(2)
         run_name += f"_(dp={dp}, fs={fs}, tp={tp})"
+        if "dion2" in hp.optimizer and hp.shard_independent:
+            run_name += "_shard-indep"
     if cli_args.wandb_job_name:
         run_name += f"_{cli_args.wandb_job_name}"
 
@@ -901,42 +922,43 @@ def main():
         # --- Validation ---
         last_step = step == hp.num_iterations
         if last_step or (hp.val_loss_every > 0 and step % hp.val_loss_every == 0):
-            # Measure elapsed time for training
-            torch.cuda.synchronize()
-            training_time_ms += 1000 * (time.time() - t0)
+            if not hp.no_validation:
+                # Measure elapsed time for training
+                torch.cuda.synchronize()
+                training_time_ms += 1000 * (time.time() - t0)
 
-            # Run validation
-            model.eval()
-            val_loader.reset()
-            val_loss = torch.tensor(0.0, device=x.device)
-            for _ in range(val_steps):
-                with torch.no_grad():
-                    x_val, y_val = val_loader.next_batch()
-                    with autocast_ctx:
-                        loss = model(x_val, y_val)
-                    val_loss += loss
+                # Run validation
+                model.eval()
+                val_loader.reset()
+                val_loss = torch.tensor(0.0, device=x.device)
+                for _ in range(val_steps):
+                    with torch.no_grad():
+                        x_val, y_val = val_loader.next_batch()
+                        with autocast_ctx:
+                            loss = model(x_val, y_val)
+                        val_loss += loss
 
-            # Average validation loss across devices
-            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-            val_loss = val_loss.item() / val_steps
-            log_message = (
-                f"step:{step}/{hp.num_iterations} val_loss:{val_loss:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps):.2f}ms"
-            )
-            print0(log_message)
-            if MASTER_PROCESS and not cli_args.no_wandb and not cli_args.debug:
-                wandb.log(
-                    {
-                        "val/loss": val_loss,
-                        "step": step,
-                        "time/training_time_ms": training_time_ms,  # Log total elapsed training time in ms
-                    }
+                # Average validation loss across devices
+                dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+                val_loss = val_loss.item() / val_steps
+                log_message = (
+                    f"step:{step}/{hp.num_iterations} val_loss:{val_loss:.4f} "
+                    f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps):.2f}ms"
                 )
-            pbar.set_postfix(val_loss=f"{val_loss:.4f}")
+                print0(log_message)
+                if MASTER_PROCESS and not cli_args.no_wandb and not cli_args.debug:
+                    wandb.log(
+                        {
+                            "val/loss": val_loss,
+                            "step": step,
+                            "time/training_time_ms": training_time_ms,  # Log total elapsed training time in ms
+                        }
+                    )
+                pbar.set_postfix(val_loss=f"{val_loss:.4f}")
 
-            # Restart training time for the next iteration
-            torch.cuda.synchronize()
-            t0 = time.time()
+                # Restart training time for the next iteration
+                torch.cuda.synchronize()
+                t0 = time.time()
 
         if last_step:
             break
@@ -985,6 +1007,7 @@ def main():
                 {
                     "train/loss": train_loss.item(),
                     "train/grad_norm": grad_norm.item(),
+                    "train/base_lr": lr_scheduler.get_last_lr()[0],
                     "step": step,
                     "time/training_time_ms": approx_time,  # Log approximate elapsed training time in ms
                 }

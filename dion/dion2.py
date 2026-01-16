@@ -1,3 +1,4 @@
+# dion2.py
 import math
 import torch
 import torch.distributed as dist
@@ -51,9 +52,10 @@ class Dion2(Optimizer):
         use_triton: Whether to use Triton kernel for Newton-Schulz. Ignored if custom function is provided.
         newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
             Signature is `func(input: Tensor, epsilon: float) -> Tensor`.
-        verbose: Whether to print debug information during updates. If True, it prints whether rows or columns are selected for the submatrix selection process.
+        shard_independent: If True, use shard-independent row selection for Dion2.
+            This incurs higher communication cost due to all-to-all of full matrices,
 
-    Dion2 optimizer by Ahn et al.: TBD
+    Dion2 optimizer by Ahn et al.: https://arxiv.org/abs/2512.16928
     """
 
     def __init__(
@@ -70,7 +72,7 @@ class Dion2(Optimizer):
         flatten: bool = False,
         use_triton: bool = False,
         newton_schulz_func: Optional[Callable] = None,
-        verbose: bool = False,
+        shard_independent: bool = False,
     ):
         # Validate hyperparameters
         if lr < 0.0:
@@ -135,7 +137,7 @@ class Dion2(Optimizer):
             self._newton_schulz_func = newton_schulz_triton
         else:
             self._newton_schulz_func = zeropower_via_newtonschulz5
-        self.verbose = verbose
+        self.shard_independent = shard_independent
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -167,7 +169,7 @@ class Dion2(Optimizer):
                 raise ValueError(f"Unknown algorithm: {algo}")
 
         # Create async tasks for each algorithm
-        dion2_tasks = self._create_dion2_tasks(dion2_groups, verbose=self.verbose)
+        dion2_tasks = self._create_dion2_tasks(dion2_groups)
         lion_tasks = self._create_lion_tasks(lion_groups)
         adamw_tasks = self._create_adamw_tasks(adamw_groups)
 
@@ -192,7 +194,6 @@ class Dion2(Optimizer):
     def _create_dion2_tasks(
         self,
         param_groups: List[dict],
-        verbose: bool = False,
     ) -> Generator["AsyncTask", None, None]:
         """
         Helper function to create batches of Dion2 matrices and generate
@@ -223,6 +224,7 @@ class Dion2(Optimizer):
                 world_size=self._world_size,
                 process_group=self._process_group,
                 newton_schulz_func=self._newton_schulz_func,
+                shard_independent=self.shard_independent,
             )
 
             # Create batches of parameters of size self._world_size
@@ -264,6 +266,15 @@ class Dion2(Optimizer):
                             (i, p) for i, p in shard_placements if p.dim in matrix_dims
                         ]
 
+                    # We currently do not support tensors sharded along the last dimension because Dion2
+                    # normalization later assumes a full trailing axis when computing means.
+                    if any(p.dim == params[0].ndim - 1 for _, p in shard_placements):
+                        raise NotImplementedError(
+                            "Dion2 currently does not support parameters sharded along the last dimension. "
+                            "Please avoid shards at dim -1."
+                            "(Note: Default behavior of FSDP2 is to shard along dim-0.)"
+                        )
+
                     # Check that we have no more than 1 sharded matrix dimension
                     # Note that non-flattened 3D tensors can have additional sharded batch dimensions
                     # Flattened 3D tensors are limited to one sharded dimension out of all dimensions
@@ -299,7 +310,6 @@ class Dion2(Optimizer):
                                 M=[m],
                                 shard_dim=None,  # No sharded matrix dim
                                 **dion2_args,
-                                verbose=verbose,
                             )
                         )
                 # Otherwise, we parallelize the Muon update across devices
@@ -311,7 +321,6 @@ class Dion2(Optimizer):
                             M=pad_batch(momentums, self._world_size),
                             shard_dim=sharded_tensor_dim,
                             **dion2_args,
-                            verbose=verbose,
                         )
                     )
 
@@ -412,7 +421,7 @@ def dion2_update_batch_async(
     shard_dim: Optional[int] = None,  # Shard dimension for DTensor (if applicable)
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
-    verbose: bool = False,
+    shard_independent: bool = False,
 ) -> Generator[None, None, None]:
     """
     Batched version of Dion2 update. Batch size should be equal to number of GPUs.
@@ -422,137 +431,210 @@ def dion2_update_batch_async(
     assert len(X) == len(G)
     assert len(X) == len(M)
 
-    # Determine selection dimension based on sharding and tensor shape:
-    # For sharded matrices, we align select_dim with shard_dim
-    # For unsharded matrices (DDP or single-GPU), we select the shorter dimension
-    ndim = X[0].ndim
-    select_dim = None
+    # ALways select submtrix based on row-wise selection
+    # This way it chooses the submatrix neuron-wise
+    select_dim = -2
 
-    if shard_dim is not None:
-        # Normalize shard_dim to negative indexing for unified treatment
-        shard_dim = shard_dim if shard_dim < 0 else shard_dim - ndim
-        if shard_dim == -2:
-            select_dim = -2  # Row-sharded
-        elif shard_dim == -1:
-            select_dim = -1  # Column-sharded
-
-    # Fall-back to shorter dimension when DDP, Single-GPU, or batch-sharded
-    if select_dim is None:
-        num_rows, num_cols = X[0].shape[-2:]
-        select_dim = -2 if num_rows <= num_cols else -1
-
-    # Print how the selection choice based on shard_dim and tensor shape
-    if verbose:
-        _print_selection_choice(X[0].shape, shard_dim, select_dim, ndim)
-
-    # Update momentum and select top-α fraction along select_dim
-    U_selected, indices_list = dion2_pre_orthogonalize(
-        G=to_local(G),
-        M=to_local(M),
-        fraction=fraction,
-        ef_decay=ef_decay,
-        select_dim=select_dim,
-    )
-
-    # Get one whole matrix for each device to orthogonalize
-    if shard_dim is not None:
-        # Use all-to-all to transform from a batch of shards to a single whole matrix
-        # https://www.essential.ai/blog/infra
-        assert len(X) == world_size, "Batch size must equal world size"
-        assert (
-            process_group is not None
-        ), "process_group must be provided for sharded DTensors"
-        assert isinstance(X[0], DTensor), "X should contain DTensors"
-        assert (
-            X[0].size(shard_dim) % world_size == 0
-        ), f"Shard dimension {shard_dim} size {X[0].size(shard_dim)} is not divisible by world size {world_size}."
-
-        # Allocate buffers to receive shards of one whole submatrix from other devices
-        recv_shards = [torch.empty_like(u) for u in U_selected]
-        work = dist.all_to_all(
-            recv_shards, U_selected, group=process_group, async_op=True
-        )
-        yield
-        work.wait()
-
-        # Concatentate shards to form a whole matrix to orthogonalize
-        # Only submatrix is orthogonalized!
-        full_submatrix = torch.cat(recv_shards, dim=select_dim)
-        full_submatrix = muon_update_newton_schulz(
-            full_submatrix, newton_schulz_func, flatten=flatten, epsilon=epsilon
-        )
-
-        # Split result back into shards
-        # Contiguous is needed for all-to-all to work correctly
-        send_shards = [
-            t.contiguous()
-            for t in torch.tensor_split(full_submatrix, world_size, dim=select_dim)
-        ]
-
-        # Redistribute the orthogonalized tensor back to original layout
-        U_ortho = [torch.empty_like(u) for u in U_selected]
-        work = dist.all_to_all(U_ortho, send_shards, group=process_group, async_op=True)
-        yield
-        work.wait()
-
-    # Matrices are not sharded, so we can distribute the batch across different devices
-    # Get a single matrix of the batch corresponding to this device
-    elif len(U_selected) > 1:
-        assert len(U_selected) == world_size, "Batch size must equal world size"
+    # Shard-independent path:
+    # The row-selection process is independent of the sharding configuration.
+    # However, this comes with the cost of all-to-all communication of full matrices.
+    if shard_dim is not None and shard_independent:
+        assert len(X) == world_size
         assert process_group is not None
 
-        single_matrix = U_selected[device_rank]
-        assert not isinstance(single_matrix, DTensor)
+        M_local = to_local(M)
+        G_local = to_local(G)
+        dtype = M_local[0].dtype
 
-        single_ortho = muon_update_newton_schulz(
-            single_matrix,
-            newton_schulz_func,
-            flatten=flatten,
-            epsilon=epsilon,
-        )
+        # Update momentum locally: M = M + G
+        G_casted = [g.to(dtype=dtype) for g in G_local]
+        torch._foreach_add_(M_local, G_casted)
 
-        # Allocate empty tensors to receive updates from other devices
-        U_ortho = [torch.empty_like(u) for u in U_selected]
-        # All gather orthogonalized results from other devices into buffer
-        work = dist.all_gather(
-            U_ortho, single_ortho.contiguous(), group=process_group, async_op=True
-        )
+        # All-to-all to get one full matrix per device
+        M_recv = [torch.empty_like(M_local[0]) for _ in range(world_size)]
+        work = dist.all_to_all(M_recv, M_local, group=process_group, async_op=True)
         yield
         work.wait()
 
-    # Single tensor with no sharded dimension. This happens in 2 cases:
-    # - Running on a single GPU
-    # - 3D+ tensors sharded along a batch dimension (different whole matrices per device)
-    else:
-        assert len(U_selected) == 1
-        U_ortho = [
-            muon_update_newton_schulz(
-                U_selected[0], newton_schulz_func, flatten=flatten, epsilon=epsilon
-            )
+        # Concatenate to form full matrix
+        M_full = torch.cat(M_recv, dim=shard_dim)
+        full_rows, full_cols = M_full.shape[-2:]
+
+        # Select top-k on full matrix
+        num_select = M_full.size(select_dim)
+        k = max(1, int(math.ceil(fraction * num_select)))
+
+        slice_norms = M_full.norm(p=1, dim=-1)
+        _, indices = torch.topk(slice_norms, k, dim=-1, sorted=False)
+
+        # Extract and orthonormalize
+        U_selected = M_full.index_select(dim=select_dim, index=indices).to(
+            dtype=torch.bfloat16
+        )
+        U_ortho = muon_update_newton_schulz(
+            U_selected, newton_schulz_func, flatten=flatten, epsilon=epsilon
+        )
+
+        # Construct dense update matrix (zeros on the unchosen rows/cols)
+        U_dense_full = torch.zeros(
+            M_full.shape, dtype=U_ortho.dtype, device=U_ortho.device
+        )
+        idx_exp = indices.unsqueeze(-1).expand(-1, full_cols)
+        U_dense_full.scatter_(-2, idx_exp, U_ortho)
+
+        # All-to-all scatter dense U back to shards
+        U_send = [
+            t.contiguous()
+            for t in torch.tensor_split(U_dense_full, world_size, dim=shard_dim)
         ]
+        U_recv = [torch.empty_like(U_send[0]) for _ in range(world_size)]
 
-    # Compute scaled learning rate
-    # Do this before to_local(X) because we use the full tensor shape, not the shard shape
-    if adjust_lr is None:
-        adjusted_lr = lr
-    elif adjust_lr == "spectral_norm":
-        adjusted_lr = adjust_lr_spectral_norm(lr, X[0].shape, flatten=flatten)
-    elif adjust_lr == "rms_norm":
-        adjusted_lr = adjust_lr_rms_norm(lr, X[0].shape, flatten=flatten)
+
+        work = dist.all_to_all(U_recv, U_send, group=process_group, async_op=True)
+        yield
+        work.wait()
+
+        # Infer selected indices from non-zero rows/cols and apply error-feedback decay locally
+        dion2_apply_ef_decay_from_dense(
+            M=M_local,
+            U_dense=U_recv,
+            ef_decay=ef_decay,
+            select_dim=select_dim,
+        )
+
+        # Compute scaled learning rate
+        # Do this before to_local(X) because we use the full tensor shape, not the shard shape
+        if adjust_lr is None:
+            adjusted_lr = lr
+        elif adjust_lr == "spectral_norm":
+            adjusted_lr = adjust_lr_spectral_norm(lr, X[0].shape, flatten=flatten)
+        elif adjust_lr == "rms_norm":
+            adjusted_lr = adjust_lr_rms_norm(lr, X[0].shape, flatten=flatten)
+        else:
+            raise ValueError(f"Unknown adjust_lr: {adjust_lr}")
+
+        # Apply weight update using dense U
+        dion2_post_orthogonalize_dense(
+            X=to_local(X),
+            U_dense=U_recv,
+            base_lr=lr,
+            adjusted_lr=adjusted_lr,
+            weight_decay=weight_decay,
+        )
+    
+    # This path corresponds to the case when `shard-independent` is False
+    # When shard_dim is not None, the row selection process depends on the sharding configuration.
+    # This is because each shard chooses its own top-k rows based on local momentum.
+    # This path only communicates the selected submatrices for orthogonalization, which leads to less communication.
     else:
-        raise ValueError(f"Unknown adjust_lr: {adjust_lr}")
+        # Update momentum and select top-fraction along select_dim
+        U_selected, indices_list = dion2_pre_orthogonalize(
+            G=to_local(G),
+            M=to_local(M),
+            fraction=fraction,
+            ef_decay=ef_decay,
+            select_dim=select_dim,
+        )
 
-    # Update model parameters with orthogonalized output
-    # Weight update is applied to selected slices only
-    dion2_post_orthogonalize(
-        X=to_local(X),
-        U=U_ortho,
-        indices=indices_list,
-        base_lr=lr,
-        adjusted_lr=adjusted_lr,
-        weight_decay=weight_decay,
-        select_dim=select_dim,
-    )
+        # Get one whole matrix for each device to orthogonalize
+        if shard_dim is not None:
+            # Use all-to-all to transform from a batch of shards to a single whole matrix
+            # https://www.essential.ai/blog/infra
+            assert len(X) == world_size, "Batch size must equal world size"
+            assert (
+                process_group is not None
+            ), "process_group must be provided for sharded DTensors"
+            assert isinstance(X[0], DTensor), "X should contain DTensors"
+            assert (
+                X[0].size(shard_dim) % world_size == 0
+            ), f"Shard dimension {shard_dim} size {X[0].size(shard_dim)} is not divisible by world size {world_size}."
+
+            # Allocate buffers to receive shards of one whole submatrix from other devices
+            recv_shards = [torch.empty_like(u) for u in U_selected]
+            work = dist.all_to_all(
+                recv_shards, U_selected, group=process_group, async_op=True
+            )
+            yield
+            work.wait()
+
+            # Concatentate shards to form a whole matrix to orthogonalize
+            # Only submatrix is orthogonalized!
+            full_submatrix = torch.cat(recv_shards, dim=select_dim)
+            full_submatrix = muon_update_newton_schulz(
+                full_submatrix, newton_schulz_func, flatten=flatten, epsilon=epsilon
+            )
+
+            # Split result back into shards
+            # Contiguous is needed for all-to-all to work correctly
+            send_shards = [
+                t.contiguous()
+                for t in torch.tensor_split(full_submatrix, world_size, dim=select_dim)
+            ]
+
+            # Redistribute the orthogonalized tensor back to original layout
+            U_ortho = [torch.empty_like(u) for u in U_selected]
+            work = dist.all_to_all(U_ortho, send_shards, group=process_group, async_op=True)
+            yield
+            work.wait()
+
+        # Matrices are not sharded, so we can distribute the batch across different devices
+        # Get a single matrix of the batch corresponding to this device
+        elif len(U_selected) > 1:
+            assert len(U_selected) == world_size, "Batch size must equal world size"
+            assert process_group is not None
+
+            single_matrix = U_selected[device_rank]
+            assert not isinstance(single_matrix, DTensor)
+
+            single_ortho = muon_update_newton_schulz(
+                single_matrix,
+                newton_schulz_func,
+                flatten=flatten,
+                epsilon=epsilon,
+            )
+
+            # Allocate empty tensors to receive updates from other devices
+            U_ortho = [torch.empty_like(u) for u in U_selected]
+            # All gather orthogonalized results from other devices into buffer
+            work = dist.all_gather(
+                U_ortho, single_ortho.contiguous(), group=process_group, async_op=True
+            )
+            yield
+            work.wait()
+
+        # Single tensor with no sharded dimension. This happens in 2 cases:
+        # - Running on a single GPU
+        # - 3D+ tensors sharded along a batch dimension (different whole matrices per device)
+        else:
+            assert len(U_selected) == 1
+            U_ortho = [
+                muon_update_newton_schulz(
+                    U_selected[0], newton_schulz_func, flatten=flatten, epsilon=epsilon
+                )
+            ]
+
+        # Compute scaled learning rate
+        # Do this before to_local(X) because we use the full tensor shape, not the shard shape
+        if adjust_lr is None:
+            adjusted_lr = lr
+        elif adjust_lr == "spectral_norm":
+            adjusted_lr = adjust_lr_spectral_norm(lr, X[0].shape, flatten=flatten)
+        elif adjust_lr == "rms_norm":
+            adjusted_lr = adjust_lr_rms_norm(lr, X[0].shape, flatten=flatten)
+        else:
+            raise ValueError(f"Unknown adjust_lr: {adjust_lr}")
+
+        # Update model parameters with orthogonalized output
+        # Weight update is applied to selected slices only
+        dion2_post_orthogonalize(
+            X=to_local(X),
+            U=U_ortho,
+            indices=indices_list,
+            base_lr=lr,
+            adjusted_lr=adjusted_lr,
+            weight_decay=weight_decay,
+            select_dim=select_dim,
+        )
 
 
 @torch.compile(fullgraph=True)
@@ -633,6 +715,7 @@ def dion2_post_orthogonalize(
     Inputs and outputs should be lists of regular Tensor, not DTensor.
     This is a separate function for compatibility with torch.compile().
     """
+    # Apply weight decay
     torch._foreach_mul_(X, 1 - base_lr * weight_decay)
 
     # Convert U to match parameter dtype
@@ -645,44 +728,48 @@ def dion2_post_orthogonalize(
         x.index_add_(dim=select_dim, index=idx, source=u_scaled)
 
 
-# A helper function to print selection chocie for each matrix
-# It only prints once `verbose` is set True
-_printed_configs: set = set()
-
-
-def _print_selection_choice(
-    shape: torch.Size,
-    shard_dim: Optional[int],
+def dion2_apply_ef_decay_from_dense(
+    M: List[Tensor],
+    U_dense: List[Tensor],
+    ef_decay: Tensor,
     select_dim: int,
-    ndim: int,
 ):
-    config_key = (tuple(shape), shard_dim, select_dim)
-    if config_key not in _printed_configs:
-        _printed_configs.add(config_key)
+    """
+    Infer selected indices from non-zero rows/cols in U_dense,
+    then apply error-feedback decay to those rows/cols in M.
+    This function is used for `shard-independent' path of the Dion2 update.
+    """
+    norm_dim = -1 if select_dim == -2 else -2
 
-        num_rows, num_cols = shape[-2:]
-        select_info = "rows" if select_dim == -2 else "columns"
-        norm_info = "row norms" if select_dim == -2 else "col norms"
+    for m, u in zip(M, U_dense):
+        # Check if ANY element in the row/col is non-zero
+        any_nonzero = (u != 0).any(dim=norm_dim)
+        indices = torch.where(any_nonzero)[0]
 
-        if shard_dim is None:
-            mode = "DDP/Single-GPU"
-            shorter = "rows" if num_rows <= num_cols else "cols"
-            reason = f"shorter dim = {shorter} ({min(num_rows, num_cols)})"
-        else:
-            # Normalize shard_dim for display
-            normalized = shard_dim if shard_dim < 0 else shard_dim - ndim
-            if normalized == -2:
-                mode = "FSDP"
-                reason = f"row-sharded (shard_dim={shard_dim}→-2)"
-            elif normalized == -1:
-                mode = "FSDP"
-                reason = f"col-sharded (shard_dim={shard_dim}→-1)"
-            else:
-                mode = "FSDP batch-sharded"
-                shorter = "rows" if num_rows <= num_cols else "cols"
-                reason = f"shard_dim={shard_dim} (batch), shorter = {shorter}"
+        # Apply error-feedback decay on the non-zero rows/cols
+        if indices.numel() > 0:
+            selected_slice = m.index_select(dim=select_dim, index=indices)
+            m.index_copy_(
+                dim=select_dim, index=indices, source=selected_slice * ef_decay
+            )
 
-        print(
-            f"[Dion2] Shape {tuple(shape)}: {mode}, {reason} → "
-            f"select top-α {select_info} by {norm_info}"
-        )
+
+def dion2_post_orthogonalize_dense(
+    X: List[Tensor],
+    U_dense: List[Tensor],
+    base_lr: Tensor,
+    adjusted_lr: Tensor,
+    weight_decay: Tensor,
+):
+    """
+    Apply weight decay and weight update.
+    This function assumes that the update is dense (zeros on unselected rows/cols).
+    This is used for `shard-independent' path of the Dion2 update.
+    """
+    # Apply weight decay
+    torch._foreach_mul_(X, 1 - base_lr * weight_decay)
+
+    # Dense weight update
+    dtype = X[0].dtype
+    U_casted = [u.to(dtype=dtype) for u in U_dense]
+    torch._foreach_add_(X, U_casted, alpha=-adjusted_lr)
