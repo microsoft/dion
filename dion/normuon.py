@@ -43,6 +43,19 @@ class NorMuon(DistributedOrthoBase):
         use_triton: Whether to use Triton kernel for Newton-Schulz. Ignored if custom function is provided.
         newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
             Signature is ``func(input: Tensor, epsilon: float) -> Tensor``.
+        skip_update_prob: SkipUpdate survival probability p ∈ (0, 1].
+            Each parameter matrix is independently skipped with probability (1-p) at each step.
+            Surviving updates are rescaled by 1/p to keep updates unbiased in expectation.
+            Moment buffers always update densely (regardless of skip).
+            None (default) disables SkipUpdate.
+            See: "On Surprising Effectiveness of Masking Updates in Adaptive Optimizers".
+        magma_tau: Magma temperature τ > 0. When set, enables Magma mode which replaces the
+            fixed 1/p rescaling with an adaptive EMA scale based on momentum-gradient alignment:
+              ẽ_t = sigmoid(cossim(momentum_before, grad) / τ)
+              s_t = 0.9 * s_{t-1} + 0.1 * ẽ_t
+            Bernoulli(0.5) masking is still applied; s_t modulates the surviving update.
+            Requires skip_update_prob to also be set. None (default) uses fixed SkipUpdate scaling.
+            See: "On Surprising Effectiveness of Masking Updates in Adaptive Optimizers".
 
     Muon optimizer algorithm by Keller Jordan: https://kellerjordan.github.io/posts/muon/
     FSDP2 Muon uses all-to-all communications: https://www.essential.ai/blog/infra
@@ -65,6 +78,8 @@ class NorMuon(DistributedOrthoBase):
         flatten: bool = False,
         use_triton: bool = False,
         newton_schulz_func: Optional[Callable] = None,
+        skip_update_prob: Optional[float] = None,
+        magma_tau: Optional[float] = None,
     ):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -78,6 +93,13 @@ class NorMuon(DistributedOrthoBase):
             raise ValueError(
                 f"Invalid adjust_lr value: {adjust_lr}. Must be 'spectral_norm', 'rms_norm', or None."
             )
+        # SkipUpdate / Magma: validate parameters
+        if skip_update_prob is not None and not (0.0 < skip_update_prob <= 1.0):
+            raise ValueError(f"skip_update_prob must be in (0, 1], got {skip_update_prob}")
+        if magma_tau is not None and magma_tau <= 0.0:
+            raise ValueError(f"magma_tau must be > 0, got {magma_tau}")
+        if magma_tau is not None and skip_update_prob is None:
+            raise ValueError("magma_tau requires skip_update_prob to be set")
 
         defaults = dict(
             lr=lr,
@@ -93,6 +115,8 @@ class NorMuon(DistributedOrthoBase):
             nesterov=nesterov,
             flatten=flatten,
             adjust_lr=adjust_lr,
+            skip_update_prob=skip_update_prob,  # SkipUpdate: survival prob (None = disabled)
+            magma_tau=magma_tau,  # Magma: temperature for adaptive scaling (None = disabled)
         )
         super().__init__(
             params, distributed_mesh, "normuon", defaults,
@@ -103,6 +127,8 @@ class NorMuon(DistributedOrthoBase):
         state = super()._get_or_initialize_state(param, algo)
         if algo == self._algo_name and "variance_neuron" not in state:
             state["variance_neuron"] = torch.zeros_like(param[..., 0:1])
+            # Magma: per-param EMA scale, init=0.5 (neutral alignment)
+            state["magma_scale"] = torch.tensor(0.5, device=param.device, dtype=param.dtype)
         return state
 
     def _get_shard_info(self, param: Tensor, group: dict):
@@ -146,6 +172,8 @@ class NorMuon(DistributedOrthoBase):
                 process_group=self._process_group,
                 newton_schulz_func=self._newton_schulz_func,
                 cautious_wd=group["cautious_wd"],
+                skip_update_prob=group["skip_update_prob"],  # SkipUpdate: survival probability
+                magma_tau=group["magma_tau"],  # Magma: temperature (None = plain SkipUpdate)
             )
 
             shape_groups: dict[tuple, list] = defaultdict(list)
@@ -158,6 +186,7 @@ class NorMuon(DistributedOrthoBase):
                 states = [self._get_or_initialize_state(p, self._algo_name) for p in params]
                 momentums = [s["momentum"] for s in states]
                 variances_neuron = [s["variance_neuron"] for s in states]
+                magma_scales = [s["magma_scale"] for s in states]  # Magma EMA scale per param
 
                 is_batch_sharded, is_matrix_sharded, sharded_tensor_dim = (
                     self._get_shard_info(params[0], group)
@@ -173,6 +202,7 @@ class NorMuon(DistributedOrthoBase):
                         G=gradients,
                         M=momentums,
                         V=variances_neuron,
+                        S=magma_scales,
                         shard_dim=sharded_tensor_dim,
                         **megabatch_args,
                     )
@@ -184,6 +214,7 @@ def normuon_update_megabatch_async(
     G: List[Tensor],
     M: List[Tensor],
     V: List[Tensor],
+    S: List[Tensor],  # Magma EMA scale buffer, scalar per param (modified in place)
     lr: Tensor,
     momentum: Tensor,
     muon_beta2: Tensor,
@@ -198,6 +229,8 @@ def normuon_update_megabatch_async(
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
     cautious_wd: bool = False,
+    skip_update_prob: Optional[float] = None,  # SkipUpdate: survival probability (None = disabled)
+    magma_tau: Optional[float] = None,  # Magma: temperature for adaptive scaling (None = disabled)
 ) -> Generator[None, None, None]:
     """
     Mega-batched NorMuon update: processes ALL same-shape parameters in one
@@ -206,9 +239,16 @@ def normuon_update_megabatch_async(
     N = len(X)
     assert N == len(G) == len(M) == len(V)
 
+    # Magma: snapshot momentum before it's updated, for cosine similarity with current grad.
+    # muon_update_pre_orthogonalize updates M in-place, so we must clone beforehand.
+    G_local = to_local(G)
+    M_local = to_local(M)
+    if magma_tau is not None:
+        M_before = [m.clone() for m in M_local]
+
     # Pre-orthogonalize: update momentum
     U = muon_update_pre_orthogonalize(
-        G=to_local(G), M=to_local(M), momentum=momentum, nesterov=nesterov,
+        G=G_local, M=M_local, momentum=momentum, nesterov=nesterov,
     )
 
     # Convert shard_dim to negative for comm_dim
@@ -234,6 +274,33 @@ def normuon_update_megabatch_async(
     for i in range(N):
         V_local[i].copy_(V_stacked[i])
     U = [U_stacked[i] for i in range(N)]
+
+    # SkipUpdate / Magma: stochastic block masking per parameter matrix.
+    # Moments always update densely (above); only the final update direction is masked.
+    # Reference: "On Surprising Effectiveness of Masking Updates in Adaptive Optimizers".
+    if skip_update_prob is not None and skip_update_prob < 1.0:
+        U = list(U)
+        S_local = to_local(S)
+
+        for i in range(len(U)):
+            # Sample one Bernoulli scalar per parameter block (not per element)
+            keep = torch.bernoulli(torch.tensor(skip_update_prob, device=U[i].device))
+
+            if magma_tau is not None:
+                # Magma: adaptive scale via momentum-gradient cosine similarity.
+                # ẽ_t = sigmoid(cossim(μ_t_before, g_t) / τ)
+                # s_t = 0.9 * s_{t-1} + 0.1 * ẽ_t   (EMA, updated in-place)
+                mu = M_before[i].flatten().float()
+                g = G_local[i].flatten().float()
+                cos = torch.dot(mu, g) / (mu.norm() * g.norm() + 1e-8)
+                e_tilde = torch.sigmoid(cos / magma_tau)
+                S_local[i].mul_(0.9).add_(e_tilde * 0.1)  # EMA update in-place
+                scale = S_local[i]
+            else:
+                # Plain SkipUpdate: fixed unbiasing rescale of 1/p
+                scale = 1.0 / skip_update_prob
+
+            U[i] = U[i] * (keep * scale)  # zero-out or scale entire matrix
 
     # Compute scaled learning rate
     if adjust_lr is None:
