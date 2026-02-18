@@ -44,18 +44,20 @@ class NorMuon(DistributedOrthoBase):
         newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
             Signature is ``func(input: Tensor, epsilon: float) -> Tensor``.
         skip_update_prob: SkipUpdate survival probability p ∈ (0, 1].
-            Each parameter matrix is independently skipped with probability (1-p) at each step.
-            Surviving updates are rescaled by 1/p to keep updates unbiased in expectation.
-            Moment buffers always update densely (regardless of skip).
+            At each step, each parameter matrix is independently kept with probability p and
+            skipped (zeroed out) with probability (1-p). Surviving updates are rescaled by
+            1/p to keep the update unbiased in expectation. Moment buffers (momentum and
+            variance_neuron) always update densely regardless of skip.
             None (default) disables SkipUpdate.
-            See: "On Surprising Effectiveness of Masking Updates in Adaptive Optimizers".
+            See: https://arxiv.org/abs/2602.15322
         magma_tau: Magma temperature τ > 0. When set, enables Magma mode which replaces the
-            fixed 1/p rescaling with an adaptive EMA scale based on momentum-gradient alignment:
+            fixed 1/p rescaling with an adaptive EMA scale driven by momentum-gradient alignment:
               ẽ_t = sigmoid(cossim(momentum_before, grad) / τ)
               s_t = 0.9 * s_{t-1} + 0.1 * ẽ_t
-            Bernoulli(0.5) masking is still applied; s_t modulates the surviving update.
-            Requires skip_update_prob to also be set. None (default) uses fixed SkipUpdate scaling.
-            See: "On Surprising Effectiveness of Masking Updates in Adaptive Optimizers".
+            The surviving update is scaled by s_t instead of 1/p. This is intentionally biased
+            (no 1/s_t correction) as unbiased variants were found to be unstable.
+            Requires skip_update_prob to also be set. None (default) uses plain SkipUpdate scaling.
+            See: https://arxiv.org/abs/2602.15322
 
     Muon optimizer algorithm by Keller Jordan: https://kellerjordan.github.io/posts/muon/
     FSDP2 Muon uses all-to-all communications: https://www.essential.ai/blog/infra
