@@ -302,7 +302,7 @@ def ns_line_2(A: Tensor, alpha: float, beta: float, *, out: Tensor = None):
     return out
 
 
-@torch.compile(dynamic=False, fullgraph=True)
+#@torch.compile(dynamic=False, fullgraph=True)
 def zeropower_via_newtonschulz5(G: Tensor, epsilon: float = 1e-7):
     """
     Reference implementation of Newton-Schulz without Triton.
@@ -333,7 +333,7 @@ def zeropower_via_newtonschulz5(G: Tensor, epsilon: float = 1e-7):
     return X
 
 
-@torch.compile(dynamic=False, fullgraph=True)
+#@torch.compile(dynamic=False, fullgraph=True)
 def newton_schulz_triton(G: Tensor, epsilon: float = 1e-7):
     """
     Triton implementation of Newton-Schulz iteration

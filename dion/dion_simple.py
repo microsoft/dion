@@ -7,7 +7,7 @@ from typing import Any, Dict, Tuple
 from .scalar_opts import adamw_update, lion_update
 
 
-@torch.compile()
+#@torch.compile()
 def dion_update(
     X: Tensor,  # Model weights (modified in place)
     G: Tensor,  # Gradient

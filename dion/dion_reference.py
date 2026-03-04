@@ -610,7 +610,7 @@ class Dion(Optimizer):
             )
 
 
-@torch.compile()
+#@torch.compile()
 def dion_update(
     X: Tensor,  # Model weights (modified in place)
     G: Tensor,  # Gradient

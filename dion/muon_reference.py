@@ -7,7 +7,7 @@ from torch.optim.optimizer import Optimizer, ParamsT
 from typing import Optional, Tuple
 
 
-@torch.compile()
+#@torch.compile()
 def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
     """
     Newton-Schulz iteration to approximate the orthogonalization of G.
