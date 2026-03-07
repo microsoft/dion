@@ -122,7 +122,8 @@ def test_newton_schulz_triton_vs_reference(m: int, n: int):
         triton_out = newton_schulz_triton(G)
         ref_out = zeropower_via_newtonschulz5(G)
         diff = (triton_out - ref_out).abs().max().item()
-        assert diff < 0.1, (
+        # Empirically max diff is ~7.8e-3 across 50 runs; 0.02 gives ~2.5x headroom.
+        assert diff < 0.02, (
             f"Newton-Schulz implementations diverged: max diff {diff:.3e} "
             f"(shape={tuple(G.shape)}, dtype={G.dtype})"
         )
