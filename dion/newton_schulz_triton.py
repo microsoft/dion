@@ -76,6 +76,7 @@ def ns_line_1_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     LOWER_UPPER: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr = "tf32",
 ):
     """
     Input A has shape (M, K)
@@ -111,7 +112,7 @@ def ns_line_1_kernel(
     for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
         at = tl.load(at_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
-        accumulator = tl.dot(a, at, accumulator)
+        accumulator = tl.dot(a, at, accumulator, input_precision=INPUT_PRECISION)
         a_ptrs += BLOCK_SIZE_K * a_stride_c
         at_ptrs += BLOCK_SIZE_K * a_stride_c
 
@@ -148,6 +149,7 @@ def ns_line_1(A: Tensor, *, out: Tensor = None):
     batch_size = A.size(0) if A.ndim == 3 else 1
     input_batch_stride = A.stride(0) if A.ndim == 3 else 0
     output_batch_stride = out.stride(0) if out.ndim == 3 else 0
+    input_precision = "ieee" if A.dtype == torch.float32 else "tf32"
 
     grid = lambda meta: (
         batch_size
@@ -165,6 +167,7 @@ def ns_line_1(A: Tensor, *, out: Tensor = None):
         c_stride_b=output_batch_stride,
         c_stride_r=out.stride(-2),
         c_stride_c=out.stride(-1),
+        INPUT_PRECISION=input_precision,
     )
 
     return out
@@ -192,6 +195,7 @@ def ns_line_2_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     LOWER_UPPER: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr = "tf32",
 ):
     """
     Input A is square matrix with shape (M, M)
@@ -227,7 +231,7 @@ def ns_line_2_kernel(
     for k in tl.range(0, tl.cdiv(M, BLOCK_SIZE_K)):
         a = tl.load(a_ptrs, mask=offs_k[None, :] < M - k * BLOCK_SIZE_K, other=0.0)
         at = tl.load(at_ptrs, mask=offs_k[:, None] < M - k * BLOCK_SIZE_K, other=0.0)
-        accumulator = tl.dot(a, at, accumulator)
+        accumulator = tl.dot(a, at, accumulator, input_precision=INPUT_PRECISION)
         a_ptrs += BLOCK_SIZE_K * a_stride_c
         at_ptrs += BLOCK_SIZE_K * a_stride_c
 
@@ -279,6 +283,7 @@ def ns_line_2(A: Tensor, alpha: float, beta: float, *, out: Tensor = None):
     batch_size = A.size(0) if A.ndim == 3 else 1
     input_batch_stride = A.stride(0) if A.ndim == 3 else 0
     output_batch_stride = out.stride(0) if out.ndim == 3 else 0
+    input_precision = "ieee" if A.dtype == torch.float32 else "tf32"
 
     grid = lambda meta: (
         batch_size
@@ -297,6 +302,7 @@ def ns_line_2(A: Tensor, alpha: float, beta: float, *, out: Tensor = None):
         c_stride_c=out.stride(-1),
         alpha=alpha,
         beta=beta,
+        INPUT_PRECISION=input_precision,
     )
 
     return out
