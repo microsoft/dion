@@ -308,33 +308,23 @@ class NorMuon(Optimizer):
                     self._get_shard_info(params[0], group)
                 )
 
-                # 3D tensors sharded along batch dim: can't mega-batch, process individually
+                megabatch_args = normuon_update_args
                 if is_batch_sharded and not is_matrix_sharded:
-                    for x, g, m, v in zip(
-                        params, gradients, momentums, variances_neuron
-                    ):
-                        yield AsyncTask(
-                            normuon_update_batch_async(
-                                X=[x],
-                                G=[g],
-                                M=[m],
-                                V=[v],
-                                shard_dim=None,
-                                **normuon_update_args,
-                            )
-                        )
-                # Mega-batch: all same-shape params in ONE task
-                else:
-                    yield AsyncTask(
-                        normuon_update_megabatch_async(
-                            X=params,
-                            G=gradients,
-                            M=momentums,
-                            V=variances_neuron,
-                            shard_dim=sharded_tensor_dim,
-                            **normuon_update_args,
-                        )
+                    # Batch-sharded 3D tensors already contain whole local matrices,
+                    # so we can stack them and run the local megabatch path without
+                    # cross-rank communication.
+                    megabatch_args = {**normuon_update_args, "process_group": None}
+
+                yield AsyncTask(
+                    normuon_update_megabatch_async(
+                        X=params,
+                        G=gradients,
+                        M=momentums,
+                        V=variances_neuron,
+                        shard_dim=sharded_tensor_dim,
+                        **megabatch_args,
                     )
+                )
 
     def _create_lion_tasks(
         self,
