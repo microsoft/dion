@@ -34,7 +34,7 @@ no_triton: false
 
 # — Optimizer & Hyperparameters —
 optimizer: normuon 
-scalar_opt: lion
+scalar_opt: adamw
 adjust_lr: spectral_norm
 lr: 0.02
 mu: 0.95

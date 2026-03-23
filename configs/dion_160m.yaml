@@ -35,7 +35,7 @@ replicate_mesh_grad_sync: true
 
 # — Optimizer & Hyperparameters —
 optimizer: dion
-scalar_opt: lion
+scalar_opt: adamw
 mu: 0.95
 weight_decay: 0.01
 ortho_fraction: 0.5

@@ -34,7 +34,7 @@ no_triton: false
 
 # — Optimizer & Hyperparameters —
 optimizer: muon 
-scalar_opt: lion
+scalar_opt: adamw
 adjust_lr: spectral_norm
 mu: 0.95
 weight_decay: 0.01
