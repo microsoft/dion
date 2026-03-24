@@ -930,7 +930,7 @@ def main():
             val_loss = val_loss.item() / val_steps
             log_message = (
                 f"step:{step}/{hp.num_iterations} val_loss:{val_loss:.4f} "
-                f"train_time:{training_time_ms*1000:.0f}s step_avg:{training_time_ms/timed_steps:.2f}ms "
+                f"train_time:{training_time_ms/1000:.0f}s step_avg:{training_time_ms/timed_steps:.2f}ms "
                 f"(fwd_bwd_avg:{total_fwd_bwd_ms/timed_steps:.2f} opt_avg:{total_opt_ms/timed_steps:.2f})"
             )
             print0(log_message)
