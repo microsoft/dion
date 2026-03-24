@@ -881,6 +881,8 @@ def main():
     # --- Training Loop ---
     x, y = train_loader.next_batch()
     training_time_ms = 0
+    total_fwd_bwd_ms = 0
+    total_opt_ms = 0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -894,6 +896,8 @@ def main():
         # Skip the first few steps for timing to avoid torch.compile overhead
         if step == 10:
             training_time_ms = 0
+            total_fwd_bwd_ms = 0
+            total_opt_ms = 0
             torch.cuda.synchronize()
             t0 = time.perf_counter()
         timed_steps = (step - 10) if step > 10 else float("nan")
@@ -921,7 +925,8 @@ def main():
             val_loss = val_loss.item() / val_steps
             log_message = (
                 f"step:{step}/{hp.num_iterations} val_loss:{val_loss:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/timed_steps:.2f}ms"
+                f"train_time:{training_time_ms*1000:.0f}s step_avg:{training_time_ms/timed_steps:.2f}ms "
+                f"(fwd_bwd_avg:{total_fwd_bwd_ms/timed_steps:.2f} opt_avg:{total_opt_ms/timed_steps:.2f})"
             )
             print0(log_message)
             if MASTER_PROCESS and not cli_args.no_wandb and not cli_args.debug:
@@ -985,6 +990,9 @@ def main():
 
         torch.cuda.synchronize()
         opt_ms = 1000 * (time.perf_counter() - t_opt)
+
+        total_fwd_bwd_ms += fwd_bwd_ms
+        total_opt_ms += opt_ms
 
         # Snapshot wall-clock training time for logging (without pausing t0)
         current_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
