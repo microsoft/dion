@@ -989,16 +989,16 @@ def main():
         # Snapshot wall-clock training time for logging (without pausing t0)
         current_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
         if MASTER_PROCESS and not cli_args.no_wandb and not cli_args.debug:
-            wandb.log(
-                {
-                    "train/loss": train_loss.item(),
-                    "train/grad_norm": grad_norm.item(),
-                    "step": step,
-                    "time/training_time_ms": current_training_time_ms,
-                    "time/fwd_bwd_ms": fwd_bwd_ms,
-                    "time/opt_ms": opt_ms,
-                }
-            )
+            log_dict = {
+                "train/loss": train_loss.item(),
+                "train/grad_norm": grad_norm.item(),
+                "step": step,
+                "time/training_time_ms": current_training_time_ms,
+            }
+            if step > 10:
+                log_dict["time/fwd_bwd_ms"] = fwd_bwd_ms
+                log_dict["time/opt_ms"] = opt_ms
+            wandb.log(log_dict)
         if MASTER_PROCESS and cli_args.debug:
             print0(
                 f"Step {step}: train_loss={train_loss.item():.4f}, grad_norm={grad_norm.item():.4f}"
