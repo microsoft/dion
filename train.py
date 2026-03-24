@@ -135,6 +135,11 @@ def parse_cli_args():
     parser.add_argument(
         "--mixed_precision", action="store_true", help="Use mixed precision for Dion"
     )
+    parser.add_argument(
+        "--ortho_fraction", type=float, default=None, help="Fraction to orthogonalize for Dion/Dion2"
+    )
+    parser.add_argument("--mu", type=float, default=None, help="Momentum coefficient")
+    parser.add_argument("--weight_decay", type=float, default=None, help="Weight decay")
 
     # ---------- model ----------
     parser.add_argument("--model_dim", type=int, default=None)
