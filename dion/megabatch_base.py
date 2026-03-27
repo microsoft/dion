@@ -14,6 +14,7 @@ from .newton_schulz_triton import (
     newton_schulz_triton,
     zeropower_via_newtonschulz5,
 )
+from .polar_express import polar_express, polar_express_triton
 from .opt_utils import AsyncRuntime, AsyncTask, to_local
 from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
 
@@ -34,6 +35,7 @@ class DistributedOrthoBase(Optimizer):
         algo_name: str,
         defaults: dict,
         use_triton: bool = False,
+        use_polar_express: bool = False,
         newton_schulz_func: Optional[Callable] = None,
     ):
         super().__init__(params, defaults)
@@ -71,6 +73,10 @@ class DistributedOrthoBase(Optimizer):
                     f"newton_schulz_func must be a callable function, got {type(newton_schulz_func)}"
                 )
             self._newton_schulz_func = newton_schulz_func
+        elif use_polar_express and use_triton:
+            self._newton_schulz_func = polar_express_triton
+        elif use_polar_express:
+            self._newton_schulz_func = polar_express
         elif use_triton:
             if not TRITON_AVAILABLE:
                 raise ImportError(

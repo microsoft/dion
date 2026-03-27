@@ -59,6 +59,7 @@ class Dion2(DistributedOrthoBase):
         adjust_lr: Optional[str] = "spectral_norm",
         flatten: bool = False,
         use_triton: bool = False,
+        use_polar_express: bool = False,
         newton_schulz_func: Optional[Callable] = None,
         verbose: bool = False,
     ):
@@ -91,7 +92,8 @@ class Dion2(DistributedOrthoBase):
         )
         super().__init__(
             params, distributed_mesh, "dion2", defaults,
-            use_triton=use_triton, newton_schulz_func=newton_schulz_func,
+            use_triton=use_triton, use_polar_express=use_polar_express,
+            newton_schulz_func=newton_schulz_func,
         )
         self.verbose = verbose
 
