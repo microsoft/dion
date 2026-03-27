@@ -6,7 +6,7 @@ from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.optim.optimizer import ParamsT
 from typing import Callable, Generator, List, Optional, Tuple, Union
 
-from .megabatch_base import MegabatchMuonBase, megabatch_orthogonalize_async
+from .megabatch_base import DistributedOrthoBase, megabatch_orthogonalize_async
 from .opt_utils import AsyncTask, to_local
 from .muon import (
     muon_update_pre_orthogonalize,
@@ -16,7 +16,7 @@ from .muon import (
 )
 
 
-class NorMuon(MegabatchMuonBase):
+class NorMuon(DistributedOrthoBase):
     """
     Distributed NorMuon optimizer for PyTorch FSDP2. Also compatible with DDP.
 

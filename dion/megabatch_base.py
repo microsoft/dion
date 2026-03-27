@@ -14,9 +14,9 @@ from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
 from .muon import muon_update_newton_schulz, adjust_lr_spectral_norm, adjust_lr_rms_norm
 
 
-class MegabatchMuonBase(Optimizer):
+class DistributedOrthoBase(Optimizer):
     """
-    Shared base class for megabatched Muon-family optimizers (NorMuon, Dion2).
+    Shared base class for distributed orthogonalization optimizers (NorMuon, Dion2).
     Handles distributed setup, Newton-Schulz config, step orchestration,
     shard detection, and scalar optimizer tasks (Lion, AdamW).
 

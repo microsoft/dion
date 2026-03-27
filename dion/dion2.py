@@ -7,12 +7,12 @@ from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.optim.optimizer import ParamsT
 from typing import Callable, Generator, List, Optional, Tuple, Union
 
-from .megabatch_base import MegabatchMuonBase, megabatch_orthogonalize_async
+from .megabatch_base import DistributedOrthoBase, megabatch_orthogonalize_async
 from .opt_utils import AsyncTask, to_local
 from .muon import adjust_lr_spectral_norm, adjust_lr_rms_norm
 
 
-class Dion2(MegabatchMuonBase):
+class Dion2(DistributedOrthoBase):
     """
     Distributed Dion2 optimizer for PyTorch FSDP2. Also compatible with DDP.
 
