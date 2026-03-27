@@ -1,6 +1,7 @@
 import math
 import torch
 import torch.distributed as dist
+from collections import defaultdict
 from itertools import chain
 from torch import Tensor
 from torch.distributed import ProcessGroup
@@ -189,14 +190,63 @@ class Dion2(Optimizer):
                 state["variance"] = torch.zeros_like(param)
         return state
 
+    def _get_shard_info(self, param: Tensor, group: dict):
+        """Determine sharding info for a parameter. Returns (is_batch_sharded, is_matrix_sharded, sharded_tensor_dim)."""
+        is_batch_sharded = False
+        is_matrix_sharded = False
+        sharded_tensor_dim = None
+
+        if not isinstance(param, DTensor):
+            return is_batch_sharded, is_matrix_sharded, sharded_tensor_dim
+
+        if not isinstance(self._distributed_mesh, DeviceMesh):
+            raise RuntimeError(
+                "Must create optimizer with DeviceMesh if using DTensor parameters."
+            )
+
+        shard_placements = [
+            (i, p)
+            for i, p in enumerate(param.placements)
+            if p.is_shard() and param.device_mesh.size(i) > 1
+        ]
+
+        if not group["flatten"]:
+            matrix_dims = {param.ndim - 1, param.ndim - 2}
+            is_batch_sharded = any(
+                p.dim not in matrix_dims for _, p in shard_placements
+            )
+            shard_placements = [
+                (i, p) for i, p in shard_placements if p.dim in matrix_dims
+            ]
+
+        if len(shard_placements) == 1:
+            is_matrix_sharded = True
+            sharded_mesh_dim = shard_placements[0][0]
+            sharded_tensor_dim = shard_placements[0][1].dim
+
+            if (
+                param.device_mesh.get_group(sharded_mesh_dim)
+                != self._process_group
+            ):
+                raise RuntimeError(
+                    f"Got DTensor sharded over mesh dimension {sharded_mesh_dim} different from the optimizer's device mesh. "
+                    f"DTensor has mesh: {param.device_mesh}, placements: {param.placements}, but optimizer was created with mesh: {self._distributed_mesh}."
+                )
+        elif len(shard_placements) > 1:
+            raise NotImplementedError(
+                "Dion2 does not support parameters with multiple sharded dimensions."
+            )
+
+        return is_batch_sharded, is_matrix_sharded, sharded_tensor_dim
+
     def _create_dion2_tasks(
         self,
         param_groups: List[dict],
         verbose: bool = False,
     ) -> Generator["AsyncTask", None, None]:
         """
-        Helper function to create batches of Dion2 matrices and generate
-        AsyncTask objects so we can process multiple batches concurrently.
+        Mega-batched Dion2 task creation: groups ALL same-shape parameters
+        into a single task to minimize communication rounds and kernel launches.
         """
         for group in param_groups:
             assert group["algorithm"] == "dion2"
@@ -223,97 +273,40 @@ class Dion2(Optimizer):
                 world_size=self._world_size,
                 process_group=self._process_group,
                 newton_schulz_func=self._newton_schulz_func,
+                verbose=verbose,
             )
 
-            # Create batches of parameters of size self._world_size
-            for params in create_param_batches(
-                group_params, batch_size=self._world_size
-            ):
+            # Group parameters by shape, sharding, and dtype for mega-batching
+            shape_groups: dict[tuple, list] = defaultdict(list)
+            for p in group_params:
+                sharding = p.placements if isinstance(p, DTensor) else None
+                shape_groups[(p.shape, sharding, p.dtype)].append(p)
+
+            for (_shape, _sharding, _dtype), params in shape_groups.items():
                 gradients = [p.grad for p in params]
                 states = [self._get_or_initialize_state(p, "dion2") for p in params]
                 momentums = [s["momentum"] for s in states]
 
-                # Get sharding state for DTensor
-                is_batch_sharded = False
-                is_matrix_sharded = False
-                sharded_mesh_dim = None
-                sharded_tensor_dim = None
+                is_batch_sharded, is_matrix_sharded, sharded_tensor_dim = (
+                    self._get_shard_info(params[0], group)
+                )
 
-                if isinstance(params[0], DTensor):
-                    if not isinstance(self._distributed_mesh, DeviceMesh):
-                        raise RuntimeError(
-                            "Must create optimizer with DeviceMesh if using DTensor parameters."
-                        )
-
-                    # Find the sharded placement and get its mesh and tensor dimensions
-                    # Skip any Shard() placements on size-1 mesh dimension = Replicate()
-                    shard_placements = [
-                        (i, p)
-                        for i, p in enumerate(params[0].placements)
-                        if p.is_shard() and params[0].device_mesh.size(i) > 1
-                    ]
-
-                    # If we don't flatten 3D matrices, we can ignore shard placements along batch dimensions
-                    # Only keep placements that shard one of the two matrix dimensions
-                    if not group["flatten"]:
-                        matrix_dims = {params[0].ndim - 1, params[0].ndim - 2}
-                        is_batch_sharded = any(
-                            p.dim not in matrix_dims for _, p in shard_placements
-                        )
-                        shard_placements = [
-                            (i, p) for i, p in shard_placements if p.dim in matrix_dims
-                        ]
-
-                    # Check that we have no more than 1 sharded matrix dimension
-                    # Note that non-flattened 3D tensors can have additional sharded batch dimensions
-                    # Flattened 3D tensors are limited to one sharded dimension out of all dimensions
-                    if len(shard_placements) == 1:
-                        is_matrix_sharded = True
-                        sharded_mesh_dim = shard_placements[0][0]
-                        sharded_tensor_dim = shard_placements[0][1].dim
-                    elif len(shard_placements) > 1:
-                        raise NotImplementedError(
-                            "Dion2 does not support parameters with multiple sharded dimensions."
-                        )
-
-                    # Check that the sharded mesh dimension matches optimizer's device mesh
-                    if (
-                        sharded_mesh_dim is not None
-                        and params[0].device_mesh.get_group(sharded_mesh_dim)
-                        != self._process_group
-                    ):
-                        raise RuntimeError(
-                            f"Got DTensor sharded over mesh dimension {sharded_mesh_dim} different from the optimizer's device mesh. "
-                            f"DTensor has mesh: {params[0].device_mesh}, placements: {params[0].placements}, but optimizer was created with mesh: {self._distributed_mesh}."
-                        )
-
-                # Special case for 3D tensors sharded along batch dimension
-                # As long as matrix dimensions are not sharded, each device will have whole matrices
-                # Each device already has different matrices of the batch, so we can't parallelize further
+                megabatch_args = dion2_args
                 if is_batch_sharded and not is_matrix_sharded:
-                    for x, g, m in zip(params, gradients, momentums):
-                        yield AsyncTask(
-                            dion2_update_batch_async(
-                                X=[x],
-                                G=[g],
-                                M=[m],
-                                shard_dim=None,  # No sharded matrix dim
-                                **dion2_args,
-                                verbose=verbose,
-                            )
-                        )
-                # Otherwise, we parallelize the Muon update across devices
-                else:
-                    yield AsyncTask(
-                        dion2_update_batch_async(
-                            X=pad_batch(params, self._world_size),
-                            G=pad_batch(gradients, self._world_size),
-                            M=pad_batch(momentums, self._world_size),
-                            shard_dim=sharded_tensor_dim,
-                            **dion2_args,
-                            verbose=verbose,
-                        )
+                    # Batch-sharded 3D tensors already contain whole local matrices,
+                    # so we can stack them and run the local megabatch path without
+                    # cross-rank communication.
+                    megabatch_args = {**dion2_args, "process_group": None}
+
+                yield AsyncTask(
+                    dion2_update_megabatch_async(
+                        X=params,
+                        G=gradients,
+                        M=momentums,
+                        shard_dim=sharded_tensor_dim,
+                        **megabatch_args,
                     )
+                )
 
     def _create_lion_tasks(
         self,
@@ -530,6 +523,187 @@ def dion2_update_batch_async(
                 U_selected[0], newton_schulz_func, flatten=flatten, epsilon=epsilon
             )
         ]
+
+    # Compute scaled learning rate
+    # Do this before to_local(X) because we use the full tensor shape, not the shard shape
+    if adjust_lr is None:
+        adjusted_lr = lr
+    elif adjust_lr == "spectral_norm":
+        adjusted_lr = adjust_lr_spectral_norm(lr, X[0].shape, flatten=flatten)
+    elif adjust_lr == "rms_norm":
+        adjusted_lr = adjust_lr_rms_norm(lr, X[0].shape, flatten=flatten)
+    else:
+        raise ValueError(f"Unknown adjust_lr: {adjust_lr}")
+
+    # Update model parameters with orthogonalized output
+    # Weight update is applied to selected slices only
+    dion2_post_orthogonalize(
+        X=to_local(X),
+        U=U_ortho,
+        indices=indices_list,
+        base_lr=lr,
+        adjusted_lr=adjusted_lr,
+        weight_decay=weight_decay,
+        select_dim=select_dim,
+    )
+
+
+def dion2_update_megabatch_async(
+    X: List[Tensor],  # All same-shape params (may be more than world_size)
+    G: List[Tensor],  # Gradient
+    M: List[Tensor],  # Momentum buffer (modified in place)
+    lr: Tensor,  # Learning rate (scalar tensor)
+    ef_decay: Tensor,  # Error-feedback factor (scalar tensor)
+    fraction: float,  # Fraction of submatrix to orthogonalize (0 < fraction <= 1)
+    weight_decay: Tensor,  # Weight decay (scalar tensor)
+    epsilon: Tensor,  # Epsilon (scalar tensor)
+    flatten: bool,  # Whether to flatten 3D+ tensors to 2D
+    adjust_lr: Optional[str],  # How to adjust learning rate
+    device_rank: int,  # Rank of the current device
+    world_size: int,  # Total number of devices to parallelize over
+    shard_dim: Optional[int] = None,  # Shard dimension for DTensor (if applicable)
+    process_group: Optional[ProcessGroup] = None,
+    newton_schulz_func: Optional[Callable] = None,
+    verbose: bool = False,
+) -> Generator[None, None, None]:
+    """
+    Mega-batched Dion2 update: processes ALL same-shape parameters in one
+    communication round instead of world_size-sized batches. This reduces
+    the number of all-to-all/all-gather rounds from O(N/world_size) to O(1)
+    per shape group, and enables batched Newton-Schulz on stacked 3D tensors.
+    """
+    N = len(X)
+    assert N == len(G) == len(M)
+
+    # Determine selection dimension based on sharding and tensor shape
+    ndim = X[0].ndim
+    select_dim = None
+
+    if shard_dim is not None:
+        shard_dim = shard_dim if shard_dim < 0 else shard_dim - ndim
+        if shard_dim == -2:
+            select_dim = -2  # Row-sharded
+        elif shard_dim == -1:
+            select_dim = -1  # Column-sharded
+
+    if select_dim is None:
+        num_rows, num_cols = X[0].shape[-2:]
+        select_dim = -2 if num_rows <= num_cols else -1
+
+    if verbose:
+        _print_selection_choice(X[0].shape, shard_dim, select_dim, ndim)
+
+    # Update momentum and select top-α fraction along select_dim
+    U_selected, indices_list = dion2_pre_orthogonalize(
+        G=to_local(G),
+        M=to_local(M),
+        fraction=fraction,
+        ef_decay=ef_decay,
+        select_dim=select_dim,
+    )
+
+    if shard_dim is not None and process_group is not None:
+        # --- Mega-batched sharded FSDP2 path ---
+        # Pad N to be divisible by world_size
+        pad_n = (world_size - N % world_size) % world_size
+        U_work = U_selected + [torch.zeros_like(U_selected[0])] * pad_n if pad_n > 0 else U_selected
+        N_total = len(U_work)
+        per_rank = N_total // world_size
+
+        # Stack shards for each target rank into a single tensor
+        input_chunks = [
+            torch.stack(U_work[r * per_rank : (r + 1) * per_rank])
+            for r in range(world_size)
+        ]  # each: [per_rank, *shard_shape]
+
+        output_chunks = [torch.empty_like(c) for c in input_chunks]
+        work = dist.all_to_all(
+            output_chunks, input_chunks, group=process_group, async_op=True
+        )
+        yield
+        work.wait()
+
+        # Cat shards from all ranks along select_dim to form full submatrices
+        # select_dim is negative, so it correctly indexes the stacked tensor
+        full_submatrices = torch.cat(output_chunks, dim=select_dim)
+
+        # Batched Newton-Schulz on stacked tensor
+        full_submatrices = muon_update_newton_schulz(
+            full_submatrices,
+            newton_schulz_func=newton_schulz_func,
+            flatten=flatten,
+            epsilon=epsilon,
+        )
+
+        # Split back and all-to-all back
+        split_chunks = [
+            s.contiguous()
+            for s in torch.tensor_split(full_submatrices, world_size, dim=select_dim)
+        ]
+
+        recv_chunks = [torch.empty_like(c) for c in split_chunks]
+        work = dist.all_to_all(
+            recv_chunks, split_chunks, group=process_group, async_op=True
+        )
+        yield
+        work.wait()
+
+        # Unstack back to list in original order
+        U_ortho = [recv_chunks[r][i] for r in range(world_size) for i in range(per_rank)]
+        U_ortho = U_ortho[:N]  # Remove padding
+
+    elif N > 1 and process_group is not None:
+        # --- Mega-batched non-sharded path ---
+        # Each GPU orthogonalizes N/world_size submatrices instead of 1
+        pad_n = (world_size - N % world_size) % world_size
+        U_work = U_selected + [torch.zeros_like(U_selected[0])] * pad_n if pad_n > 0 else U_selected
+        N_total = len(U_work)
+        per_rank = N_total // world_size
+
+        # This GPU processes its assigned chunk
+        start = device_rank * per_rank
+        my_matrices = torch.stack(U_work[start : start + per_rank])
+
+        my_matrices = muon_update_newton_schulz(
+            my_matrices,
+            newton_schulz_func=newton_schulz_func,
+            flatten=flatten,
+            epsilon=epsilon,
+        )
+
+        # All-gather: each rank broadcasts its processed chunk
+        all_chunks = [torch.empty_like(my_matrices) for _ in range(world_size)]
+        work = dist.all_gather(
+            all_chunks, my_matrices.contiguous(), group=process_group, async_op=True
+        )
+        yield
+        work.wait()
+
+        # Unstack back to list in original order
+        U_ortho = [all_chunks[r][i] for r in range(world_size) for i in range(per_rank)]
+        U_ortho = U_ortho[:N]
+
+    elif N == 1:
+        U_ortho = [
+            muon_update_newton_schulz(
+                U_selected[0],
+                newton_schulz_func=newton_schulz_func,
+                flatten=flatten,
+                epsilon=epsilon,
+            )
+        ]
+
+    else:
+        # N > 1 but no process_group (single GPU or batch-sharded 3D):
+        # batch Newton-Schulz on stacked tensor
+        stacked = torch.stack(U_selected)
+        stacked = muon_update_newton_schulz(
+            stacked,
+            newton_schulz_func=newton_schulz_func,
+            flatten=flatten,
+            epsilon=epsilon,
+        )
+        U_ortho = [stacked[i] for i in range(N)]
 
     # Compute scaled learning rate
     # Do this before to_local(X) because we use the full tensor shape, not the shard shape
