@@ -20,20 +20,20 @@ class DistributedOrthoBase(Optimizer):
     Handles distributed setup, Newton-Schulz config, step orchestration,
     shard detection, and scalar optimizer tasks (Lion, AdamW).
 
-    Subclasses must set ``_algo_name`` and implement ``_create_ortho_tasks()``.
+    Subclasses must implement ``_create_ortho_tasks()``.
     """
-
-    _algo_name: str
 
     def __init__(
         self,
         params: ParamsT,
         distributed_mesh: Optional[Union[DeviceMesh, ProcessGroup]],
+        algo_name: str,
         defaults: dict,
         use_triton: bool = False,
         newton_schulz_func: Optional[Callable] = None,
     ):
         super().__init__(params, defaults)
+        self._algo_name = algo_name
 
         # Distributed configuration
         if isinstance(distributed_mesh, DeviceMesh):
@@ -240,10 +240,11 @@ def megabatch_orthogonalize_async(
     """
     Shared megabatch communication + Newton-Schulz orthogonalization.
 
-    Yields at async communication points for use with AsyncRuntime.
-    Returns the orthogonalized list of tensors.
-
-    Use via ``result = yield from megabatch_orthogonalize_async(...)``.
+    This is a generator that yields at async communication points and uses
+    ``return value`` to pass the result back to the caller. In Python, ``return``
+    inside a generator raises ``StopIteration(value)``, and the caller recovers
+    the value via ``result = yield from megabatch_orthogonalize_async(...)``.
+    The ``yield from`` transparently forwards intermediate yields to AsyncRuntime.
 
     Args:
         U: List of tensors to orthogonalize (all same shape).
@@ -258,13 +259,17 @@ def megabatch_orthogonalize_async(
     """
     N = len(U)
 
-    if comm_dim is not None and process_group is not None:
-        # --- Mega-batched sharded FSDP2 path ---
+    # Pad to divisible by world_size (needed by both distributed paths)
+    if process_group is not None and N > 1:
         pad_n = (world_size - N % world_size) % world_size
         U_work = U + [torch.zeros_like(U[0])] * pad_n if pad_n > 0 else U
         N_total = len(U_work)
         per_rank = N_total // world_size
+    else:
+        U_work = U
 
+    if comm_dim is not None and process_group is not None:
+        # --- Mega-batched sharded FSDP2 path ---
         input_chunks = [
             torch.stack(U_work[r * per_rank : (r + 1) * per_rank])
             for r in range(world_size)
@@ -303,11 +308,6 @@ def megabatch_orthogonalize_async(
 
     elif N > 1 and process_group is not None:
         # --- Mega-batched non-sharded path ---
-        pad_n = (world_size - N % world_size) % world_size
-        U_work = U + [torch.zeros_like(U[0])] * pad_n if pad_n > 0 else U
-        N_total = len(U_work)
-        per_rank = N_total // world_size
-
         start = device_rank * per_rank
         my_matrices = torch.stack(U_work[start : start + per_rank])
         my_matrices = muon_update_newton_schulz(

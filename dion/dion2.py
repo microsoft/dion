@@ -42,8 +42,6 @@ class Dion2(DistributedOrthoBase):
     Dion2 optimizer by Ahn et al.: TBD
     """
 
-    _algo_name = "dion2"
-
     def __init__(
         self,
         params: ParamsT,
@@ -88,7 +86,7 @@ class Dion2(DistributedOrthoBase):
             step=0,
         )
         super().__init__(
-            params, distributed_mesh, defaults,
+            params, distributed_mesh, "dion2", defaults,
             use_triton=use_triton, newton_schulz_func=newton_schulz_func,
         )
         self.verbose = verbose

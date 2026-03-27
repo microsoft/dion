@@ -49,8 +49,6 @@ class NorMuon(DistributedOrthoBase):
     NorMuon optimizer: https://arxiv.org/abs/2510.05491
     """
 
-    _algo_name = "normuon"
-
     def __init__(
         self,
         params: ParamsT,
@@ -97,7 +95,7 @@ class NorMuon(DistributedOrthoBase):
             adjust_lr=adjust_lr,
         )
         super().__init__(
-            params, distributed_mesh, defaults,
+            params, distributed_mesh, "normuon", defaults,
             use_triton=use_triton, newton_schulz_func=newton_schulz_func,
         )
 
