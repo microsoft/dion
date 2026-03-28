@@ -497,7 +497,7 @@ def zeropower_via_newtonschulz5(G: Tensor, epsilon: float = 1e-7):
     return X
 
 
-@torch.compile(dynamic=False, fullgraph=True)
+@torch.no_grad()
 def newton_schulz_triton(G: Tensor, epsilon: float = 1e-7):
     """
     Triton implementation of Newton-Schulz iteration (5 iterations).
@@ -568,8 +568,9 @@ def newton_schulz_triton_fast(G: Tensor, epsilon: float = 1e-7):
     # and use it to rescale X closer to orthogonal before iterating.
     # This fuses with the first NS iteration by reusing A = X @ X.mT.
     ns_line_1(X, out=A)
+    eps = torch.tensor(epsilon, device=X.device, dtype=X.dtype)
     s = torch.rsqrt(torch.clamp_min(
-        A.abs().sum(dim=-1, keepdim=False), min=epsilon
+        A.abs().sum(dim=-1, keepdim=False), min=eps
     ))
     X = X * s.unsqueeze(-1)
 
