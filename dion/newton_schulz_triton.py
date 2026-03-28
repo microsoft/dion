@@ -500,9 +500,55 @@ def zeropower_via_newtonschulz5(G: Tensor, epsilon: float = 1e-7):
 @torch.compile(dynamic=False, fullgraph=True)
 def newton_schulz_triton(G: Tensor, epsilon: float = 1e-7):
     """
-    Triton implementation of Newton-Schulz iteration
+    Triton implementation of Newton-Schulz iteration (5 iterations).
     """
     # Newton-Schulz constants
+    ns_consts = [
+        (4.0848, -6.8946, 2.9270),
+        (3.9505, -6.3029, 2.6377),
+        (3.7418, -5.5913, 2.3037),
+        (2.8769, -3.1427, 1.2046),
+        (2.8366, -3.0525, 1.2012),
+    ]
+
+    X = G.to(dtype=torch.bfloat16)
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + epsilon)
+
+    # Allocate buffers
+    X = X.contiguous()
+    A = torch.empty((*X.shape[:-1], X.size(-2)), device=X.device, dtype=X.dtype)
+    B = torch.empty_like(A)
+    C = torch.empty_like(X)
+
+    ns_line_3_fallback = torch.baddbmm if X.ndim > 2 else torch.addmm
+
+    # Perform the NS iterations
+    for a, b, c in ns_consts:
+        ns_line_1(X, out=A)  # A = X @ X.mT
+        ns_line_2(A, alpha=c, beta=b, out=B)  # B = b * A + c * A @ A
+        ns_line_3_fallback(X, B, X, beta=a, out=C)  # C = a * X + B @ X
+        X, C = C, X  # Swap references to avoid unnecessary copies
+
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+
+@torch.no_grad()
+def newton_schulz_triton_fast(G: Tensor, epsilon: float = 1e-7):
+    """
+    Faster Triton Newton-Schulz using AOL rescaling to converge in 4 iterations.
+
+    Uses AOL rescaling (https://arxiv.org/pdf/2208.03160) for a better starting
+    point, fusing the rescaling with the first NS iteration to save one iteration.
+    Polynomials optimized via genetic algorithm (https://github.com/thib-s/flash-newton-schulz).
+
+    Signature matches zeropower_via_newtonschulz5: func(input, epsilon) -> Tensor.
+    """
     ns_consts = [
         [4.6051, -9.6552, 5.6769],
         [4.7505, -6.0861, 2.1790],
@@ -518,33 +564,28 @@ def newton_schulz_triton(G: Tensor, epsilon: float = 1e-7):
     B = torch.empty_like(A)
     C = torch.empty_like(X)
 
-    # Ensure spectral norm is at most 1
-    # we remove the previous normalization to switch to AOL rescaling
-    # Which is further explained in the paper: https://arxiv.org/pdf/2208.03160
-    # which consists in computing W@W^t using ns_line_1 and then computing the
-    # scaling factors: fast_inv_sqrt(reduce_sum(abs(WW^t), axis=-1)) which is a vector
-    # since the main operation to compute those correspond to ns_line_1
-    # we can fuse it with the first newton schulz iterate. Furthermore this gives a better
-    # starting point for the newton schulz iterations as the matrix is closer to orthogonal
-    # thanks to this, we can save one iteration of newton schulz.
-    ns_line_1(X, out=A)  # gram matrix A = X @ X.mT
+    # AOL rescaling: compute row-wise infinity-norm of the Gram matrix
+    # and use it to rescale X closer to orthogonal before iterating.
+    # This fuses with the first NS iteration by reusing A = X @ X.mT.
+    ns_line_1(X, out=A)
     s = torch.rsqrt(torch.clamp_min(
         A.abs().sum(dim=-1, keepdim=False), min=epsilon
-    ))  # AOL rescaling vector
-    X = X * s.unsqueeze(-1)  # rescale X using s making it closer to orthogonal
-    # first NS iteration with reuse of A
+    ))
+    X = X * s.unsqueeze(-1)
+
+    # First NS iteration reuses the rescaled Gram matrix
     a, b, c = ns_consts[0]
     A = A * s.unsqueeze(-1) * s.unsqueeze(-2)
     ns_line_2(A, alpha=c, beta=b, out=B)
     ns_line_3(B, X, a, out=C)
     X, C = C, X
 
-    # Perform the remaining NS iterations
+    # Remaining 3 NS iterations
     for a, b, c in ns_consts[1:]:
-        ns_line_1(X, out=A)  # A = X @ X.mT
-        ns_line_2(A, alpha=c, beta=b, out=B)  # B = b * A + c * A @ A
-        ns_line_3(B, X, a, out=C)  # C = a * X + B @ X
-        X, C = C, X  # Swap references to avoid unnecessary copies
+        ns_line_1(X, out=A)
+        ns_line_2(A, alpha=c, beta=b, out=B)
+        ns_line_3(B, X, a, out=C)
+        X, C = C, X
 
     if G.size(-2) > G.size(-1):
         X = X.mT
