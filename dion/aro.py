@@ -36,6 +36,7 @@ class ARO(DistributedOrthoBase):
         weight_decay: Weight decay factor.
         epsilon: Small value for numerical stability.
         base_opt: Base optimizer function applied in the rotated frame.
+            "sinkhorn": Alternating row/column L2 normalization (recommended).
             "row_norm": f(X) = sqrt(n) * X / ||x_i||  (row normalization)
             "sign": f(X) = sign(X)
         adjust_lr: How to adjust the learning rate for ARO updates.
@@ -62,9 +63,9 @@ class ARO(DistributedOrthoBase):
             raise ValueError(f"Invalid momentum factor: {mu}")
         if len(betas) != 2 or betas[0] < 0.0 or betas[1] < 0.0:
             raise ValueError(f"Invalid betas: {betas}")
-        if base_opt not in ("row_norm", "sign"):
+        if base_opt not in ("row_norm", "sign", "sinkhorn"):
             raise ValueError(
-                f"Invalid base_opt: {base_opt}. Must be 'row_norm' or 'sign'."
+                f"Invalid base_opt: {base_opt}. Must be 'row_norm', 'sign', or 'sinkhorn'."
             )
         if adjust_lr not in ("spectral_norm", "rms_norm", None):
             raise ValueError(
@@ -247,6 +248,8 @@ def _get_base_opt_fn(base_opt: str):
         return _base_opt_row_norm
     elif base_opt == "sign":
         return _base_opt_sign
+    elif base_opt == "sinkhorn":
+        return _base_opt_sinkhorn
     raise ValueError(f"Unknown base_opt: {base_opt}")
 
 
@@ -260,6 +263,27 @@ def _base_opt_row_norm(X: Tensor) -> Tensor:
 def _base_opt_sign(X: Tensor) -> Tensor:
     """f(X) = sign(X)"""
     return torch.sign(X)
+
+
+def _base_opt_sinkhorn(X: Tensor, num_iters: int = 5, eps: float = 1e-8) -> Tensor:
+    """SR-Sinkhorn normalization: alternating L2 row/column normalization.
+
+    Each iteration normalizes rows to have L2 norm sqrt(cols), then
+    columns to have L2 norm sqrt(rows). This corresponds to the
+    square-root iterates of the classical Sinkhorn algorithm applied
+    to the matrix of squared entries.
+
+    Reference: https://arxiv.org/abs/2502.06742
+    """
+    m, n = X.shape[-2], X.shape[-1]
+    for _ in range(num_iters):
+        # Row normalization: each row gets L2 norm sqrt(n)
+        row_norms = X.norm(dim=-1, keepdim=True).clamp(min=eps)
+        X = X * (math.sqrt(n) / row_norms)
+        # Column normalization: each column gets L2 norm sqrt(m)
+        col_norms = X.norm(dim=-2, keepdim=True).clamp(min=eps)
+        X = X * (math.sqrt(m) / col_norms)
+    return X
 
 
 @torch.compile(fullgraph=True)
