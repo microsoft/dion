@@ -260,7 +260,7 @@ def megabatch_orthogonalize_async(
     N = len(U)
 
     # Pad to divisible by world_size (needed by both distributed paths)
-    if process_group is not None and N > 1:
+    if process_group is not None and (N > 1 or comm_dim is not None):
         pad_n = (world_size - N % world_size) % world_size
         U_work = U + [torch.zeros_like(U[0])] * pad_n if pad_n > 0 else U
         N_total = len(U_work)
