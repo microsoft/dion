@@ -221,17 +221,20 @@ def aro_update_megabatch_async(
         f_rotated = base_opt_fn(rotated)
         del rotated
         cross = M_f32 @ f_rotated.mT
-        del f_rotated
+        del f_rotated, M_f32
 
-        # Phase 2: QR (needs cusolver workspace)
+        # Phase 2: QR — cusolver allocates workspace outside PyTorch's
+        # caching allocator, so we must release cached blocks first.
+        torch.cuda.empty_cache()
         Q, _ = torch.linalg.qr(cross)
         del cross
         R_new_holder[0] = Q
 
-        # Phase 3: compute update direction with new rotation
+        # Phase 3: recompute M_f32 (freed above to make room for QR)
+        M_f32 = M_batch.float()
         rotated_new = Q.mT @ M_f32
         f_new = base_opt_fn(rotated_new)
-        del rotated_new
+        del rotated_new, M_f32
         return (Q @ f_new).to(M_batch.dtype)
 
     # Distribute ARO computation via shared megabatch infrastructure.
