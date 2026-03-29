@@ -53,7 +53,7 @@ class ARO(DistributedOrthoBase):
         betas: Tuple[float, float] = (0.9, 0.95),
         weight_decay: float = 0.01,
         epsilon: float = 1e-8,
-        base_opt: str = "row_norm",
+        base_opt: str = "sinkhorn",
         adjust_lr: Optional[str] = "rms_norm",
         flatten: bool = False,
     ):
