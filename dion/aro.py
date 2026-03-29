@@ -223,16 +223,12 @@ def aro_update_megabatch_async(
         cross = M_f32 @ f_rotated.mT
         del f_rotated, M_f32
 
-        # Phase 2: QR — use magma backend to avoid cusolver handle
-        # creation failures (cusolverDnCreate INTERNAL_ERROR) under
-        # memory pressure in FSDP configurations.
-        torch.cuda.empty_cache()
-        prev_lib = torch.backends.cuda.preferred_linalg_library()
-        try:
-            torch.backends.cuda.preferred_linalg_library("magma")
-            Q, _ = torch.linalg.qr(cross)
-        finally:
-            torch.backends.cuda.preferred_linalg_library(prev_lib)
+        # Phase 2: QR on CPU — both cusolver and magma fail under FSDP
+        # memory pressure because the all-to-all reassembly of full
+        # matrices leaves no room for linalg workspace on GPU.
+        # CPU QR is cheap since cross is square [per_rank, m, m].
+        Q, _ = torch.linalg.qr(cross.cpu())
+        Q = Q.to(device=cross.device, dtype=cross.dtype)
         del cross
         R_new_holder[0] = Q
 
