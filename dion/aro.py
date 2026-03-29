@@ -223,10 +223,16 @@ def aro_update_megabatch_async(
         cross = M_f32 @ f_rotated.mT
         del f_rotated, M_f32
 
-        # Phase 2: QR — cusolver allocates workspace outside PyTorch's
-        # caching allocator, so we must release cached blocks first.
+        # Phase 2: QR — use magma backend to avoid cusolver handle
+        # creation failures (cusolverDnCreate INTERNAL_ERROR) under
+        # memory pressure in FSDP configurations.
         torch.cuda.empty_cache()
-        Q, _ = torch.linalg.qr(cross)
+        prev_lib = torch.backends.cuda.preferred_linalg_library()
+        try:
+            torch.backends.cuda.preferred_linalg_library("magma")
+            Q, _ = torch.linalg.qr(cross)
+        finally:
+            torch.backends.cuda.preferred_linalg_library(prev_lib)
         del cross
         R_new_holder[0] = Q
 
