@@ -210,26 +210,23 @@ def aro_update_megabatch_async(
         params assigned to this rank, after all-to-all reassembly (FSDP)
         or direct stacking (DDP).
 
-        Intermediates are explicitly deleted before QR to reduce peak
-        memory — cusolver needs workspace and will fail with
-        CUSOLVER_STATUS_INTERNAL_ERROR if GPU memory is exhausted.
         """
         M_f32 = M_batch.float()
 
-        # Phase 1: compute cross-alignment matrix, then free intermediates
+        # Phase 1: compute cross-alignment matrix
         rotated = R_my.mT @ M_f32
         f_rotated = base_opt_fn(rotated)
         del rotated
         cross = M_f32 @ f_rotated.mT
-        del f_rotated, M_f32
+        del f_rotated
 
-        # Phase 2: QR
-        Q, _ = torch.linalg.qr(cross)
+        # Phase 2: Shifted Cholesky QR — uses only matmul + Cholesky +
+        # triangular solve, avoiding Householder QR's large workspace.
+        Q = _shifted_cholesky_qr(cross)
         del cross
         R_new_holder[0] = Q
 
-        # Phase 3: recompute M_f32 (freed above to make room for QR)
-        M_f32 = M_batch.float()
+        # Phase 3: compute update direction with new rotation
         rotated_new = Q.mT @ M_f32
         f_new = base_opt_fn(rotated_new)
         del rotated_new, M_f32
@@ -276,6 +273,33 @@ def aro_update_megabatch_async(
         adjusted_lr=adjusted_lr,
         weight_decay=weight_decay,
     )
+
+
+def _shifted_cholesky_qr(A: Tensor) -> Tensor:
+    """Orthogonalize A via Shifted Cholesky QR.
+
+    Uses matmul + Cholesky + triangular solve, which need far less
+    GPU workspace than Householder QR (torch.linalg.qr). Adds a
+    small shift to the Gram matrix diagonal for numerical stability.
+
+    If Cholesky fails (input too ill-conditioned), falls back to
+    Householder QR.
+
+    Same approach as dion.py's orthogonalize() and the ARO paper's
+    recommended implementation.
+    """
+    G = A.mT @ A  # Gram matrix [*, m, m], via cuBLAS
+    # Shift proportional to the Frobenius norm of A
+    shift = A.norm() ** 2 * 1e-7
+    G.diagonal(dim1=-2, dim2=-1).add_(shift)
+    # Upper Cholesky: G = R^T R, then Q = A @ R^{-1}
+    # Same pattern as dion.py's orthogonalize()
+    R, info = torch.linalg.cholesky_ex(G, upper=True)
+    if (info != 0).any():
+        # Fallback: Householder QR for ill-conditioned inputs
+        Q, _ = torch.linalg.qr(A)
+        return Q
+    return torch.linalg.solve_triangular(R, A, upper=True, left=False)
 
 
 def _get_base_opt_fn(base_opt: str):
