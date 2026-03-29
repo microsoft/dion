@@ -209,15 +209,29 @@ def aro_update_megabatch_async(
         M_batch is [per_rank, m, n] — full (unsharded) matrices for the
         params assigned to this rank, after all-to-all reassembly (FSDP)
         or direct stacking (DDP).
+
+        Intermediates are explicitly deleted before QR to reduce peak
+        memory — cusolver needs workspace and will fail with
+        CUSOLVER_STATUS_INTERNAL_ERROR if GPU memory is exhausted.
         """
         M_f32 = M_batch.float()
+
+        # Phase 1: compute cross-alignment matrix, then free intermediates
         rotated = R_my.mT @ M_f32
         f_rotated = base_opt_fn(rotated)
+        del rotated
         cross = M_f32 @ f_rotated.mT
+        del f_rotated
+
+        # Phase 2: QR (needs cusolver workspace)
         Q, _ = torch.linalg.qr(cross)
+        del cross
         R_new_holder[0] = Q
+
+        # Phase 3: compute update direction with new rotation
         rotated_new = Q.mT @ M_f32
         f_new = base_opt_fn(rotated_new)
+        del rotated_new
         return (Q @ f_new).to(M_batch.dtype)
 
     # Distribute ARO computation via shared megabatch infrastructure.
