@@ -218,15 +218,19 @@ def aro_update_megabatch_async(
         f_rotated = base_opt_fn(rotated)
         del rotated
         cross = M_f32 @ f_rotated.mT
-        del f_rotated
+        del f_rotated, M_f32
 
         # Phase 2: Shifted Cholesky QR — uses only matmul + Cholesky +
         # triangular solve, avoiding Householder QR's large workspace.
+        # Release cached-but-free memory so cusolver can allocate handles
+        # and workspace (it allocates outside PyTorch's caching allocator).
+        torch.cuda.empty_cache()
         Q = _shifted_cholesky_qr(cross)
         del cross
         R_new_holder[0] = Q
 
         # Phase 3: compute update direction with new rotation
+        M_f32 = M_batch.float()
         rotated_new = Q.mT @ M_f32
         f_new = base_opt_fn(rotated_new)
         del rotated_new, M_f32
@@ -297,6 +301,7 @@ def _shifted_cholesky_qr(A: Tensor) -> Tensor:
     R, info = torch.linalg.cholesky_ex(G, upper=True)
     if (info != 0).any():
         # Fallback: Householder QR for ill-conditioned inputs
+        torch.cuda.empty_cache()
         Q, _ = torch.linalg.qr(A)
         return Q
     return torch.linalg.solve_triangular(R, A, upper=True, left=False)
