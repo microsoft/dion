@@ -1,6 +1,5 @@
 import math
 import torch
-import torch.distributed as dist
 from collections import defaultdict
 from torch import Tensor
 from torch.distributed import ProcessGroup
@@ -8,7 +7,7 @@ from torch.distributed.tensor import DTensor
 from torch.optim.optimizer import ParamsT
 from typing import Callable, Generator, List, Optional, Tuple, Union
 
-from .megabatch_base import DistributedOrthoBase
+from .megabatch_base import DistributedOrthoBase, megabatch_orthogonalize_async
 from .opt_utils import AsyncTask, to_local
 from .muon import adjust_lr_spectral_norm, adjust_lr_rms_norm
 
@@ -173,9 +172,9 @@ def aro_update_megabatch_async(
     process_group: Optional[ProcessGroup] = None,
 ) -> Generator[None, None, None]:
     """
-    Megabatched ARO update. Distributes the per-parameter ARO computation
-    (QR + matmuls) across ranks via all-gather, matching the DDP pattern
-    used by Muon/NorMuon for Newton-Schulz.
+    Megabatched ARO update. Pre-computes cross-alignment matrices locally,
+    then distributes QR orthogonalization across ranks via the shared
+    megabatch_orthogonalize_async infrastructure.
     """
     N = len(X)
     assert N == len(G) == len(M) == len(R)
@@ -189,59 +188,39 @@ def aro_update_megabatch_async(
 
     base_opt_fn = _get_base_opt_fn(base_opt)
 
-    if N > 1 and process_group is not None:
-        # --- Distributed DDP megabatch ---
-        pad_n = (world_size - N % world_size) % world_size
-        if pad_n > 0:
-            M_work = M_local + [torch.zeros_like(M_local[0])] * pad_n
-            R_work = R + [torch.eye(
-                R[0].shape[-1], device=R[0].device, dtype=R[0].dtype
-            ).expand_as(R[0]).clone() for _ in range(pad_n)]
-        else:
-            M_work = M_local
-            R_work = R
+    # Pre-compute cross-alignment matrices (local, all params)
+    cross_list = []
+    for i in range(N):
+        M_f32 = M_local[i].float()
+        rotated = R[i].mT @ M_f32
+        f_rotated = base_opt_fn(rotated)
+        cross_list.append(M_f32 @ f_rotated.mT)
 
-        N_total = len(M_work)
-        per_rank = N_total // world_size
+    # Distribute QR across ranks via shared megabatch infrastructure
+    def qr_orthogonalize(X_in, epsilon=None):
+        Q, _ = torch.linalg.qr(X_in)
+        return Q
 
-        start = device_rank * per_rank
-        my_M = torch.stack(M_work[start : start + per_rank]).float()
-        my_R = torch.stack(R_work[start : start + per_rank])
+    Q_list = yield from megabatch_orthogonalize_async(
+        cross_list,
+        comm_dim=None,  # non-sharded
+        device_rank=device_rank,
+        world_size=world_size,
+        process_group=process_group,
+        newton_schulz_func=qr_orthogonalize,
+        flatten=False,
+        epsilon=epsilon,
+    )
 
-        my_U, my_R_new = _aro_step_batched(my_M, my_R, base_opt_fn)
-
-        # All-gather update directions and new rotations concurrently
-        all_U = [torch.empty_like(my_U) for _ in range(world_size)]
-        all_R = [torch.empty_like(my_R_new) for _ in range(world_size)]
-        work_u = dist.all_gather(
-            all_U, my_U.contiguous(), group=process_group, async_op=True
-        )
-        work_r = dist.all_gather(
-            all_R, my_R_new.contiguous(), group=process_group, async_op=True
-        )
-        yield
-        work_u.wait()
-        work_r.wait()
-
-        U_list = [all_U[r][i] for r in range(world_size) for i in range(per_rank)][:N]
-        R_new_list = [all_R[r][i] for r in range(world_size) for i in range(per_rank)][:N]
-
-    elif N == 1:
-        U, R_new = _aro_step_single(M_local[0].float(), R[0], base_opt_fn)
-        U_list = [U]
-        R_new_list = [R_new]
-
-    else:
-        # N > 1, no process_group (single GPU or batch-sharded)
-        M_stack = torch.stack(M_local).float()
-        R_stack = torch.stack(R)
-        U_stack, R_new_stack = _aro_step_batched(M_stack, R_stack, base_opt_fn)
-        U_list = [U_stack[i] for i in range(N)]
-        R_new_list = [R_new_stack[i] for i in range(N)]
-
-    # Update rotation state in-place
-    for r, r_new in zip(R, R_new_list):
-        r.copy_(r_new)
+    # Post-compute: use new rotations to produce update directions (local, all params)
+    U_list = []
+    for i in range(N):
+        Q = Q_list[i]
+        R[i].copy_(Q)
+        M_f32 = M_local[i].float()
+        rotated_new = Q.mT @ M_f32
+        f_new = base_opt_fn(rotated_new)
+        U_list.append(Q @ f_new)
 
     # Compute adjusted learning rate
     if adjust_lr is None:
@@ -261,39 +240,6 @@ def aro_update_megabatch_async(
         adjusted_lr=adjusted_lr,
         weight_decay=weight_decay,
     )
-
-
-def _aro_step_single(M: Tensor, R: Tensor, base_opt_fn) -> Tuple[Tensor, Tensor]:
-    """ARO step for a single parameter. M: [m, n] float32, R: [m, m] float32."""
-    # Rotate gradient into R's frame
-    rotated = R.mT @ M
-    f_rotated = base_opt_fn(rotated)
-
-    # Cross-alignment → QR for new rotation
-    cross = M @ f_rotated.mT
-    Q, _ = torch.linalg.qr(cross)
-
-    # Re-rotate with new R, apply base opt, rotate back
-    rotated_new = Q.mT @ M
-    f_new = base_opt_fn(rotated_new)
-    U = Q @ f_new
-
-    return U, Q
-
-
-def _aro_step_batched(M: Tensor, R: Tensor, base_opt_fn) -> Tuple[Tensor, Tensor]:
-    """Batched ARO step. M: [N, m, n] float32, R: [N, m, m] float32."""
-    rotated = R.mT @ M
-    f_rotated = base_opt_fn(rotated)
-
-    cross = M @ f_rotated.mT
-    Q, _ = torch.linalg.qr(cross)
-
-    rotated_new = Q.mT @ M
-    f_new = base_opt_fn(rotated_new)
-    U = Q @ f_new
-
-    return U, Q
 
 
 def _get_base_opt_fn(base_opt: str):
