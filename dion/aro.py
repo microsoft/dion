@@ -23,8 +23,6 @@ class ARO(DistributedOrthoBase):
     Each parameter of shape [m, n] maintains an m×m rotation matrix R in
     float32, adding O(m²) memory per parameter (e.g., 64 MB for m=4096).
 
-    FSDP is not supported — use DDP or single-GPU.
-
     Reference: https://arxiv.org/abs/2602.09006
 
     Args:
@@ -135,14 +133,8 @@ class ARO(DistributedOrthoBase):
                     self._get_shard_info(params[0], group)
                 )
 
-                if is_matrix_sharded:
-                    raise NotImplementedError(
-                        "ARO does not support FSDP-sharded parameters. "
-                        "Use DDP or single-GPU instead."
-                    )
-
                 megabatch_args = update_args
-                if is_batch_sharded:
+                if is_batch_sharded and not is_matrix_sharded:
                     megabatch_args = {**update_args, "process_group": None}
 
                 yield AsyncTask(
@@ -151,6 +143,7 @@ class ARO(DistributedOrthoBase):
                         G=gradients,
                         M=momentums,
                         R=rotations,
+                        shard_dim=sharded_tensor_dim,
                         **megabatch_args,
                     )
                 )
@@ -170,12 +163,18 @@ def aro_update_megabatch_async(
     adjust_lr: Optional[str],
     device_rank: int,
     world_size: int,
+    shard_dim: Optional[int] = None,
     process_group: Optional[ProcessGroup] = None,
 ) -> Generator[None, None, None]:
     """
-    Megabatched ARO update. Pre-computes cross-alignment matrices locally,
-    then distributes QR orthogonalization across ranks via the shared
+    Megabatched ARO update. Distributes the full ARO computation (rotation,
+    cross-alignment, QR, update direction) across ranks via the shared
     megabatch_orthogonalize_async infrastructure.
+
+    For FSDP: the all-to-all reassembles full matrices before the ARO step;
+    for DDP: each rank processes its assigned params then all-gathers.
+    In both cases, the ARO computation runs inside a closure that captures
+    the rotation matrices R for the assigned params.
     """
     N = len(X)
     assert N == len(G) == len(M) == len(R)
@@ -188,40 +187,61 @@ def aro_update_megabatch_async(
     torch._foreach_lerp_(M_local, G_cast, 1 - momentum)
 
     base_opt_fn = _get_base_opt_fn(base_opt)
+    comm_dim = (shard_dim - X[0].ndim) if shard_dim is not None else None
 
-    # Pre-compute cross-alignment matrices (local, all params)
-    cross_list = []
-    for i in range(N):
-        M_f32 = M_local[i].float()
-        rotated = R[i].mT @ M_f32
+    # Determine which params are assigned to this rank so the closure
+    # can access the right rotation matrices.
+    pad_n = (world_size - N % world_size) % world_size if process_group is not None and N > 1 else 0
+    N_total = N + pad_n
+    per_rank = N_total // world_size if process_group is not None and N > 1 else N
+    start = device_rank * per_rank if process_group is not None and N > 1 else 0
+
+    # Pad R to match padded M list, stack this rank's assigned rotations
+    R_padded = R + [torch.eye(
+        R[0].shape[-1], device=R[0].device, dtype=R[0].dtype
+    )] * pad_n if pad_n > 0 else R
+    R_my = torch.stack(R_padded[start : start + per_rank])
+    R_new_holder = [None]
+
+    def aro_ortho_fn(M_batch, epsilon=None):
+        """Full ARO step: rotation → base_opt → cross-alignment → QR → update.
+
+        M_batch is [per_rank, m, n] — full (unsharded) matrices for the
+        params assigned to this rank, after all-to-all reassembly (FSDP)
+        or direct stacking (DDP).
+        """
+        M_f32 = M_batch.float()
+        rotated = R_my.mT @ M_f32
         f_rotated = base_opt_fn(rotated)
-        cross_list.append(M_f32 @ f_rotated.mT)
+        cross = M_f32 @ f_rotated.mT
+        Q, _ = torch.linalg.qr(cross)
+        R_new_holder[0] = Q
+        rotated_new = Q.mT @ M_f32
+        f_new = base_opt_fn(rotated_new)
+        return (Q @ f_new).to(M_batch.dtype)
 
-    # Distribute QR across ranks via shared megabatch infrastructure
-    def qr_orthogonalize(X_in, epsilon=None):
-        Q, _ = torch.linalg.qr(X_in)
-        return Q
-
-    Q_list = yield from megabatch_orthogonalize_async(
-        cross_list,
-        comm_dim=None,  # non-sharded
+    # Distribute ARO computation via shared megabatch infrastructure.
+    # For FSDP: all-to-all reassembles full M, aro_ortho_fn runs on full
+    #   matrices, result is scattered back.
+    # For DDP: each rank runs aro_ortho_fn on its assigned chunk, all-gather.
+    U_list = yield from megabatch_orthogonalize_async(
+        M_local,
+        comm_dim=comm_dim,
         device_rank=device_rank,
         world_size=world_size,
         process_group=process_group,
-        newton_schulz_func=qr_orthogonalize,
+        newton_schulz_func=aro_ortho_fn,
         flatten=False,
         epsilon=epsilon,
     )
 
-    # Post-compute: use new rotations to produce update directions (local, all params)
-    U_list = []
-    for i in range(N):
-        Q = Q_list[i]
-        R[i].copy_(Q)
-        M_f32 = M_local[i].float()
-        rotated_new = Q.mT @ M_f32
-        f_new = base_opt_fn(rotated_new)
-        U_list.append(Q @ f_new)
+    # Update rotation state for this rank's assigned params
+    if R_new_holder[0] is not None:
+        Q_new = R_new_holder[0]
+        for i in range(per_rank):
+            idx = start + i
+            if idx < N:
+                R[idx].copy_(Q_new[i])
 
     # Compute adjusted learning rate
     if adjust_lr is None:
