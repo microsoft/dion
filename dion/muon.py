@@ -8,7 +8,11 @@ from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.optim.optimizer import Optimizer, ParamsT
 from typing import Callable, Generator, List, Optional, Tuple, Union
 
-from .newton_schulz_triton import newton_schulz_triton
+from .newton_schulz_triton import (
+    TRITON_AVAILABLE,
+    newton_schulz_triton,
+    zeropower_via_newtonschulz5,
+)
 from .opt_utils import (
     AsyncRuntime,
     AsyncTask,
@@ -126,6 +130,11 @@ class Muon(Optimizer):
                 )
             self._newton_schulz_func = newton_schulz_func
         elif use_triton:
+            if not TRITON_AVAILABLE:
+                raise ImportError(
+                    "use_triton=True requires the 'triton' package, which is not installed. "
+                    "Install it with: pip install dion[triton]  (or: pip install triton)"
+                )
             self._newton_schulz_func = newton_schulz_triton
         else:
             self._newton_schulz_func = zeropower_via_newtonschulz5

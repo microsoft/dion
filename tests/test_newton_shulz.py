@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from dion.newton_schulz_triton import (
+    TRITON_AVAILABLE,
     ns_line_1,
     ns_line_2,
     newton_schulz_triton,
@@ -55,6 +56,7 @@ def _numpy_ref_ns_line_2(A: torch.Tensor, alpha: float, beta: float) -> torch.Te
     return torch.from_numpy(out.astype(np.float32))
 
 
+@pytest.mark.skipif(not TRITON_AVAILABLE, reason="triton not installed")
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA device required")
 @pytest.mark.parametrize("m,n", [(256, 256), (256, 1024)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -79,6 +81,7 @@ def test_ns_line_1_accuracy(m: int, n: int, dtype: torch.dtype):
         )
 
 
+@pytest.mark.skipif(not TRITON_AVAILABLE, reason="triton not installed")
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA device required")
 @pytest.mark.parametrize("m", [256])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -106,6 +109,7 @@ def test_ns_line_2_accuracy(m: int, dtype: torch.dtype):
         )
 
 
+@pytest.mark.skipif(not TRITON_AVAILABLE, reason="triton not installed")
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA device required")
 @pytest.mark.parametrize("m,n", [(256, 256), (256, 1024)])
 def test_newton_schulz_triton_vs_reference(m: int, n: int):

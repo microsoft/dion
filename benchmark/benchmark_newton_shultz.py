@@ -18,7 +18,14 @@ import argparse
 from pathlib import Path
 from typing import Iterable, Tuple
 import torch
-import triton.testing as tt
+
+try:
+    import triton.testing as tt
+except ImportError:
+    raise ImportError(
+        "Benchmarks require the 'triton' package. "
+        "Install it with: pip install dion[triton]  (or: pip install triton)"
+    )
 
 from dion.newton_schulz_triton import (
     newton_schulz_triton,
