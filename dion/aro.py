@@ -296,8 +296,10 @@ def _shifted_cholesky_qr(A: Tensor) -> Tensor:
     # Shift proportional to the Frobenius norm of A
     shift = A.norm() ** 2 * 1e-7
     G.diagonal(dim1=-2, dim2=-1).add_(shift)
+    # Release cached memory right before cusolver call — the matmul above
+    # re-fills the cache, so the earlier empty_cache() is not sufficient.
+    torch.cuda.empty_cache()
     # Upper Cholesky: G = R^T R, then Q = A @ R^{-1}
-    # Same pattern as dion.py's orthogonalize()
     R, info = torch.linalg.cholesky_ex(G, upper=True)
     if (info != 0).any():
         # Fallback: Householder QR for ill-conditioned inputs
