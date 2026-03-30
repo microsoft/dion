@@ -280,35 +280,32 @@ def aro_update_megabatch_async(
 
 
 def _shifted_cholesky_qr(A: Tensor) -> Tensor:
-    """Orthogonalize A via Shifted Cholesky QR.
+    """Orthogonalize A via Shifted Cholesky QR on CPU.
 
-    Uses matmul + Cholesky + triangular solve, which need far less
-    GPU workspace than Householder QR (torch.linalg.qr). Adds a
-    small shift to the Gram matrix diagonal for numerical stability.
+    torch.compile on B200/CUDA 13.0 corrupts cusolver state, making all
+    GPU linalg operations fail after the first compiled forward/backward.
+    We move the decomposition to CPU (Gram matrix is small: [batch, m, m])
+    and keep the matmuls on GPU.
 
-    If Cholesky fails (input too ill-conditioned), falls back to
-    Householder QR.
-
-    Same approach as dion.py's orthogonalize() and the ARO paper's
-    recommended implementation.
+    Uses matmul + Cholesky + triangular solve. Adds a small shift to the
+    Gram matrix diagonal for numerical stability. Falls back to
+    Householder QR if Cholesky fails.
     """
-    G = A.mT @ A  # Gram matrix [*, m, m], via cuBLAS
+    device = A.device
+    G = A.mT @ A  # Gram matrix [*, m, m], via cuBLAS (on GPU)
+    G_cpu = G.cpu()
+    del G
     # Shift proportional to the Frobenius norm of A
-    shift = A.norm() ** 2 * 1e-7
-    G.diagonal(dim1=-2, dim2=-1).add_(shift)
-    # Synchronize + release cached memory before cusolver call.
-    # Without synchronize, empty_cache cannot release blocks with pending
-    # ops on other CUDA streams (e.g. NCCL all-to-all, torch.compile).
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    # Upper Cholesky: G = R^T R, then Q = A @ R^{-1}
-    R, info = torch.linalg.cholesky_ex(G, upper=True)
+    shift = A.norm().item() ** 2 * 1e-7
+    G_cpu.diagonal(dim1=-2, dim2=-1).add_(shift)
+    # Cholesky on CPU (avoids cusolver entirely)
+    R, info = torch.linalg.cholesky_ex(G_cpu, upper=True)
     if (info != 0).any():
-        # Fallback: Householder QR for ill-conditioned inputs
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        Q, _ = torch.linalg.qr(A)
-        return Q
+        # Fallback: QR on CPU
+        A_cpu = A.cpu()
+        Q, _ = torch.linalg.qr(A_cpu)
+        return Q.to(device)
+    R = R.to(device)
     return torch.linalg.solve_triangular(R, A, upper=True, left=False)
 
 
