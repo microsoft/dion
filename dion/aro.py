@@ -296,13 +296,16 @@ def _shifted_cholesky_qr(A: Tensor) -> Tensor:
     # Shift proportional to the Frobenius norm of A
     shift = A.norm() ** 2 * 1e-7
     G.diagonal(dim1=-2, dim2=-1).add_(shift)
-    # Release cached memory right before cusolver call — the matmul above
-    # re-fills the cache, so the earlier empty_cache() is not sufficient.
+    # Synchronize + release cached memory before cusolver call.
+    # Without synchronize, empty_cache cannot release blocks with pending
+    # ops on other CUDA streams (e.g. NCCL all-to-all, torch.compile).
+    torch.cuda.synchronize()
     torch.cuda.empty_cache()
     # Upper Cholesky: G = R^T R, then Q = A @ R^{-1}
     R, info = torch.linalg.cholesky_ex(G, upper=True)
     if (info != 0).any():
         # Fallback: Householder QR for ill-conditioned inputs
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
         Q, _ = torch.linalg.qr(A)
         return Q
