@@ -211,10 +211,17 @@ def aro_update_megabatch_async(
         or direct stacking (DDP).
 
         """
+        # Disable autocast — FSDP MixedPrecisionPolicy may wrap the
+        # optimizer step in bf16 autocast, but ARO needs float32 for
+        # the rotation and cross-alignment computation.
+        with torch.autocast("cuda", enabled=False):
+            return _aro_ortho_fn_impl(M_batch, epsilon)
+
+    def _aro_ortho_fn_impl(M_batch, epsilon=None):
         M_f32 = M_batch.float()
 
         # Phase 1: compute cross-alignment matrix
-        rotated = R_my.mT @ M_f32
+        rotated = R_my.float().mT @ M_f32
         f_rotated = base_opt_fn(rotated)
         del rotated
         cross = M_f32 @ f_rotated.mT
