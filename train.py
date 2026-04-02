@@ -140,6 +140,10 @@ def parse_cli_args():
     )
     parser.add_argument("--mu", type=float, default=None, help="Momentum coefficient")
     parser.add_argument("--weight_decay", type=float, default=None, help="Weight decay")
+    parser.add_argument(
+        "--time_optimizer", action="store_true",
+        help="Time fwd/bwd and optimizer step separately (adds cuda.synchronize between them)",
+    )
 
     # ---------- model ----------
     parser.add_argument("--model_dim", type=int, default=None)
@@ -930,9 +934,13 @@ def main():
             val_loss = val_loss.item() / val_steps
             log_message = (
                 f"step:{step}/{hp.num_iterations} val_loss:{val_loss:.4f} "
-                f"train_time:{training_time_ms/1000:.0f}s step_avg:{training_time_ms/timed_steps:.2f}ms "
-                f"(fwd_bwd_avg:{total_fwd_bwd_ms/timed_steps:.2f} opt_avg:{total_opt_ms/timed_steps:.2f})"
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/timed_steps:.2f}ms"
             )
+            if cli_args.time_optimizer:
+                log_message += (
+                    f" (fwd_bwd_avg:{total_fwd_bwd_ms/timed_steps:.2f}ms"
+                    f" opt_avg:{total_opt_ms/timed_steps:.2f}ms)"
+                )
             print0(log_message)
             if MASTER_PROCESS and not cli_args.no_wandb and not cli_args.debug:
                 wandb.log(
@@ -952,8 +960,9 @@ def main():
             break
 
         model.train()
-        torch.cuda.synchronize()
-        t_fwd_bwd = time.perf_counter()
+        if cli_args.time_optimizer:
+            torch.cuda.synchronize()
+            t_fwd_bwd = time.perf_counter()
         for i in range(1, grad_accum_steps + 1):
             with autocast_ctx:
                 loss = model(x, y)
@@ -980,12 +989,12 @@ def main():
                         model.set_requires_gradient_sync(True)
                 loss.backward()
 
-        torch.cuda.synchronize()
-        fwd_bwd_ms = 1000 * (time.perf_counter() - t_fwd_bwd)
+        if cli_args.time_optimizer:
+            torch.cuda.synchronize()
+            fwd_bwd_ms = 1000 * (time.perf_counter() - t_fwd_bwd)
+            t_opt = time.perf_counter()
 
         # Gradient norm + optimizer step
-        t_opt = time.perf_counter()
-
         grad_norm = torch.nn.utils.get_total_norm(
             [p.grad for p in model.parameters() if p.grad is not None]
         )
@@ -993,11 +1002,11 @@ def main():
         lr_scheduler.step()
         model.zero_grad(set_to_none=True)
 
-        torch.cuda.synchronize()
-        opt_ms = 1000 * (time.perf_counter() - t_opt)
-
-        total_fwd_bwd_ms += fwd_bwd_ms
-        total_opt_ms += opt_ms
+        if cli_args.time_optimizer:
+            torch.cuda.synchronize()
+            opt_ms = 1000 * (time.perf_counter() - t_opt)
+            total_fwd_bwd_ms += fwd_bwd_ms
+            total_opt_ms += opt_ms
 
         # Snapshot wall-clock training time for logging (without pausing t0)
         current_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
@@ -1008,7 +1017,7 @@ def main():
                 "step": step,
                 "time/training_time_ms": current_training_time_ms,
             }
-            if step > 10:
+            if cli_args.time_optimizer and step > 10:
                 log_dict["time/fwd_bwd_ms"] = fwd_bwd_ms
                 log_dict["time/opt_ms"] = opt_ms
             wandb.log(log_dict)
