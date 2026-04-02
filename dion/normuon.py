@@ -6,14 +6,14 @@ from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.optim.optimizer import ParamsT
 from typing import Callable, Generator, List, Optional, Tuple, Union
 
-from .megabatch_base import DistributedOrthoBase, megabatch_orthogonalize_async
-from .opt_utils import AsyncTask, to_local
-from .muon import (
-    muon_update_pre_orthogonalize,
-    muon_update_post_orthogonalize,
+from .megabatch_base import (
+    DistributedOrthoBase,
+    megabatch_orthogonalize_async,
     adjust_lr_spectral_norm,
     adjust_lr_rms_norm,
 )
+from .opt_utils import AsyncTask, to_local
+from .muon import muon_update_pre_orthogonalize, muon_update_post_orthogonalize
 
 
 class NorMuon(DistributedOrthoBase):
