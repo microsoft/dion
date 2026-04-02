@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.distributed as dist
 from collections import defaultdict
@@ -15,7 +16,6 @@ from .newton_schulz_triton import (
 )
 from .opt_utils import AsyncRuntime, AsyncTask, to_local
 from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
-from .muon import muon_update_newton_schulz, adjust_lr_spectral_norm, adjust_lr_rms_norm
 
 
 class DistributedOrthoBase(Optimizer):
@@ -64,7 +64,7 @@ class DistributedOrthoBase(Optimizer):
             )
         self._distributed_mesh = distributed_mesh
 
-        # Newton-Schulz configuration
+        # Orthogonalization function configuration
         if newton_schulz_func is not None:
             if not callable(newton_schulz_func):
                 raise TypeError(
@@ -269,7 +269,7 @@ def megabatch_orthogonalize_async(
     N = len(U)
 
     # Pad to divisible by world_size (needed by both distributed paths)
-    if process_group is not None and N > 1:
+    if process_group is not None and (N > 1 or comm_dim is not None):
         pad_n = (world_size - N % world_size) % world_size
         U_work = U + [torch.zeros_like(U[0])] * pad_n if pad_n > 0 else U
         N_total = len(U_work)
@@ -356,3 +356,42 @@ def megabatch_orthogonalize_async(
             epsilon=epsilon,
         )
         return [stacked[i] for i in range(N)]
+
+
+def muon_update_newton_schulz(
+    X: Tensor,
+    newton_schulz_func: Callable,
+    flatten: bool,
+    epsilon: Tensor,
+) -> Tensor:
+    """
+    Flatten the input tensor if needed and call the Newton-Schulz function.
+    """
+    original_shape = X.shape
+    if flatten and X.ndim >= 3:
+        X = X.flatten(start_dim=1)
+    elif X.ndim >= 4:
+        X = X.flatten(end_dim=-3)
+
+    return newton_schulz_func(X, epsilon=epsilon).reshape(original_shape)
+
+
+def adjust_lr_rms_norm(lr, param_shape, flatten):
+    """Adjust learning rate for constant element-wise RMS norm."""
+    if flatten:
+        fan_out = param_shape[0]
+        fan_in = math.prod(param_shape[1:])
+    else:
+        fan_out, fan_in = param_shape[-2:]
+    adjusted_ratio = 0.2 * math.sqrt(max(fan_out, fan_in))
+    return lr * adjusted_ratio
+
+
+def adjust_lr_spectral_norm(lr, param_shape, flatten):
+    """Adjust from spectral norm 1 to RMS operator norm 1."""
+    if flatten:
+        fan_out = param_shape[0]
+        fan_in = math.prod(param_shape[1:])
+    else:
+        fan_out, fan_in = param_shape[-2:]
+    return lr * math.sqrt(fan_out / fan_in)
