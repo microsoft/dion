@@ -34,7 +34,7 @@ fs_size: null      # FSDP size
 
 # — Optimizer & Hyperparameters —
 optimizer: dion2
-scalar_opt: lion
+scalar_opt: adamw
 mu: 0.95
 weight_decay: 0.01
 ortho_fraction: 0.5

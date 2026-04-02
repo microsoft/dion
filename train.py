@@ -135,6 +135,15 @@ def parse_cli_args():
     parser.add_argument(
         "--mixed_precision", action="store_true", help="Use mixed precision for Dion"
     )
+    parser.add_argument(
+        "--ortho_fraction", type=float, default=None, help="Fraction to orthogonalize for Dion/Dion2"
+    )
+    parser.add_argument("--mu", type=float, default=None, help="Momentum coefficient")
+    parser.add_argument("--weight_decay", type=float, default=None, help="Weight decay")
+    parser.add_argument(
+        "--time_optimizer", action="store_true",
+        help="Time fwd/bwd and optimizer step separately (adds cuda.synchronize between them)",
+    )
 
     # ---------- model ----------
     parser.add_argument("--model_dim", type=int, default=None)
@@ -881,8 +890,10 @@ def main():
     # --- Training Loop ---
     x, y = train_loader.next_batch()
     training_time_ms = 0
+    total_fwd_bwd_ms = 0
+    total_opt_ms = 0
     torch.cuda.synchronize()
-    t0 = time.time()
+    t0 = time.perf_counter()
 
     # Use autocast for mixed precision
     autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -894,16 +905,18 @@ def main():
         # Skip the first few steps for timing to avoid torch.compile overhead
         if step == 10:
             training_time_ms = 0
+            total_fwd_bwd_ms = 0
+            total_opt_ms = 0
             torch.cuda.synchronize()
-            t0 = time.time()
+            t0 = time.perf_counter()
         timed_steps = (step - 10) if step > 10 else float("nan")
 
         # --- Validation ---
         last_step = step == hp.num_iterations
         if last_step or (hp.val_loss_every > 0 and step % hp.val_loss_every == 0):
-            # Measure elapsed time for training
+            # Pause wall-clock training timer during validation
             torch.cuda.synchronize()
-            training_time_ms += 1000 * (time.time() - t0)
+            training_time_ms += 1000 * (time.perf_counter() - t0)
 
             # Run validation
             model.eval()
@@ -921,8 +934,13 @@ def main():
             val_loss = val_loss.item() / val_steps
             log_message = (
                 f"step:{step}/{hp.num_iterations} val_loss:{val_loss:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps):.2f}ms"
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/timed_steps:.2f}ms"
             )
+            if cli_args.time_optimizer:
+                log_message += (
+                    f" (fwd_bwd_avg:{total_fwd_bwd_ms/timed_steps:.2f}ms"
+                    f" opt_avg:{total_opt_ms/timed_steps:.2f}ms)"
+                )
             print0(log_message)
             if MASTER_PROCESS and not cli_args.no_wandb and not cli_args.debug:
                 wandb.log(
@@ -934,14 +952,17 @@ def main():
                 )
             pbar.set_postfix(val_loss=f"{val_loss:.4f}")
 
-            # Restart training time for the next iteration
+            # Resume wall-clock training timer
             torch.cuda.synchronize()
-            t0 = time.time()
+            t0 = time.perf_counter()
 
         if last_step:
             break
 
         model.train()
+        if cli_args.time_optimizer:
+            torch.cuda.synchronize()
+            t_fwd_bwd = time.perf_counter()
         for i in range(1, grad_accum_steps + 1):
             with autocast_ctx:
                 loss = model(x, y)
@@ -968,27 +989,38 @@ def main():
                         model.set_requires_gradient_sync(True)
                 loss.backward()
 
-        # Gradient norm
+        if cli_args.time_optimizer:
+            torch.cuda.synchronize()
+            fwd_bwd_ms = 1000 * (time.perf_counter() - t_fwd_bwd)
+            t_opt = time.perf_counter()
+
+        # Gradient norm + optimizer step
         grad_norm = torch.nn.utils.get_total_norm(
             [p.grad for p in model.parameters() if p.grad is not None]
         )
-
-        # Optimizer step
         optimizer.step()
         lr_scheduler.step()
         model.zero_grad(set_to_none=True)
 
-        # Approximate updated training time just before logging
-        approx_time = training_time_ms + 1000 * (time.time() - t0)
+        if cli_args.time_optimizer:
+            torch.cuda.synchronize()
+            opt_ms = 1000 * (time.perf_counter() - t_opt)
+            total_fwd_bwd_ms += fwd_bwd_ms
+            total_opt_ms += opt_ms
+
+        # Snapshot wall-clock training time for logging (without pausing t0)
+        current_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
         if MASTER_PROCESS and not cli_args.no_wandb and not cli_args.debug:
-            wandb.log(
-                {
-                    "train/loss": train_loss.item(),
-                    "train/grad_norm": grad_norm.item(),
-                    "step": step,
-                    "time/training_time_ms": approx_time,  # Log approximate elapsed training time in ms
-                }
-            )
+            log_dict = {
+                "train/loss": train_loss.item(),
+                "train/grad_norm": grad_norm.item(),
+                "step": step,
+                "time/training_time_ms": current_training_time_ms,
+            }
+            if cli_args.time_optimizer and step > 10:
+                log_dict["time/fwd_bwd_ms"] = fwd_bwd_ms
+                log_dict["time/opt_ms"] = opt_ms
+            wandb.log(log_dict)
         if MASTER_PROCESS and cli_args.debug:
             print0(
                 f"Step {step}: train_loss={train_loss.item():.4f}, grad_norm={grad_norm.item():.4f}"
@@ -1006,9 +1038,6 @@ def main():
 
             # Save a distributed checkpoint
             checkpoint_manager.save(step=step)
-
-        torch.cuda.synchronize()
-        t0 = time.time()  # reset timer after optimizer step
 
     pbar.close()
     print0(
