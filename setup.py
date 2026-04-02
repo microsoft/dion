@@ -68,5 +68,6 @@ setup(
     extras_require={
         "dev": install_dev_requires,  # Can be installed with `pip install dion[dev]`
         "train": install_train_requires,
+        "triton": install_requires + ["triton"],
     },
 )

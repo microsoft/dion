@@ -1,7 +1,23 @@
 import torch
-import triton
-import triton.language as tl
 from torch import Tensor
+
+try:
+    import triton
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+except ImportError:
+    TRITON_AVAILABLE = False
+    # Provide stubs so the module can be parsed without triton.
+    # The kernel functions will be defined but non-functional;
+    # the user-facing functions check TRITON_AVAILABLE at runtime.
+    import types
+    triton = types.ModuleType("triton")
+    triton.jit = lambda fn: fn
+    triton.autotune = lambda **kw: lambda fn: fn
+    triton.Config = dict
+    triton.cdiv = lambda a, b: (a + b - 1) // b
+    tl = types.ModuleType("triton.language")
+    tl.constexpr = int
 
 
 def _get_autotune_configs():
@@ -502,6 +518,11 @@ def newton_schulz_triton(G: Tensor, epsilon: float = 1e-7):
     """
     Triton implementation of Newton-Schulz iteration (5 iterations).
     """
+    if not TRITON_AVAILABLE:
+        raise ImportError(
+            "newton_schulz_triton requires the 'triton' package. "
+            "Install it with: pip install dion[triton]  (or: pip install triton)"
+        )
     # Newton-Schulz constants
     ns_consts = [
         (4.0848, -6.8946, 2.9270),
@@ -549,6 +570,11 @@ def newton_schulz_triton_fast(G: Tensor, epsilon: float = 1e-7):
 
     Signature matches zeropower_via_newtonschulz5: func(input, epsilon) -> Tensor.
     """
+    if not TRITON_AVAILABLE:
+        raise ImportError(
+            "newton_schulz_triton_fast requires the 'triton' package. "
+            "Install it with: pip install dion[triton]  (or: pip install triton)"
+        )
     ns_consts = [
         [4.6051, -9.6552, 5.6769],
         [4.7505, -6.0861, 2.1790],
