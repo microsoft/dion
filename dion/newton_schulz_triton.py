@@ -4,481 +4,482 @@ from torch import Tensor
 try:
     import triton
     import triton.language as tl
-
     TRITON_AVAILABLE = True
 except ImportError:
     TRITON_AVAILABLE = False
+    # Provide stubs so the module can be parsed without triton.
+    # The kernel functions will be defined but non-functional;
+    # the user-facing functions check TRITON_AVAILABLE at runtime.
+    import types
+    triton = types.ModuleType("triton")
+    triton.jit = lambda fn: fn
+    triton.autotune = lambda **kw: lambda fn: fn
+    triton.Config = dict
+    triton.cdiv = lambda a, b: (a + b - 1) // b
+    tl = types.ModuleType("triton.language")
+    tl.constexpr = int
 
 
-def _require_triton(func_name: str):
-    raise ImportError(
-        f"'{func_name}' requires the 'triton' package, which is not installed. "
-        f"Install it with: pip install dion[triton]  (or: pip install triton)"
+def _get_autotune_configs():
+    return [
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": bm,
+                "BLOCK_SIZE_N": bn,
+                "BLOCK_SIZE_K": bk,
+                "GROUP_SIZE_M": 8,
+                "LOWER_UPPER": 1,
+            },
+            num_stages=stages,
+            num_warps=warps,
+        )
+        for bm in [64, 128]
+        for bn in [64, 128, 256]
+        for bk in [64, 128]
+        for stages, warps in [(3, 4), (3, 8), (4, 4)]
+        if bm // bn <= 2 and bn // bm <= 2
+    ]
+
+
+@triton.jit
+def _pid_to_block(
+    pid,
+    M,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    """
+    Helper function to map Triton program ID to (batch, row, col) of the output matrix.
+    """
+    # Split output matrix into blocks of size (BLOCK_SIZE_M, BLOCK_SIZE_N)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(M, BLOCK_SIZE_N)
+
+    # Map PID to a single matrix in batch
+    batch_idx = pid // (num_pid_m * num_pid_n)
+    pid = pid % (num_pid_m * num_pid_n)
+
+    # Map PID to 2D grid of blocks
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    pid_m, pid_n = tl.swizzle2d(pid_m, pid_n, num_pid_m, num_pid_n, GROUP_SIZE_M)
+
+    m_idx = pid_m * BLOCK_SIZE_M
+    n_idx = pid_n * BLOCK_SIZE_N
+
+    return batch_idx, m_idx, n_idx
+
+
+@triton.autotune(
+    configs=_get_autotune_configs(),
+    key=["M", "K", "a_stride_r", "a_stride_c", "c_stride_r", "c_stride_c"],
+)
+@triton.jit
+def ns_line_1_kernel(
+    A_ptr,
+    C_ptr,
+    M,
+    K,
+    a_stride_b,
+    a_stride_r,
+    a_stride_c,
+    c_stride_b,
+    c_stride_r,
+    c_stride_c,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    LOWER_UPPER: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr = "tf32",
+):
+    """
+    Input A has shape (M, K)
+    Output C has shape (M, M)
+    Compute C = A @ A.T
+    """
+
+    pid = tl.program_id(axis=0)
+    batch_idx, m_idx, n_idx = _pid_to_block(
+        pid, M, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M
     )
 
+    # Skip blocks that don't need to be computed
+    skip_block_below_diag = (LOWER_UPPER == 0) and (n_idx + BLOCK_SIZE_N <= m_idx)
+    skip_block_above_diag = (LOWER_UPPER != 0) and (m_idx + BLOCK_SIZE_M <= n_idx)
+    if skip_block_below_diag or skip_block_above_diag:
+        return
 
-if TRITON_AVAILABLE:
+    # Index into one matrix of batch
+    A_ptr += batch_idx * a_stride_b
+    C_ptr += batch_idx * c_stride_b
 
-    def _get_autotune_configs():
-        return [
-            triton.Config(
-                {
-                    "BLOCK_SIZE_M": bm,
-                    "BLOCK_SIZE_N": bn,
-                    "BLOCK_SIZE_K": bk,
-                    "GROUP_SIZE_M": 8,
-                    "LOWER_UPPER": 1,
-                },
-                num_stages=stages,
-                num_warps=warps,
-            )
-            for bm in [64, 128]
-            for bn in [64, 128, 256]
-            for bk in [64, 128]
-            for stages, warps in [(3, 4), (3, 8), (4, 4)]
-            if bm // bn <= 2 and bn // bm <= 2
-        ]
+    # Create pointer arrays for A and A.T
+    offs_m = (m_idx + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_n = (n_idx + tl.arange(0, BLOCK_SIZE_N)) % M
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = A_ptr + (offs_m[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
+    at_ptrs = A_ptr + (offs_k[:, None] * a_stride_c + offs_n[None, :] * a_stride_r)
 
-    @triton.jit
-    def _pid_to_block(
-        pid,
-        M,
-        BLOCK_SIZE_M: tl.constexpr,
-        BLOCK_SIZE_N: tl.constexpr,
-        GROUP_SIZE_M: tl.constexpr,
-    ):
-        """
-        Helper function to map Triton program ID to (batch, row, col) of the output matrix.
-        """
-        # Split output matrix into blocks of size (BLOCK_SIZE_M, BLOCK_SIZE_N)
-        num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-        num_pid_n = tl.cdiv(M, BLOCK_SIZE_N)
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-        # Map PID to a single matrix in batch
-        batch_idx = pid // (num_pid_m * num_pid_n)
-        pid = pid % (num_pid_m * num_pid_n)
+    # Accumulate over blocks of K
+    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+        at = tl.load(at_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        accumulator = tl.dot(a, at, accumulator, input_precision=INPUT_PRECISION)
+        a_ptrs += BLOCK_SIZE_K * a_stride_c
+        at_ptrs += BLOCK_SIZE_K * a_stride_c
 
-        # Map PID to 2D grid of blocks
-        pid_m = pid // num_pid_n
-        pid_n = pid % num_pid_n
-        pid_m, pid_n = tl.swizzle2d(pid_m, pid_n, num_pid_m, num_pid_n, GROUP_SIZE_M)
+    out_dtype = C_ptr.dtype.element_ty
+    output = accumulator.to(out_dtype)
 
-        m_idx = pid_m * BLOCK_SIZE_M
-        n_idx = pid_n * BLOCK_SIZE_N
+    # Store block of C
+    offs_cm = m_idx + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = n_idx + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C_ptr + (offs_cm[:, None] * c_stride_r + offs_cn[None, :] * c_stride_c)
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < M)
+    tl.store(c_ptrs, output, mask=c_mask)
 
-        return batch_idx, m_idx, n_idx
+    # Store block of C mirrored across the diagonal
+    c_ptrs_t = C_ptr + (offs_cn[:, None] * c_stride_r + offs_cm[None, :] * c_stride_c)
+    c_mask_t = (offs_cn[:, None] < M) & (offs_cm[None, :] < M)
+    tl.store(c_ptrs_t, output.T, mask=c_mask_t)
 
-    @triton.autotune(
-        configs=_get_autotune_configs(),
-        key=["M", "K", "a_stride_r", "a_stride_c", "c_stride_r", "c_stride_c"],
+
+def ns_line_1(A: Tensor, *, out: Tensor = None):
+    """
+    Launch Triton kernel to compute C = A @ A.T
+    """
+    if A.ndim > 3 or A.ndim < 2:
+        raise ValueError(f"Input tensor must be 2D or 3D, but got {A.ndim}D tensor.")
+
+    M, K = A.shape[-2:]
+
+    if out is None:
+        out = torch.empty((*A.shape[:-1], M), device=A.device, dtype=A.dtype)
+    assert out.size(-2) == M, "Output matrix has incorrect shape"
+    assert out.size(-1) == M, "Output matrix has incorrect shape"
+
+    batch_size = A.size(0) if A.ndim == 3 else 1
+    input_batch_stride = A.stride(0) if A.ndim == 3 else 0
+    output_batch_stride = out.stride(0) if out.ndim == 3 else 0
+    input_precision = "ieee" if A.dtype == torch.float32 else "tf32"
+
+    grid = lambda meta: (
+        batch_size
+        * triton.cdiv(M, meta["BLOCK_SIZE_M"])
+        * triton.cdiv(M, meta["BLOCK_SIZE_N"]),
     )
-    @triton.jit
-    def ns_line_1_kernel(
-        A_ptr,
-        C_ptr,
-        M,
-        K,
-        a_stride_b,
-        a_stride_r,
-        a_stride_c,
-        c_stride_b,
-        c_stride_r,
-        c_stride_c,
-        BLOCK_SIZE_M: tl.constexpr,
-        BLOCK_SIZE_N: tl.constexpr,
-        BLOCK_SIZE_K: tl.constexpr,
-        GROUP_SIZE_M: tl.constexpr,
-        LOWER_UPPER: tl.constexpr,
-        INPUT_PRECISION: tl.constexpr = "tf32",
-    ):
-        """
-        Input A has shape (M, K)
-        Output C has shape (M, M)
-        Compute C = A @ A.T
-        """
-
-        pid = tl.program_id(axis=0)
-        batch_idx, m_idx, n_idx = _pid_to_block(
-            pid, M, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M
-        )
-
-        # Skip blocks that don't need to be computed
-        skip_block_below_diag = (LOWER_UPPER == 0) and (n_idx + BLOCK_SIZE_N <= m_idx)
-        skip_block_above_diag = (LOWER_UPPER != 0) and (m_idx + BLOCK_SIZE_M <= n_idx)
-        if skip_block_below_diag or skip_block_above_diag:
-            return
-
-        # Index into one matrix of batch
-        A_ptr += batch_idx * a_stride_b
-        C_ptr += batch_idx * c_stride_b
-
-        # Create pointer arrays for A and A.T
-        offs_m = (m_idx + tl.arange(0, BLOCK_SIZE_M)) % M
-        offs_n = (n_idx + tl.arange(0, BLOCK_SIZE_N)) % M
-        offs_k = tl.arange(0, BLOCK_SIZE_K)
-        a_ptrs = A_ptr + (offs_m[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
-        at_ptrs = A_ptr + (offs_k[:, None] * a_stride_c + offs_n[None, :] * a_stride_r)
-
-        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-
-        # Accumulate over blocks of K
-        for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-            at = tl.load(at_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
-            accumulator = tl.dot(a, at, accumulator, input_precision=INPUT_PRECISION)
-            a_ptrs += BLOCK_SIZE_K * a_stride_c
-            at_ptrs += BLOCK_SIZE_K * a_stride_c
-
-        out_dtype = C_ptr.dtype.element_ty
-        output = accumulator.to(out_dtype)
-
-        # Store block of C
-        offs_cm = m_idx + tl.arange(0, BLOCK_SIZE_M)
-        offs_cn = n_idx + tl.arange(0, BLOCK_SIZE_N)
-        c_ptrs = C_ptr + (offs_cm[:, None] * c_stride_r + offs_cn[None, :] * c_stride_c)
-        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < M)
-        tl.store(c_ptrs, output, mask=c_mask)
-
-        # Store block of C mirrored across the diagonal
-        c_ptrs_t = C_ptr + (offs_cn[:, None] * c_stride_r + offs_cm[None, :] * c_stride_c)
-        c_mask_t = (offs_cn[:, None] < M) & (offs_cm[None, :] < M)
-        tl.store(c_ptrs_t, output.T, mask=c_mask_t)
-
-    def ns_line_1(A: Tensor, *, out: Tensor = None):
-        """
-        Launch Triton kernel to compute C = A @ A.T
-        """
-        if A.ndim > 3 or A.ndim < 2:
-            raise ValueError(f"Input tensor must be 2D or 3D, but got {A.ndim}D tensor.")
-
-        M, K = A.shape[-2:]
-
-        if out is None:
-            out = torch.empty((*A.shape[:-1], M), device=A.device, dtype=A.dtype)
-        assert out.size(-2) == M, "Output matrix has incorrect shape"
-        assert out.size(-1) == M, "Output matrix has incorrect shape"
-
-        batch_size = A.size(0) if A.ndim == 3 else 1
-        input_batch_stride = A.stride(0) if A.ndim == 3 else 0
-        output_batch_stride = out.stride(0) if out.ndim == 3 else 0
-        input_precision = "ieee" if A.dtype == torch.float32 else "tf32"
-
-        grid = lambda meta: (
-            batch_size
-            * triton.cdiv(M, meta["BLOCK_SIZE_M"])
-            * triton.cdiv(M, meta["BLOCK_SIZE_N"]),
-        )
-        ns_line_1_kernel[grid](
-            A_ptr=A,
-            C_ptr=out,
-            M=M,
-            K=K,
-            a_stride_b=input_batch_stride,
-            a_stride_r=A.stride(-2),
-            a_stride_c=A.stride(-1),
-            c_stride_b=output_batch_stride,
-            c_stride_r=out.stride(-2),
-            c_stride_c=out.stride(-1),
-            INPUT_PRECISION=input_precision,
-        )
-
-        return out
-
-    @triton.autotune(
-        configs=_get_autotune_configs(),
-        key=["M", "a_stride_r", "a_stride_c", "c_stride_r", "c_stride_c"],
+    ns_line_1_kernel[grid](
+        A_ptr=A,
+        C_ptr=out,
+        M=M,
+        K=K,
+        a_stride_b=input_batch_stride,
+        a_stride_r=A.stride(-2),
+        a_stride_c=A.stride(-1),
+        c_stride_b=output_batch_stride,
+        c_stride_r=out.stride(-2),
+        c_stride_c=out.stride(-1),
+        INPUT_PRECISION=input_precision,
     )
-    @triton.jit
-    def ns_line_2_kernel(
-        A_ptr,
-        C_ptr,
-        M,
-        a_stride_b,
-        a_stride_r,
-        a_stride_c,
-        c_stride_b,
-        c_stride_r,
-        c_stride_c,
-        alpha,
-        beta,
-        BLOCK_SIZE_M: tl.constexpr,
-        BLOCK_SIZE_N: tl.constexpr,
-        BLOCK_SIZE_K: tl.constexpr,
-        GROUP_SIZE_M: tl.constexpr,
-        LOWER_UPPER: tl.constexpr,
-        INPUT_PRECISION: tl.constexpr = "tf32",
-    ):
-        """
-        Input A is square matrix with shape (M, M)
-        Output C has shape (M, M)
-        Compute C = alpha * A @ A.T + beta * A
-        """
 
-        pid = tl.program_id(axis=0)
-        batch_idx, m_idx, n_idx = _pid_to_block(
-            pid, M, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M
-        )
+    return out
 
-        # Skip blocks that don't need to be computed
-        skip_block_below_diag = (LOWER_UPPER == 0) and (n_idx + BLOCK_SIZE_N <= m_idx)
-        skip_block_above_diag = (LOWER_UPPER != 0) and (m_idx + BLOCK_SIZE_M <= n_idx)
-        if skip_block_below_diag or skip_block_above_diag:
-            return
 
-        # Index into one matrix of batch
-        A_ptr += batch_idx * a_stride_b
-        C_ptr += batch_idx * c_stride_b
+@triton.autotune(
+    configs=_get_autotune_configs(),
+    key=["M", "a_stride_r", "a_stride_c", "c_stride_r", "c_stride_c"],
+)
+@triton.jit
+def ns_line_2_kernel(
+    A_ptr,
+    C_ptr,
+    M,
+    a_stride_b,
+    a_stride_r,
+    a_stride_c,
+    c_stride_b,
+    c_stride_r,
+    c_stride_c,
+    alpha,
+    beta,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    LOWER_UPPER: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr = "tf32",
+):
+    """
+    Input A is square matrix with shape (M, M)
+    Output C has shape (M, M)
+    Compute C = alpha * A @ A.T + beta * A
+    """
 
-        # Create pointer arrays for A and A.T
-        offs_m = (m_idx + tl.arange(0, BLOCK_SIZE_M)) % M
-        offs_n = (n_idx + tl.arange(0, BLOCK_SIZE_N)) % M
-        offs_k = tl.arange(0, BLOCK_SIZE_K)
-        a_ptrs = A_ptr + (offs_m[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
-        at_ptrs = A_ptr + (offs_k[:, None] * a_stride_c + offs_n[None, :] * a_stride_r)
-
-        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-
-        # Accumulate over blocks of K
-        for k in tl.range(0, tl.cdiv(M, BLOCK_SIZE_K)):
-            a = tl.load(a_ptrs, mask=offs_k[None, :] < M - k * BLOCK_SIZE_K, other=0.0)
-            at = tl.load(at_ptrs, mask=offs_k[:, None] < M - k * BLOCK_SIZE_K, other=0.0)
-            accumulator = tl.dot(a, at, accumulator, input_precision=INPUT_PRECISION)
-            a_ptrs += BLOCK_SIZE_K * a_stride_c
-            at_ptrs += BLOCK_SIZE_K * a_stride_c
-
-        # Load block of A to add (corresponds to the current block of C)
-        offs_am = m_idx + tl.arange(0, BLOCK_SIZE_M)
-        offs_an = n_idx + tl.arange(0, BLOCK_SIZE_N)
-        a_add_ptrs = A_ptr + (offs_am[:, None] * a_stride_r + offs_an[None, :] * a_stride_c)
-        a_add_mask = (offs_am[:, None] < M) & (offs_an[None, :] < M)
-        a_add = tl.load(a_add_ptrs, mask=a_add_mask, other=0.0).to(tl.float32)
-
-        # Apply alpha and beta
-        accumulator *= alpha
-        accumulator += a_add * beta
-
-        out_dtype = C_ptr.dtype.element_ty
-        output = accumulator.to(out_dtype)
-
-        # Store block of C
-        offs_cm = m_idx + tl.arange(0, BLOCK_SIZE_M)
-        offs_cn = n_idx + tl.arange(0, BLOCK_SIZE_N)
-        c_ptrs = C_ptr + (offs_cm[:, None] * c_stride_r + offs_cn[None, :] * c_stride_c)
-        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < M)
-        tl.store(c_ptrs, output, mask=c_mask)
-
-        # Store block of C mirrored across the diagonal
-        c_ptrs_t = C_ptr + (offs_cn[:, None] * c_stride_r + offs_cm[None, :] * c_stride_c)
-        c_mask_t = (offs_cn[:, None] < M) & (offs_cm[None, :] < M)
-        tl.store(c_ptrs_t, output.T, mask=c_mask_t)
-
-    def ns_line_2(A: Tensor, alpha: float, beta: float, *, out: Tensor = None):
-        """
-        Launch Triton kernel to compute C = alpha * A @ A.T + beta * A
-        """
-        if A.ndim > 3 or A.ndim < 2:
-            raise ValueError(f"Input tensor must be 2D or 3D, but got {A.ndim}D tensor.")
-
-        M, K = A.shape[-2:]
-        if M != K:
-            raise ValueError(
-                f"Input must be symmetric square matrix, but got shape {A.shape}"
-            )
-
-        if out is None:
-            out = torch.empty((*A.shape[:-1], M), device=A.device, dtype=A.dtype)
-        assert out.size(-2) == M, "Output matrix has incorrect shape"
-        assert out.size(-1) == M, "Output matrix has incorrect shape"
-
-        batch_size = A.size(0) if A.ndim == 3 else 1
-        input_batch_stride = A.stride(0) if A.ndim == 3 else 0
-        output_batch_stride = out.stride(0) if out.ndim == 3 else 0
-        input_precision = "ieee" if A.dtype == torch.float32 else "tf32"
-
-        grid = lambda meta: (
-            batch_size
-            * triton.cdiv(M, meta["BLOCK_SIZE_M"])
-            * triton.cdiv(M, meta["BLOCK_SIZE_N"]),
-        )
-        ns_line_2_kernel[grid](
-            A_ptr=A,
-            C_ptr=out,
-            M=M,
-            a_stride_b=input_batch_stride,
-            a_stride_r=A.stride(-2),
-            a_stride_c=A.stride(-1),
-            c_stride_b=output_batch_stride,
-            c_stride_r=out.stride(-2),
-            c_stride_c=out.stride(-1),
-            alpha=alpha,
-            beta=beta,
-            INPUT_PRECISION=input_precision,
-        )
-
-        return out
-
-    def _get_gemm_configs():
-        return [
-            triton.Config(
-                {
-                    "BLOCK_SIZE_M": bm,
-                    "BLOCK_SIZE_N": bn,
-                    "BLOCK_SIZE_K": bk,
-                    "GROUP_SIZE_M": 8,
-                },
-                num_stages=st,
-                num_warps=wp,
-            )
-            for bm in (64, 128)
-            for bn in (64, 128, 256)
-            for bk in (32, 64, 128)
-            for st, wp in ((3, 4), (4, 4), (3, 8))
-            if bm // bn <= 2 and bn // bm <= 2
-        ]
-
-    @triton.jit
-    def _pid_to_block_ns3(
-        pid,
-        M,
-        N,
-        BLOCK_SIZE_M: tl.constexpr,
-        BLOCK_SIZE_N: tl.constexpr,
-        GROUP_SIZE_M: tl.constexpr,
-    ):
-        """Same helper as in your earlier kernels, extended with N."""
-        num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-        num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-
-        batch = pid // (num_pid_m * num_pid_n)
-        pid = pid % (num_pid_m * num_pid_n)
-
-        pid_m = pid // num_pid_n
-        pid_n = pid % num_pid_n
-        pid_m, pid_n = tl.swizzle2d(pid_m, pid_n, num_pid_m, num_pid_n, GROUP_SIZE_M)
-
-        return batch, pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N
-
-    @triton.autotune(
-        configs=_get_gemm_configs(),
-        key=["M", "N", "b_stride_r", "b_stride_c", "x_stride_r", "x_stride_c"],
+    pid = tl.program_id(axis=0)
+    batch_idx, m_idx, n_idx = _pid_to_block(
+        pid, M, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M
     )
-    @triton.jit
-    def ns_line_3_kernel(
-        B_ptr,  # [B, M, M]   symmetric
-        X_ptr,  # [B, M, N]
-        C_ptr,  # [B, M, N]
-        M,
-        N,  # rows(X)=M, cols(X)=N
-        b_stride_b,
-        b_stride_r,
-        b_stride_c,
-        x_stride_b,
-        x_stride_r,
-        x_stride_c,
-        c_stride_b,
-        c_stride_r,
-        c_stride_c,
-        alpha,  # scalar a  (scale of X)
-        BLOCK_SIZE_M: tl.constexpr,
-        BLOCK_SIZE_N: tl.constexpr,
-        BLOCK_SIZE_K: tl.constexpr,
-        GROUP_SIZE_M: tl.constexpr,
-    ):
-        pid = tl.program_id(axis=0)
-        batch, m_start, n_start = _pid_to_block_ns3(
-            pid, M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M
+
+    # Skip blocks that don't need to be computed
+    skip_block_below_diag = (LOWER_UPPER == 0) and (n_idx + BLOCK_SIZE_N <= m_idx)
+    skip_block_above_diag = (LOWER_UPPER != 0) and (m_idx + BLOCK_SIZE_M <= n_idx)
+    if skip_block_below_diag or skip_block_above_diag:
+        return
+
+    # Index into one matrix of batch
+    A_ptr += batch_idx * a_stride_b
+    C_ptr += batch_idx * c_stride_b
+
+    # Create pointer arrays for A and A.T
+    offs_m = (m_idx + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_n = (n_idx + tl.arange(0, BLOCK_SIZE_N)) % M
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = A_ptr + (offs_m[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
+    at_ptrs = A_ptr + (offs_k[:, None] * a_stride_c + offs_n[None, :] * a_stride_r)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    # Accumulate over blocks of K
+    for k in tl.range(0, tl.cdiv(M, BLOCK_SIZE_K)):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < M - k * BLOCK_SIZE_K, other=0.0)
+        at = tl.load(at_ptrs, mask=offs_k[:, None] < M - k * BLOCK_SIZE_K, other=0.0)
+        accumulator = tl.dot(a, at, accumulator, input_precision=INPUT_PRECISION)
+        a_ptrs += BLOCK_SIZE_K * a_stride_c
+        at_ptrs += BLOCK_SIZE_K * a_stride_c
+
+    # Load block of A to add (corresponds to the current block of C)
+    offs_am = m_idx + tl.arange(0, BLOCK_SIZE_M)
+    offs_an = n_idx + tl.arange(0, BLOCK_SIZE_N)
+    a_add_ptrs = A_ptr + (offs_am[:, None] * a_stride_r + offs_an[None, :] * a_stride_c)
+    a_add_mask = (offs_am[:, None] < M) & (offs_an[None, :] < M)
+    a_add = tl.load(a_add_ptrs, mask=a_add_mask, other=0.0).to(tl.float32)
+
+    # Apply alpha and beta
+    accumulator *= alpha
+    accumulator += a_add * beta
+
+    out_dtype = C_ptr.dtype.element_ty
+    output = accumulator.to(out_dtype)
+
+    # Store block of C
+    offs_cm = m_idx + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = n_idx + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C_ptr + (offs_cm[:, None] * c_stride_r + offs_cn[None, :] * c_stride_c)
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < M)
+    tl.store(c_ptrs, output, mask=c_mask)
+
+    # Store block of C mirrored across the diagonal
+    c_ptrs_t = C_ptr + (offs_cn[:, None] * c_stride_r + offs_cm[None, :] * c_stride_c)
+    c_mask_t = (offs_cn[:, None] < M) & (offs_cm[None, :] < M)
+    tl.store(c_ptrs_t, output.T, mask=c_mask_t)
+
+
+def ns_line_2(A: Tensor, alpha: float, beta: float, *, out: Tensor = None):
+    """
+    Launch Triton kernel to compute C = alpha * A @ A.T + beta * A
+    """
+    if A.ndim > 3 or A.ndim < 2:
+        raise ValueError(f"Input tensor must be 2D or 3D, but got {A.ndim}D tensor.")
+
+    M, K = A.shape[-2:]
+    if M != K:
+        raise ValueError(
+            f"Input must be symmetric square matrix, but got shape {A.shape}"
         )
 
-        # Offset base pointers to this batch
-        B_ptr += batch * b_stride_b
-        X_ptr += batch * x_stride_b
-        C_ptr += batch * c_stride_b
+    if out is None:
+        out = torch.empty((*A.shape[:-1], M), device=A.device, dtype=A.dtype)
+    assert out.size(-2) == M, "Output matrix has incorrect shape"
+    assert out.size(-1) == M, "Output matrix has incorrect shape"
 
-        # Create index ranges for the tile
-        offs_m = m_start + tl.arange(0, BLOCK_SIZE_M)
-        offs_n = n_start + tl.arange(0, BLOCK_SIZE_N)
-        offs_k = tl.arange(0, BLOCK_SIZE_K)
+    batch_size = A.size(0) if A.ndim == 3 else 1
+    input_batch_stride = A.stride(0) if A.ndim == 3 else 0
+    output_batch_stride = out.stride(0) if out.ndim == 3 else 0
+    input_precision = "ieee" if A.dtype == torch.float32 else "tf32"
 
-        # Pointers to B and X tiles
-        b_ptrs = B_ptr + offs_m[:, None] * b_stride_r + offs_k[None, :] * b_stride_c
-        x_ptrs = X_ptr + offs_k[:, None] * x_stride_r + offs_n[None, :] * x_stride_c
+    grid = lambda meta: (
+        batch_size
+        * triton.cdiv(M, meta["BLOCK_SIZE_M"])
+        * triton.cdiv(M, meta["BLOCK_SIZE_N"]),
+    )
+    ns_line_2_kernel[grid](
+        A_ptr=A,
+        C_ptr=out,
+        M=M,
+        a_stride_b=input_batch_stride,
+        a_stride_r=A.stride(-2),
+        a_stride_c=A.stride(-1),
+        c_stride_b=output_batch_stride,
+        c_stride_r=out.stride(-2),
+        c_stride_c=out.stride(-1),
+        alpha=alpha,
+        beta=beta,
+        INPUT_PRECISION=input_precision,
+    )
 
-        # Accumulator, initialized with bias * alpha
-        x_bias_ptrs = X_ptr + offs_m[:, None] * x_stride_r + offs_n[None, :] * x_stride_c
-        acc = (
-            tl.load(
-                x_bias_ptrs, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N), other=0.0
-            )
-            * alpha
-        ).to(tl.float32)
+    return out
 
-        # GEMM main loop
-        for k in tl.range(0, tl.cdiv(M, BLOCK_SIZE_K)):
-            b = tl.load(b_ptrs, mask=offs_k[None, :] < M - k * BLOCK_SIZE_K, other=0.0)
-            x = tl.load(x_ptrs, mask=offs_k[:, None] < M - k * BLOCK_SIZE_K, other=0.0)
-            acc = tl.dot(b, x, acc)
-            b_ptrs += BLOCK_SIZE_K * b_stride_c
-            x_ptrs += BLOCK_SIZE_K * x_stride_r
 
-        out_dtype = C_ptr.dtype.element_ty
-        acc = acc.to(out_dtype)
-
-        # Store result
-        c_ptrs = C_ptr + offs_m[:, None] * c_stride_r + offs_n[None, :] * c_stride_c
-        mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-        tl.store(c_ptrs, acc, mask=mask)
-
-    def ns_line_3(B: Tensor, X: Tensor, a: float, *, out: Tensor = None) -> Tensor:
-        """
-        Fused implementation of C = a * X + B @ X
-        B must be square & symmetric, X has same leading dim, arbitrary trailing cols.
-        """
-        if B.shape[-2] != B.shape[-1]:
-            raise ValueError("B must be square")
-
-        if B.shape[-2] != X.shape[-2]:
-            raise ValueError("B and X must have the same number of rows")
-
-        # Broadcast & batch handling (supports 2‑ or 3‑D inputs)
-        M, N = X.shape[-2:]
-        batch = X.shape[0] if X.ndim == 3 else 1
-
-        if out is None:
-            out = torch.empty_like(X)
-
-        grid = lambda meta: (
-            batch
-            * triton.cdiv(M, meta["BLOCK_SIZE_M"])
-            * triton.cdiv(N, meta["BLOCK_SIZE_N"]),
+def _get_gemm_configs():
+    return [
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": bm,
+                "BLOCK_SIZE_N": bn,
+                "BLOCK_SIZE_K": bk,
+                "GROUP_SIZE_M": 8,
+            },
+            num_stages=st,
+            num_warps=wp,
         )
+        for bm in (64, 128)
+        for bn in (64, 128, 256)
+        for bk in (32, 64, 128)
+        for st, wp in ((3, 4), (4, 4), (3, 8))
+        if bm // bn <= 2 and bn // bm <= 2
+    ]
 
-        ns_line_3_kernel[grid](
-            B_ptr=B,
-            X_ptr=X,
-            C_ptr=out,
-            M=M,
-            N=N,
-            b_stride_b=B.stride(0) if B.ndim == 3 else 0,
-            b_stride_r=B.stride(-2),
-            b_stride_c=B.stride(-1),
-            x_stride_b=X.stride(0) if X.ndim == 3 else 0,
-            x_stride_r=X.stride(-2),
-            x_stride_c=X.stride(-1),
-            c_stride_b=out.stride(0) if out.ndim == 3 else 0,
-            c_stride_r=out.stride(-2),
-            c_stride_c=out.stride(-1),
-            alpha=a,
+
+@triton.jit
+def _pid_to_block_ns3(
+    pid,
+    M,
+    N,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    """Same helper as in your earlier kernels, extended with N."""
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+
+    batch = pid // (num_pid_m * num_pid_n)
+    pid = pid % (num_pid_m * num_pid_n)
+
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    pid_m, pid_n = tl.swizzle2d(pid_m, pid_n, num_pid_m, num_pid_n, GROUP_SIZE_M)
+
+    return batch, pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N
+
+
+@triton.autotune(
+    configs=_get_gemm_configs(),
+    key=["M", "N", "b_stride_r", "b_stride_c", "x_stride_r", "x_stride_c"],
+)
+@triton.jit
+def ns_line_3_kernel(
+    B_ptr,  # [B, M, M]   symmetric
+    X_ptr,  # [B, M, N]
+    C_ptr,  # [B, M, N]
+    M,
+    N,  # rows(X)=M, cols(X)=N
+    b_stride_b,
+    b_stride_r,
+    b_stride_c,
+    x_stride_b,
+    x_stride_r,
+    x_stride_c,
+    c_stride_b,
+    c_stride_r,
+    c_stride_c,
+    alpha,  # scalar a  (scale of X)
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    batch, m_start, n_start = _pid_to_block_ns3(
+        pid, M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M
+    )
+
+    # Offset base pointers to this batch
+    B_ptr += batch * b_stride_b
+    X_ptr += batch * x_stride_b
+    C_ptr += batch * c_stride_b
+
+    # Create index ranges for the tile
+    offs_m = m_start + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = n_start + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    # Pointers to B and X tiles
+    b_ptrs = B_ptr + offs_m[:, None] * b_stride_r + offs_k[None, :] * b_stride_c
+    x_ptrs = X_ptr + offs_k[:, None] * x_stride_r + offs_n[None, :] * x_stride_c
+
+    # Accumulator, initialized with bias * alpha
+    x_bias_ptrs = X_ptr + offs_m[:, None] * x_stride_r + offs_n[None, :] * x_stride_c
+    acc = (
+        tl.load(
+            x_bias_ptrs, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N), other=0.0
         )
-        return out
-else:
-    def ns_line_1(A: Tensor, *, out: Tensor = None):
-        _require_triton("ns_line_1")
+        * alpha
+    ).to(tl.float32)
 
-    def ns_line_2(A: Tensor, alpha: float, beta: float, *, out: Tensor = None):
-        _require_triton("ns_line_2")
+    # GEMM main loop
+    for k in tl.range(0, tl.cdiv(M, BLOCK_SIZE_K)):
+        b = tl.load(b_ptrs, mask=offs_k[None, :] < M - k * BLOCK_SIZE_K, other=0.0)
+        x = tl.load(x_ptrs, mask=offs_k[:, None] < M - k * BLOCK_SIZE_K, other=0.0)
+        acc = tl.dot(b, x, acc)
+        b_ptrs += BLOCK_SIZE_K * b_stride_c
+        x_ptrs += BLOCK_SIZE_K * x_stride_r
 
-    def ns_line_3(B: Tensor, X: Tensor, a: float, *, out: Tensor = None) -> Tensor:
-        _require_triton("ns_line_3")
+    out_dtype = C_ptr.dtype.element_ty
+    acc = acc.to(out_dtype)
+
+    # Store result
+    c_ptrs = C_ptr + offs_m[:, None] * c_stride_r + offs_n[None, :] * c_stride_c
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=mask)
+
+
+def ns_line_3(B: Tensor, X: Tensor, a: float, *, out: Tensor = None) -> Tensor:
+    """
+    Fused implementation of C = a * X + B @ X
+    B must be square & symmetric, X has same leading dim, arbitrary trailing cols.
+    """
+    if B.shape[-2] != B.shape[-1]:
+        raise ValueError("B must be square")
+
+    if B.shape[-2] != X.shape[-2]:
+        raise ValueError("B and X must have the same number of rows")
+
+    # Broadcast & batch handling (supports 2‑ or 3‑D inputs)
+    M, N = X.shape[-2:]
+    batch = X.shape[0] if X.ndim == 3 else 1
+
+    if out is None:
+        out = torch.empty_like(X)
+
+    grid = lambda meta: (
+        batch
+        * triton.cdiv(M, meta["BLOCK_SIZE_M"])
+        * triton.cdiv(N, meta["BLOCK_SIZE_N"]),
+    )
+
+    ns_line_3_kernel[grid](
+        B_ptr=B,
+        X_ptr=X,
+        C_ptr=out,
+        M=M,
+        N=N,
+        b_stride_b=B.stride(0) if B.ndim == 3 else 0,
+        b_stride_r=B.stride(-2),
+        b_stride_c=B.stride(-1),
+        x_stride_b=X.stride(0) if X.ndim == 3 else 0,
+        x_stride_r=X.stride(-2),
+        x_stride_c=X.stride(-1),
+        c_stride_b=out.stride(0) if out.ndim == 3 else 0,
+        c_stride_r=out.stride(-2),
+        c_stride_c=out.stride(-1),
+        alpha=a,
+    )
+    return out
 
 
 @torch.compile(dynamic=False, fullgraph=True)
@@ -517,6 +518,11 @@ def newton_schulz_triton(G: Tensor, epsilon: float = 1e-7):
     """
     Triton implementation of Newton-Schulz iteration (5 iterations).
     """
+    if not TRITON_AVAILABLE:
+        raise ImportError(
+            "newton_schulz_triton requires the 'triton' package. "
+            "Install it with: pip install dion[triton]  (or: pip install triton)"
+        )
     # Newton-Schulz constants
     ns_consts = [
         (4.0848, -6.8946, 2.9270),
@@ -564,6 +570,11 @@ def newton_schulz_triton_fast(G: Tensor, epsilon: float = 1e-7):
 
     Signature matches zeropower_via_newtonschulz5: func(input, epsilon) -> Tensor.
     """
+    if not TRITON_AVAILABLE:
+        raise ImportError(
+            "newton_schulz_triton_fast requires the 'triton' package. "
+            "Install it with: pip install dion[triton]  (or: pip install triton)"
+        )
     ns_consts = [
         [4.6051, -9.6552, 5.6769],
         [4.7505, -6.0861, 2.1790],
