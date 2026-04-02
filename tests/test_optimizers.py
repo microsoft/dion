@@ -6,9 +6,11 @@ Tests cover:
 - Parameter update: parameters actually change after a step
 - Mixed param groups: matrix params (ortho) + vector params (scalar opt)
 - All optimizer-specific options (nesterov, cautious_wd, base_opt, etc.)
+- Step timing: optimizer step takes measurable wall-clock time
 """
 
 import pytest
+import time
 import torch
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -307,3 +309,68 @@ class TestSparseGradients:
         opt = Muon(params, lr=0.01)
         opt.step()
         assert torch.equal(params[0].data, before)
+
+
+# ---------------------------------------------------------------------------
+# Step timing
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA required")
+class TestTiming:
+    def test_optimizer_step_takes_time(self):
+        """Optimizer step should take measurable wall-clock time."""
+        from dion import Muon
+        params = _make_params([(256, 512)] * 10)
+        opt = Muon(params, lr=0.01)
+        for p in params:
+            p.grad = torch.randn_like(p)
+
+        # Warmup (torch.compile)
+        opt.step()
+        for p in params:
+            p.grad = torch.randn_like(p)
+
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        opt.step()
+        torch.cuda.synchronize()
+        elapsed_ms = 1000 * (time.perf_counter() - t0)
+
+        # Step should complete in reasonable time (> 0, < 10s)
+        assert elapsed_ms > 0, "Step took zero time"
+        assert elapsed_ms < 10_000, f"Step took too long: {elapsed_ms:.0f}ms"
+
+    def test_timer_accumulates_across_steps(self):
+        """Simulated training timer should accumulate monotonically."""
+        from dion import NorMuon
+        params = _make_params([(64, 128)] * 3)
+        opt = NorMuon(params, lr=0.01)
+
+        training_time_ms = 0.0
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
+        prev_time = 0.0
+        for step in range(5):
+            for p in params:
+                p.grad = torch.randn_like(p)
+            opt.step()
+
+            torch.cuda.synchronize()
+            training_time_ms = 1000 * (time.perf_counter() - t0)
+            assert training_time_ms > prev_time, (
+                f"Timer did not advance: step {step}, "
+                f"prev={prev_time:.2f}ms, now={training_time_ms:.2f}ms"
+            )
+            prev_time = training_time_ms
+
+    def test_perf_counter_resolution(self):
+        """time.perf_counter should have sub-millisecond resolution."""
+        t0 = time.perf_counter()
+        # Busy wait briefly
+        x = 0
+        for _ in range(1000):
+            x += 1
+        t1 = time.perf_counter()
+        # Should register nonzero time
+        assert t1 > t0
