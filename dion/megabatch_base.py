@@ -34,6 +34,7 @@ class DistributedOrthoBase(Optimizer):
         distributed_mesh: Optional[Union[DeviceMesh, ProcessGroup]],
         algo_name: str,
         defaults: dict,
+        use_gram_newton_schulz: bool = False,
         use_triton: bool = False,
         use_polar_express: bool = False,
         newton_schulz_func: Optional[Callable] = None,
@@ -73,6 +74,17 @@ class DistributedOrthoBase(Optimizer):
                     f"newton_schulz_func must be a callable function, got {type(newton_schulz_func)}"
                 )
             self._newton_schulz_func = newton_schulz_func
+        elif use_gram_newton_schulz:
+            from gram_newton_schulz import GramNewtonSchulz
+            assert use_polar_express, "At present, Gram Newton Schulz only uses Polar Express"
+            _gns = GramNewtonSchulz(
+                ns_use_kernels=use_triton,
+                use_gram_newton_schulz=True,
+                gram_newton_schulz_reset_iterations=[2],
+                # Some compiler crashes were observed with mode="reduce-overhead" when we also compile the entire optimizer step.
+                compile_kwargs=dict(fullgraph=True, mode="default"),
+            )
+            self._newton_schulz_func = lambda X, epsilon=None: _gns(X)
         elif use_polar_express and use_triton:
             self._newton_schulz_func = polar_express_triton
         elif use_polar_express:

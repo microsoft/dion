@@ -40,6 +40,7 @@ class Muon(DistributedOrthoBase):
             True: Tensors with 3+ dimensions are flattened to 2D. Use this for convolutional layers.
             False: Tensors are not flattened. 3D+ tensors are treated as batches of 2D matrices.
         use_triton: Whether to use Triton kernel for Newton-Schulz. Ignored if custom function is provided.
+        use_gram_newton_schulz: Whether to use Gram Newton-Schulz for orthogonalization.
         newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
             Signature is ``func(input: Tensor, epsilon: float) -> Tensor``.
 
@@ -60,6 +61,7 @@ class Muon(DistributedOrthoBase):
         nesterov: bool = False,
         adjust_lr: Optional[str] = "spectral_norm",
         flatten: bool = False,
+        use_gram_newton_schulz: bool = False,
         use_triton: bool = False,
         use_polar_express: bool = False,
         newton_schulz_func: Optional[Callable] = None,
@@ -91,7 +93,9 @@ class Muon(DistributedOrthoBase):
         )
         super().__init__(
             params, distributed_mesh, "muon", defaults,
-            use_triton=use_triton, use_polar_express=use_polar_express,
+            use_gram_newton_schulz=use_gram_newton_schulz,
+            use_triton=use_triton,
+            use_polar_express=use_polar_express,
             newton_schulz_func=newton_schulz_func,
         )
 
