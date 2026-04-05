@@ -163,9 +163,9 @@ class TestDion2:
         assert not torch.equal(params[0].data, before)
 
     def test_fraction(self):
-        """Different fraction values should work."""
+        """Different fraction values should work, including int (issue #39)."""
         from dion import Dion2
-        for fraction in [0.1, 0.25, 0.5, 1.0]:
+        for fraction in [0.1, 0.25, 0.5, 1.0, 1]:
             params = _make_params([(64, 128)])
             _run_steps(Dion2, params, dict(lr=0.01, fraction=fraction))
 
