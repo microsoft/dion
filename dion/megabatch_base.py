@@ -75,7 +75,7 @@ class DistributedOrthoBase(Optimizer):
             self._newton_schulz_func = newton_schulz_func
         elif use_gram_newton_schulz:
             from gram_newton_schulz import GramNewtonSchulz
-            assert use_polar_express, "At present, Gram Newton Schulz only uses Polar Express"
+            use_polar_express = True
             _gns = GramNewtonSchulz(
                 ns_use_kernels=use_triton,
                 use_gram_newton_schulz=True,
