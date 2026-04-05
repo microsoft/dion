@@ -61,6 +61,7 @@ class Muon(DistributedOrthoBase):
         adjust_lr: Optional[str] = "spectral_norm",
         flatten: bool = False,
         use_triton: bool = False,
+        use_polar_express: bool = False,
         newton_schulz_func: Optional[Callable] = None,
     ):
         if lr < 0.0:
@@ -90,7 +91,8 @@ class Muon(DistributedOrthoBase):
         )
         super().__init__(
             params, distributed_mesh, "muon", defaults,
-            use_triton=use_triton, newton_schulz_func=newton_schulz_func,
+            use_triton=use_triton, use_polar_express=use_polar_express,
+            newton_schulz_func=newton_schulz_func,
         )
 
     def _create_ortho_tasks(

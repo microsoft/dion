@@ -64,6 +64,7 @@ class NorMuon(DistributedOrthoBase):
         adjust_lr: Optional[str] = "rms_norm",
         flatten: bool = False,
         use_triton: bool = False,
+        use_polar_express: bool = False,
         newton_schulz_func: Optional[Callable] = None,
     ):
         if lr < 0.0:
@@ -96,7 +97,8 @@ class NorMuon(DistributedOrthoBase):
         )
         super().__init__(
             params, distributed_mesh, "normuon", defaults,
-            use_triton=use_triton, newton_schulz_func=newton_schulz_func,
+            use_triton=use_triton, use_polar_express=use_polar_express,
+            newton_schulz_func=newton_schulz_func,
         )
 
     def _get_or_initialize_state(self, param: Tensor, algo: str) -> dict:
