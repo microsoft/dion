@@ -10,7 +10,6 @@ from torch.optim.optimizer import Optimizer, ParamsT
 from typing import Callable, Generator, List, Optional, Union
 
 from .newton_schulz_triton import (
-    TRITON_AVAILABLE,
     newton_schulz_triton,
     zeropower_via_newtonschulz5,
 )
