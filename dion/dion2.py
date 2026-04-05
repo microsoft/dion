@@ -80,7 +80,7 @@ class Dion2(DistributedOrthoBase):
         defaults = dict(
             lr=lr,
             ef_decay=ef_decay,
-            fraction=fraction,
+            fraction=float(fraction),
             beta1=betas[0],
             beta2=betas[1],
             weight_decay=weight_decay,
