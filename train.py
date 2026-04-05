@@ -203,6 +203,12 @@ def parse_cli_args():
     parser.add_argument(
         "--no_triton", action="store_true", help="Disable Triton kernels"
     )
+    parser.add_argument(
+        "--use_polar_express", action="store_true", help="Use Polar Express for orthogonalization"
+    )
+    parser.add_argument(
+        "--use_gram_newton_schulz", action="store_true", help="Use Gram Newton-Schulz for orthogonalization"
+    )
 
     cli_args = parser.parse_args()
     if cli_args.config:
@@ -224,6 +230,8 @@ def parse_cli_args():
             "no_wandb",
             "no_compile",
             "no_triton",
+            "use_polar_express",
+            "use_gram_newton_schulz",
             "debug",
         ):
             if yaml_cfg.get(flag, False):
@@ -429,7 +437,9 @@ def init_optimizer(
             weight_decay=hp.weight_decay,
             nesterov=True,
             adjust_lr=hp.adjust_lr,
+            use_gram_newton_schulz=cli_args.use_gram_newton_schulz,
             use_triton=(not cli_args.no_triton),
+            use_polar_express=cli_args.use_polar_express,
         )
     elif hp.optimizer == "dion2":
         if device_mesh is not None:
@@ -455,7 +465,9 @@ def init_optimizer(
             ef_decay=hp.mu,
             weight_decay=hp.weight_decay,
             adjust_lr=hp.adjust_lr,
+            use_gram_newton_schulz=cli_args.use_gram_newton_schulz,
             use_triton=(not cli_args.no_triton),
+            use_polar_express=cli_args.use_polar_express,
             verbose=hp.verbose,
         )
     elif hp.optimizer == "normuon":
@@ -484,6 +496,8 @@ def init_optimizer(
             nesterov=True,
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
+            use_polar_express=cli_args.use_polar_express,
+            use_gram_newton_schulz=cli_args.use_gram_newton_schulz,
         )
 
     elif hp.optimizer == "dion_simple":
