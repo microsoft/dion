@@ -34,9 +34,9 @@ class DistributedOrthoBase(Optimizer):
         distributed_mesh: Optional[Union[DeviceMesh, ProcessGroup]],
         algo_name: str,
         defaults: dict,
-        use_gram_newton_schulz: bool = False,
+        use_gram_newton_schulz: bool = True,
         use_triton: bool = False,
-        use_polar_express: bool = False,
+        use_polar_express: bool = True,
         newton_schulz_func: Optional[Callable] = None,
     ):
         super().__init__(params, defaults)
