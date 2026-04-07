@@ -74,7 +74,7 @@ class DistributedOrthoBase(Optimizer):
                     f"newton_schulz_func must be a callable function, got {type(newton_schulz_func)}"
                 )
             self._newton_schulz_func = newton_schulz_func
-        elif use_gram_newton_schulz:
+        elif use_polar_express:
             try:
                 from gram_newton_schulz import GramNewtonSchulz
             except ImportError:
@@ -83,19 +83,14 @@ class DistributedOrthoBase(Optimizer):
                     "which is not installed. "
                     "Install it with: pip install gram-newton-schulz"
                 )
-            use_polar_express = True
             _gns = GramNewtonSchulz(
                 ns_use_kernels=use_triton,
-                use_gram_newton_schulz=True,
+                use_gram_newton_schulz=use_gram_newton_schulz,
                 gram_newton_schulz_reset_iterations=[2],
                 # Some compiler crashes were observed with mode="reduce-overhead" when we also compile the entire optimizer step.
                 compile_kwargs=dict(fullgraph=True, mode="default"),
             )
             self._newton_schulz_func = lambda X, epsilon=None: _gns(X)
-        elif use_polar_express and use_triton:
-            self._newton_schulz_func = polar_express_triton
-        elif use_polar_express:
-            self._newton_schulz_func = polar_express
         elif use_triton:
             if not TRITON_AVAILABLE:
                 raise ImportError(
