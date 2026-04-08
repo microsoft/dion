@@ -64,7 +64,7 @@ class NorMuon(DistributedOrthoBase):
         nesterov: bool = False,
         adjust_lr: Optional[str] = "spectral_norm",
         flatten: bool = False,
-        use_gram_newton_schulz: bool = True,
+        use_gram_newton_schulz: bool = False,
         use_triton: bool = False,
         use_polar_express: bool = True,
         newton_schulz_func: Optional[Callable] = None,
