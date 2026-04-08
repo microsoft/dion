@@ -75,7 +75,14 @@ class DistributedOrthoBase(Optimizer):
                 )
             self._newton_schulz_func = newton_schulz_func
         elif use_gram_newton_schulz:
-            from gram_newton_schulz import GramNewtonSchulz
+            try:
+                from gram_newton_schulz import GramNewtonSchulz
+            except ImportError:
+                raise ImportError(
+                    "use_gram_newton_schulz=True requires the 'gram-newton-schulz' package, "
+                    "which is not installed. "
+                    "Install it with: pip install gram-newton-schulz"
+                )
             use_polar_express = True
             _gns = GramNewtonSchulz(
                 ns_use_kernels=use_triton,
