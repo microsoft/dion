@@ -61,7 +61,7 @@ class Dion2(DistributedOrthoBase):
         flatten: bool = False,
         use_triton: bool = False,
         use_polar_express: bool = True,
-        use_gram_newton_schulz: bool = True,
+        use_gram_newton_schulz: bool = False,
         newton_schulz_func: Optional[Callable] = None,
         verbose: bool = False,
     ):
