@@ -62,11 +62,11 @@ class NorMuon(DistributedOrthoBase):
         cautious_wd: bool = False,
         epsilon: float = 1e-8,
         nesterov: bool = False,
-        adjust_lr: Optional[str] = "rms_norm",
+        adjust_lr: Optional[str] = "spectral_norm",
         flatten: bool = False,
-        use_gram_newton_schulz: bool = False,
+        use_gram_newton_schulz: bool = True,
         use_triton: bool = False,
-        use_polar_express: bool = False,
+        use_polar_express: bool = True,
         newton_schulz_func: Optional[Callable] = None,
     ):
         if lr < 0.0:
