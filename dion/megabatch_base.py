@@ -302,7 +302,29 @@ def megabatch_orthogonalize_async(
     else:
         U_work = U
 
-    if comm_dim is not None and process_group is not None:
+    if comm_dim is not None and process_group is not None and N == 1:
+        # --- Single sharded tensor: all_gather + scatter (avoids all_to_all
+        #     which triggers NCCL errors with heavily-padded singleton groups) ---
+        shard = U[0]
+        all_shards = [torch.empty_like(shard) for _ in range(world_size)]
+        work = dist.all_gather(
+            all_shards, shard.contiguous(), group=process_group, async_op=True
+        )
+        yield
+        work.wait()
+
+        full_matrix = torch.cat(all_shards, dim=comm_dim)
+        full_matrix = muon_update_newton_schulz(
+            full_matrix,
+            newton_schulz_func=newton_schulz_func,
+            flatten=flatten,
+            epsilon=epsilon,
+        )
+
+        result_shard = full_matrix.tensor_split(world_size, dim=comm_dim)[device_rank].contiguous()
+        return [result_shard]
+
+    elif comm_dim is not None and process_group is not None:
         # --- Mega-batched sharded FSDP2 path ---
         input_chunks = [
             torch.stack(U_work[r * per_rank : (r + 1) * per_rank])
