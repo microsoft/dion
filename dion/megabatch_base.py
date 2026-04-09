@@ -310,11 +310,17 @@ def megabatch_orthogonalize_async(
         ]
 
         output_chunks = [torch.empty_like(c) for c in input_chunks]
+        if device_rank == 0:
+            print(f"[megabatch_diag] sharded path: N={N} per_rank={per_rank} "
+                  f"shape={U[0].shape} comm_dim={comm_dim} "
+                  f"chunk_shape={input_chunks[0].shape}", flush=True)
         work = dist.all_to_all(
             output_chunks, input_chunks, group=process_group, async_op=True
         )
         yield
         work.wait()
+        if device_rank == 0:
+            print(f"[megabatch_diag] first all_to_all done", flush=True)
 
         # comm_dim is negative, so it correctly indexes the stacked tensor
         full_matrices = torch.cat(output_chunks, dim=comm_dim)
@@ -325,10 +331,22 @@ def megabatch_orthogonalize_async(
             epsilon=epsilon,
         )
 
+        torch.cuda.synchronize()
+        err = torch.cuda.last_error()
+        if device_rank == 0:
+            has_nan = full_matrices.isnan().any().item()
+            has_inf = full_matrices.isinf().any().item()
+            print(f"[megabatch_diag] newton_schulz done: result_shape={full_matrices.shape} "
+                  f"nan={has_nan} inf={has_inf} cuda_err={err}", flush=True)
+
         split_chunks = [
             s.contiguous()
             for s in torch.tensor_split(full_matrices, world_size, dim=comm_dim)
         ]
+
+        if device_rank == 0:
+            shapes = [s.shape for s in split_chunks]
+            print(f"[megabatch_diag] split_chunk_shapes={shapes}", flush=True)
 
         recv_chunks = [torch.empty_like(c) for c in split_chunks]
         work = dist.all_to_all(
