@@ -295,22 +295,33 @@ def dion2_pre_orthogonalize(
     _, indices = torch.topk(slice_norms, k, dim=-1, sorted=False)
 
     # Batched gather for slice extraction
+    # Use expand(*shape, ...) instead of fixed -1 counts to support arbitrary
+    # batch dimensions (e.g. 3D params have shape (B, R, C) so indices are 3D).
     if select_dim == -2:
         # Selecting rows
         num_cols = M[0].size(-1)
-        indices_expanded = indices.unsqueeze(-1).expand(-1, -1, num_cols)
+        indices_expanded = indices.unsqueeze(-1).expand(*indices.shape, num_cols)
         selected_stacked = torch.gather(M_stacked, dim=-2, index=indices_expanded)
     else:
         # Selecting cols
         num_rows = M[0].size(-2)
-        indices_expanded = indices.unsqueeze(-2).expand(-1, num_rows, -1)
+        indices_expanded = indices.unsqueeze(-2).expand(
+            *indices.shape[:-1], num_rows, indices.shape[-1]
+        )
         selected_stacked = torch.gather(M_stacked, dim=-1, index=indices_expanded)
 
-    # Apply error feedback decay to selected slices in original M tensors
+    # Apply error feedback decay to selected slices in original M tensors.
+    # Reuse the already-gathered selected_stacked slices and use scatter_ to
+    # write back, since index_select/index_copy_ require 1D indices and fail
+    # for 3D+ parameters where indices have batch dimensions.
     indices_list = list(indices.unbind(dim=0))
-    for m, idx in zip(M, indices_list):
-        selected_slice = m.index_select(dim=select_dim, index=idx)
-        m.index_copy_(dim=select_dim, index=idx, source=selected_slice * ef_decay)
+    selected_list = list(selected_stacked.unbind(dim=0))
+    for m, idx, selected in zip(M, indices_list, selected_list):
+        if select_dim == -2:
+            idx_exp = idx.unsqueeze(-1).expand(*idx.shape, m.size(-1))
+        else:
+            idx_exp = idx.unsqueeze(-2).expand(*idx.shape[:-1], m.size(-2), idx.shape[-1])
+        m.scatter_(dim=select_dim, index=idx_exp, src=selected * ef_decay)
 
     # Convert to bf16 and unstack for communication
     U_selected = list(selected_stacked.to(dtype=torch.bfloat16).unbind(dim=0))
@@ -341,8 +352,14 @@ def dion2_post_orthogonalize(
     # Apply weight update
     neg_lr = -adjusted_lr
     U_scaled = [neg_lr * u for u in U]
+    # Use scatter_add_ instead of index_add_ to support multi-dimensional
+    # indices from 3D+ parameters (index_add_ requires 1D indices).
     for x, u_scaled, idx in zip(X, U_scaled, indices):
-        x.index_add_(dim=select_dim, index=idx, source=u_scaled)
+        if select_dim == -2:
+            idx_exp = idx.unsqueeze(-1).expand_as(u_scaled)
+        else:
+            idx_exp = idx.unsqueeze(-2).expand_as(u_scaled)
+        x.scatter_add_(dim=select_dim, index=idx_exp, src=u_scaled)
 
 
 # A helper function to print selection choice for each matrix

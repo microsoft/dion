@@ -190,6 +190,34 @@ class TestDion2:
         params = _make_params([(128, 32)])
         _run_steps(Dion2, params, dict(lr=0.01, verbose=True))
 
+    def test_3d_params_wide(self):
+        """3D params (batch of wide matrices) should work with select_dim=-2."""
+        from dion import Dion2
+        params = _make_params([(4, 32, 128)])
+        before = params[0].data.clone()
+        _run_steps(Dion2, params, dict(lr=0.01, fraction=0.5), n_steps=3)
+        assert not torch.equal(params[0].data, before)
+
+    def test_3d_params_tall(self):
+        """3D params (batch of tall matrices) should work with select_dim=-1."""
+        from dion import Dion2
+        params = _make_params([(4, 128, 32)])
+        before = params[0].data.clone()
+        _run_steps(Dion2, params, dict(lr=0.01, fraction=0.25), n_steps=3)
+        assert not torch.equal(params[0].data, before)
+
+    def test_3d_params_flatten(self):
+        """3D params with flatten=True should flatten to 2D for ortho."""
+        from dion import Dion2
+        params = _make_params([(4, 32, 128)])
+        _run_steps(Dion2, params, dict(lr=0.01, flatten=True), n_steps=3)
+
+    def test_3d_megabatch(self):
+        """Multiple 3D params with same shape should be megabatched."""
+        from dion import Dion2
+        params = _make_params([(4, 32, 64)] * 3)
+        _run_steps(Dion2, params, dict(lr=0.01), n_steps=3)
+
 
 # ---------------------------------------------------------------------------
 # Mixed param groups (matrix + scalar)
