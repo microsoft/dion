@@ -294,26 +294,26 @@ def dion2_pre_orthogonalize(
     # Batched topk: indices shape (batch_size, k)
     _, indices = torch.topk(slice_norms, k, dim=-1, sorted=False)
 
-    # Batched gather for slice extraction
-    # Use expand(*shape, ...) instead of fixed -1 counts to support arbitrary
-    # batch dimensions (e.g. 3D params have shape (B, R, C) so indices are 3D).
+    # Extract the selected rows/columns from each momentum tensor.
+    # `indices` has shape (..., k) where k is the number of selected slices.
+    # `gather` requires the index tensor to have the same number of dimensions
+    # as the source, so we expand the indices to cover the non-selected dimension.
     if select_dim == -2:
-        # Selecting rows
+        # Selecting rows: expand indices from (..., k) to (..., k, num_cols)
         num_cols = M[0].size(-1)
         indices_expanded = indices.unsqueeze(-1).expand(*indices.shape, num_cols)
         selected_stacked = torch.gather(M_stacked, dim=-2, index=indices_expanded)
     else:
-        # Selecting cols
+        # Selecting cols: expand indices from (..., k) to (..., num_rows, k)
         num_rows = M[0].size(-2)
         indices_expanded = indices.unsqueeze(-2).expand(
             *indices.shape[:-1], num_rows, indices.shape[-1]
         )
         selected_stacked = torch.gather(M_stacked, dim=-1, index=indices_expanded)
 
-    # Apply error feedback decay to selected slices in original M tensors.
-    # Reuse the already-gathered selected_stacked slices and use scatter_ to
-    # write back, since index_select/index_copy_ require 1D indices and fail
-    # for 3D+ parameters where indices have batch dimensions.
+    # Apply error feedback decay to selected slices in the original M tensors.
+    # We reuse the already-gathered slices and write them back (scaled) using
+    # scatter_, which places values into positions specified by the index tensor.
     indices_list = list(indices.unbind(dim=0))
     selected_list = list(selected_stacked.unbind(dim=0))
     for m, idx, selected in zip(M, indices_list, selected_list):
@@ -352,8 +352,9 @@ def dion2_post_orthogonalize(
     # Apply weight update
     neg_lr = -adjusted_lr
     U_scaled = [neg_lr * u for u in U]
-    # Use scatter_add_ instead of index_add_ to support multi-dimensional
-    # indices from 3D+ parameters (index_add_ requires 1D indices).
+    # Apply the orthogonalized update to only the selected rows/columns.
+    # scatter_add_ accumulates values into positions specified by the index tensor:
+    #   x[..., idx_exp[..., j], j] += u_scaled[..., :, j]  (for select_dim == -2)
     for x, u_scaled, idx in zip(X, U_scaled, indices):
         if select_dim == -2:
             idx_exp = idx.unsqueeze(-1).expand_as(u_scaled)
