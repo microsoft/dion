@@ -304,6 +304,46 @@ class TestNumHeads:
                 p.grad = torch.randn_like(p)
             opt.step()
 
+    @pytest.mark.parametrize("bad", [0, -1, 2.0, "4", True])
+    def test_invalid_num_heads_raises(self, bad):
+        from dion import Muon
+        w = torch.nn.Parameter(torch.randn(32, 16, device=DEVICE))
+        w.grad = torch.randn_like(w)
+        opt = Muon([{"params": [w], "num_heads": bad}], lr=0.01)
+        with pytest.raises(ValueError, match="num_heads"):
+            opt.step()
+
+    def test_num_heads_one_is_noop(self):
+        # num_heads=1 is semantically equivalent to the default path; verify
+        # it runs without error and doesn't accidentally hit the head-split code.
+        from dion import Muon
+        w = torch.nn.Parameter(torch.randn(32, 16, device=DEVICE))
+        w_ref = torch.nn.Parameter(w.data.clone())
+        g = torch.randn_like(w)
+        for step in range(2):
+            w.grad = g.clone()
+            w_ref.grad = g.clone()
+        opt = Muon([{"params": [w], "num_heads": 1}], lr=0.01)
+        opt_ref = Muon([w_ref], lr=0.01)
+        opt.step()
+        opt_ref.step()
+        torch.testing.assert_close(w.data, w_ref.data)
+
+    def test_flatten_true_incompatible(self):
+        # flatten=True would collapse the per-head 3D view back to 2D, giving
+        # the wrong update silently. It must raise.
+        from dion import Muon
+        num_heads, head_dim, in_features = 4, 8, 16
+        w = torch.nn.Parameter(
+            torch.randn(num_heads * head_dim, in_features, device=DEVICE)
+        )
+        w.grad = torch.randn_like(w)
+        opt = Muon(
+            [{"params": [w], "num_heads": num_heads}], lr=0.01, flatten=True
+        )
+        with pytest.raises(ValueError, match="flatten"):
+            opt.step()
+
 
 # ---------------------------------------------------------------------------
 # Mixed param groups (matrix + scalar)

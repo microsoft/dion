@@ -149,6 +149,32 @@ class DistributedOrthoBase(Optimizer):
                 state["variance"] = torch.zeros_like(param)
         return state
 
+    def _resolve_num_heads(self, group: dict) -> Optional[int]:
+        """Validate the ``num_heads`` option on a param group.
+
+        Returns the group's ``num_heads`` when it is set and > 1 (the only case
+        that actually triggers the per-head code path). Returns ``None`` when
+        ``num_heads`` is unset or equals 1 (both are no-ops). Raises
+        ``ValueError`` for invalid values or incompatible combinations.
+        """
+        num_heads = group.get("num_heads")
+        if num_heads is None:
+            return None
+        # bool is a subclass of int in Python; reject it explicitly.
+        if isinstance(num_heads, bool) or not isinstance(num_heads, int) or num_heads < 1:
+            raise ValueError(
+                f"num_heads must be a positive integer if set, got {num_heads!r}."
+            )
+        if num_heads == 1:
+            return None
+        if group.get("flatten"):
+            raise ValueError(
+                "num_heads > 1 is incompatible with flatten=True: flattening "
+                "the per-head 3D view collapses heads back into a single 2D "
+                "matrix, defeating per-head Newton-Schulz."
+            )
+        return num_heads
+
     def _prepare_head_split(
         self,
         num_heads: int,

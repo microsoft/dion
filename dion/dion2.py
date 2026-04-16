@@ -138,14 +138,14 @@ class Dion2(DistributedOrthoBase):
                 sharding = p.placements if isinstance(p, DTensor) else None
                 shape_groups[(p.shape, sharding, p.dtype)].append(p)
 
-            num_heads = group.get("num_heads")
+            num_heads = self._resolve_num_heads(group)
 
             for (_shape, _sharding, _dtype), params in shape_groups.items():
                 gradients = [p.grad for p in params]
                 states = [self._get_or_initialize_state(p, self._algo_name) for p in params]
                 momentums = [s["momentum"] for s in states]
 
-                if num_heads is not None and num_heads > 1:
+                if num_heads is not None:
                     params, gradients, momentums = self._prepare_head_split(
                         num_heads, params, gradients, momentums
                     )
