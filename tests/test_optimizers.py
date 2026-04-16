@@ -269,6 +269,10 @@ class TestNumHeads:
         from dion import Dion2
         self._run_parity(Dion2, dict(lr=0.01, fraction=1.0))
 
+    def test_normuon_matches_3d(self):
+        from dion import NorMuon
+        self._run_parity(NorMuon, dict(lr=0.01))
+
     def test_muon_invalid_num_heads(self):
         from dion import Muon
         w = torch.nn.Parameter(torch.randn(30, 16, device=DEVICE))

@@ -151,17 +151,18 @@ class DistributedOrthoBase(Optimizer):
 
     def _prepare_head_split(
         self,
-        params: List[Tensor],
-        grads: List[Tensor],
-        momentums: List[Tensor],
         num_heads: int,
-    ) -> Tuple[List[Tensor], List[Tensor], List[Tensor]]:
-        """Reshape 2D params / grads / momentums into a 3D per-head view.
+        params: List[Tensor],
+        *extras: List[Tensor],
+    ) -> Tuple[List[Tensor], ...]:
+        """Reshape 2D params (and same-dim-0 companion tensors) into 3D per-head views.
 
-        A 2D weight of shape ``(num_heads * head_dim, in_features)`` is returned as
-        a 3D local tensor of shape ``(num_heads_local, head_dim, in_features)``.
+        A 2D weight of shape ``(num_heads * head_dim, ...)`` is returned as
+        a 3D local tensor of shape ``(num_heads_local, head_dim, ...)``. The same
+        split is applied to any ``extras`` lists (grads, momentums, and NorMuon's
+        per-neuron variance buffer of shape ``(out, 1)``).
+
         In-place updates on the returned views propagate to the underlying storage.
-
         Callers must also mark the resulting tensors as batch-sharded (skip NS
         all-to-all) since each rank's shard now holds whole heads.
         """
@@ -177,7 +178,6 @@ class DistributedOrthoBase(Optimizer):
                 f"(got shape {tuple(full_shape)})."
             )
         head_dim = full_shape[0] // num_heads
-        in_features = full_shape[1]
 
         if isinstance(first, DTensor):
             shard_placements = [
@@ -207,13 +207,9 @@ class DistributedOrthoBase(Optimizer):
                     f"Local shard dim 0 ({local_dim0}) is not a multiple of head_dim "
                     f"({head_dim}); shard boundaries must align with heads."
                 )
-            return local.view(local_dim0 // head_dim, head_dim, in_features)
+            return local.view(local_dim0 // head_dim, head_dim, *local.shape[1:])
 
-        return (
-            [_as_3d(p) for p in params],
-            [_as_3d(g) for g in grads],
-            [_as_3d(m) for m in momentums],
-        )
+        return tuple([_as_3d(t) for t in lst] for lst in (params,) + extras)
 
     def _get_shard_info(self, param: Tensor, group: dict):
         """Determine sharding info. Returns (is_batch_sharded, is_matrix_sharded, sharded_tensor_dim)."""

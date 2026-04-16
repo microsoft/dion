@@ -145,7 +145,7 @@ class Muon(DistributedOrthoBase):
 
                 if num_heads is not None and num_heads > 1:
                     params, gradients, momentums = self._prepare_head_split(
-                        params, gradients, momentums, num_heads
+                        num_heads, params, gradients, momentums
                     )
                     megabatch_args = {**update_args, "process_group": None}
                     shard_dim = None

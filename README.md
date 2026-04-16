@@ -245,7 +245,7 @@ param_groups = [
 
 Attention Q / K / V / O / gate projections are typically stored as a single 2D `nn.Linear` weight of shape `(num_heads * head_dim, in_features)`, but semantically each head is an independent `(head_dim, in_features)` matrix. Orthogonalizing the fused matrix blends information across heads — often not what you want.
 
-You can ask Dion2 or Muon to run Newton-Schulz independently per head without changing the model layout by setting `num_heads` on the parameter group:
+You can ask Dion2, Muon, or NorMuon to run Newton-Schulz independently per head without changing the model layout by setting `num_heads` on the parameter group:
 
 ```python
 param_groups = [
