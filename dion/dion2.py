@@ -138,25 +138,34 @@ class Dion2(DistributedOrthoBase):
                 sharding = p.placements if isinstance(p, DTensor) else None
                 shape_groups[(p.shape, sharding, p.dtype)].append(p)
 
+            num_heads = group.get("num_heads")
+
             for (_shape, _sharding, _dtype), params in shape_groups.items():
                 gradients = [p.grad for p in params]
                 states = [self._get_or_initialize_state(p, self._algo_name) for p in params]
                 momentums = [s["momentum"] for s in states]
 
-                is_batch_sharded, is_matrix_sharded, sharded_tensor_dim = (
-                    self._get_shard_info(params[0], group)
-                )
-
-                megabatch_args = update_args
-                if is_batch_sharded and not is_matrix_sharded:
+                if num_heads is not None and num_heads > 1:
+                    params, gradients, momentums = self._prepare_head_split(
+                        params, gradients, momentums, num_heads
+                    )
                     megabatch_args = {**update_args, "process_group": None}
+                    shard_dim = None
+                else:
+                    is_batch_sharded, is_matrix_sharded, sharded_tensor_dim = (
+                        self._get_shard_info(params[0], group)
+                    )
+                    megabatch_args = update_args
+                    if is_batch_sharded and not is_matrix_sharded:
+                        megabatch_args = {**update_args, "process_group": None}
+                    shard_dim = sharded_tensor_dim
 
                 yield AsyncTask(
                     dion2_update_megabatch_async(
                         X=params,
                         G=gradients,
                         M=momentums,
-                        shard_dim=sharded_tensor_dim,
+                        shard_dim=shard_dim,
                         **megabatch_args,
                     )
                 )

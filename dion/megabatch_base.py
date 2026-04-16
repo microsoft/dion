@@ -7,7 +7,7 @@ from torch import Tensor
 from torch.distributed import ProcessGroup
 from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.optim.optimizer import Optimizer, ParamsT
-from typing import Callable, Generator, List, Optional, Union
+from typing import Callable, Generator, List, Optional, Tuple, Union
 
 from .newton_schulz_triton import (
     TRITON_AVAILABLE,
@@ -148,6 +148,72 @@ class DistributedOrthoBase(Optimizer):
             if algo == "adamw":
                 state["variance"] = torch.zeros_like(param)
         return state
+
+    def _prepare_head_split(
+        self,
+        params: List[Tensor],
+        grads: List[Tensor],
+        momentums: List[Tensor],
+        num_heads: int,
+    ) -> Tuple[List[Tensor], List[Tensor], List[Tensor]]:
+        """Reshape 2D params / grads / momentums into a 3D per-head view.
+
+        A 2D weight of shape ``(num_heads * head_dim, in_features)`` is returned as
+        a 3D local tensor of shape ``(num_heads_local, head_dim, in_features)``.
+        In-place updates on the returned views propagate to the underlying storage.
+
+        Callers must also mark the resulting tensors as batch-sharded (skip NS
+        all-to-all) since each rank's shard now holds whole heads.
+        """
+        first = params[0]
+        full_shape = first.shape
+        if first.ndim != 2:
+            raise ValueError(
+                f"num_heads is only supported for 2D parameters, got shape {tuple(full_shape)}."
+            )
+        if full_shape[0] % num_heads != 0:
+            raise ValueError(
+                f"num_heads ({num_heads}) must divide dim 0 of the parameter "
+                f"(got shape {tuple(full_shape)})."
+            )
+        head_dim = full_shape[0] // num_heads
+        in_features = full_shape[1]
+
+        if isinstance(first, DTensor):
+            shard_placements = [
+                (i, p)
+                for i, p in enumerate(first.placements)
+                if p.is_shard() and first.device_mesh.size(i) > 1
+            ]
+            if any(p.dim != 0 for _, p in shard_placements):
+                raise NotImplementedError(
+                    f"num_heads requires sharding on dim 0 (the heads dim) or no sharding; "
+                    f"got placements {first.placements}."
+                )
+            if shard_placements:
+                sharded_mesh_dim = shard_placements[0][0]
+                world = first.device_mesh.size(sharded_mesh_dim)
+                if num_heads % world != 0:
+                    raise ValueError(
+                        f"num_heads ({num_heads}) must be divisible by the sharding "
+                        f"world_size ({world}) so each rank holds whole heads."
+                    )
+
+        def _as_3d(t: Tensor) -> Tensor:
+            local = t.to_local() if isinstance(t, DTensor) else t
+            local_dim0 = local.shape[0]
+            if local_dim0 % head_dim != 0:
+                raise RuntimeError(
+                    f"Local shard dim 0 ({local_dim0}) is not a multiple of head_dim "
+                    f"({head_dim}); shard boundaries must align with heads."
+                )
+            return local.view(local_dim0 // head_dim, head_dim, in_features)
+
+        return (
+            [_as_3d(p) for p in params],
+            [_as_3d(g) for g in grads],
+            [_as_3d(m) for m in momentums],
+        )
 
     def _get_shard_info(self, param: Tensor, group: dict):
         """Determine sharding info. Returns (is_batch_sharded, is_matrix_sharded, sharded_tensor_dim)."""
