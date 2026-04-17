@@ -2,24 +2,6 @@ import torch
 from torch import Tensor
 from typing import Generator, List
 
-try:
-    import triton
-    import triton.language as tl
-    _TRITON_AVAILABLE = True
-except ImportError:
-    _TRITON_AVAILABLE = False
-
-
-_TORCH_TO_TRITON_DTYPE = (
-    {
-        torch.float32: tl.float32,
-        torch.float16: tl.float16,
-        torch.bfloat16: tl.bfloat16,
-    }
-    if _TRITON_AVAILABLE
-    else {}
-)
-
 
 @torch.compile(fullgraph=True)
 def adamw_update(
@@ -125,149 +107,15 @@ def lion_update(
     X.add_(U, alpha=-lr)
 
 
-if _TRITON_AVAILABLE:
-
-    @triton.jit
-    def _fused_adamw_mta_kernel(
-        ptrs_x, ptrs_g, ptrs_m, ptrs_v,      # int64 [N]: per-tensor data_ptr()s
-        numels,                               # int32 [N]: per-tensor numel
-        block_to_tensor, block_to_chunk_start,  # int32 [total_blocks]: host-built partition
-        lr, beta1, beta2, weight_decay, eps,
-        bias_correction1, bias_correction2_sqrt,
-        BLOCK_SIZE: tl.constexpr,
-        CAUTIOUS_WD: tl.constexpr,
-        DTYPE: tl.constexpr,
-    ):
-        """Multi-tensor-apply AdamW. Mirrors ``at::native::adam_math``
-        (``ADAM_MODE::ADAMW``), with an optional CWD branch gating decoupled
-        weight decay on ``sign(param * update) >= 0``
-        (https://arxiv.org/pdf/2510.12402)."""
-        pid = tl.program_id(0)
-        t_idx = tl.load(block_to_tensor + pid)
-        chunk_start = tl.load(block_to_chunk_start + pid)
-        n = tl.load(numels + t_idx)
-
-        x_ptr = tl.cast(tl.load(ptrs_x + t_idx), tl.pointer_type(DTYPE))
-        g_ptr = tl.cast(tl.load(ptrs_g + t_idx), tl.pointer_type(DTYPE))
-        m_ptr = tl.cast(tl.load(ptrs_m + t_idx), tl.pointer_type(DTYPE))
-        v_ptr = tl.cast(tl.load(ptrs_v + t_idx), tl.pointer_type(DTYPE))
-
-        offs = chunk_start + tl.arange(0, BLOCK_SIZE)
-        mask = offs < n
-
-        # Promote to fp32 for the math (matches C++ ``opmath_t``).
-        param = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-        grad = tl.load(g_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-        exp_avg = tl.load(m_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-        exp_avg_sq = tl.load(v_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-
-        exp_avg = beta1 * exp_avg + (1.0 - beta1) * grad
-        exp_avg_sq = beta2 * exp_avg_sq + (1.0 - beta2) * grad * grad
-        step_size = lr / bias_correction1
-        denom = tl.sqrt(exp_avg_sq) / bias_correction2_sqrt + eps
-        update = step_size * exp_avg / denom
-
-        if CAUTIOUS_WD:
-            # CWD needs the mask to reference the update direction from the
-            # updated moments, so WD is applied after ``update`` is computed.
-            cwd_mask = (param * update >= 0.0).to(tl.float32)
-            param = param - lr * weight_decay * param * cwd_mask - update
-        else:
-            param = param * (1.0 - lr * weight_decay) - update
-
-        tl.store(x_ptr + offs, param.to(DTYPE), mask=mask)
-        tl.store(m_ptr + offs, exp_avg.to(DTYPE), mask=mask)
-        tl.store(v_ptr + offs, exp_avg_sq.to(DTYPE), mask=mask)
+_step_tensor_cache: dict = {}
 
 
-def _pinned_int_tensor_to_device(values, dtype: torch.dtype, device: torch.device):
-    """Build a CUDA int tensor via a pinned-memory staging buffer so the H2D
-    copy is genuinely asynchronous. ``torch.tensor(...).to(non_blocking=True)``
-    from pageable memory would fall back to a synchronous copy."""
-    return torch.tensor(values, dtype=dtype, pin_memory=True).to(
-        device, non_blocking=True
-    )
-
-
-def _build_mta_metadata(numels_list: List[int], block_size: int, device: torch.device):
-    """Build per-block partition metadata for ``_fused_adamw_mta_kernel``.
-    Returns ``(numels, block_to_tensor, block_to_chunk_start, total_blocks)``
-    as int32 CUDA tensors plus a python int."""
-    N = len(numels_list)
-    numels_cpu = torch.tensor(numels_list, dtype=torch.int32)
-    chunks = (numels_cpu + block_size - 1) // block_size
-    total_blocks = int(chunks.sum().item())
-
-    block_to_tensor_cpu = torch.repeat_interleave(
-        torch.arange(N, dtype=torch.int32), chunks
-    )
-    prefix = torch.zeros(N, dtype=torch.int32)
-    prefix[1:] = torch.cumsum(chunks[:-1], dim=0)
-    block_to_chunk_start_cpu = (
-        torch.arange(total_blocks, dtype=torch.int32)
-        - torch.repeat_interleave(prefix, chunks)
-    ) * block_size
-
-    numels = numels_cpu.pin_memory().to(device, non_blocking=True)
-    block_to_tensor = block_to_tensor_cpu.pin_memory().to(device, non_blocking=True)
-    block_to_chunk_start = block_to_chunk_start_cpu.pin_memory().to(
-        device, non_blocking=True
-    )
-    return numels, block_to_tensor, block_to_chunk_start, total_blocks
-
-
-# Cache for MTA metadata + pointer tensors. Optimizer state (X/M/V) is
-# allocated once and updated in place, so the per-step H2D copies that
-# otherwise cause ``cudaStreamSynchronize`` can be skipped entirely. Keyed on
-# per-tensor ``data_ptr()`` (stable across the tensor's lifetime, unlike
-# ``id()`` -- ``param.data`` / ``DTensor.to_local()`` return a fresh Python
-# wrapper each call). Grads are validated separately per step since
-# ``zero_grad(set_to_none=True)`` allocates a new grad buffer.
-_mta_cache: dict = {}
-
-
-def _get_mta_buffers(
-    X: List[Tensor],
-    G: List[Tensor],
-    M: List[Tensor],
-    V: List[Tensor],
-    block_size: int,
-    device: torch.device,
-):
-    x_ptrs = tuple(t.data_ptr() for t in X)
-    m_ptrs = tuple(t.data_ptr() for t in M)
-    v_ptrs = tuple(t.data_ptr() for t in V)
-    key = (x_ptrs, m_ptrs, v_ptrs, block_size, device)
-
-    entry = _mta_cache.get(key)
-    if entry is None:
-        numels, block_to_tensor, block_to_chunk_start, total_blocks = (
-            _build_mta_metadata([t.numel() for t in X], block_size, device)
-        )
-        entry = {
-            "ptrs_x": _pinned_int_tensor_to_device(
-                list(x_ptrs), torch.int64, device),
-            "ptrs_m": _pinned_int_tensor_to_device(
-                list(m_ptrs), torch.int64, device),
-            "ptrs_v": _pinned_int_tensor_to_device(
-                list(v_ptrs), torch.int64, device),
-            "numels": numels,
-            "block_to_tensor": block_to_tensor,
-            "block_to_chunk_start": block_to_chunk_start,
-            "total_blocks": total_blocks,
-            "g_ptrs": None,
-            "ptrs_g": None,
-        }
-        _mta_cache[key] = entry
-
-    g_ptrs = tuple(t.data_ptr() for t in G)
-    if entry["g_ptrs"] != g_ptrs:
-        entry["ptrs_g"] = _pinned_int_tensor_to_device(
-            list(g_ptrs), torch.int64, device
-        )
-        entry["g_ptrs"] = g_ptrs
-
-    return entry
+def _get_step_tensor(device: torch.device) -> Tensor:
+    t = _step_tensor_cache.get(device)
+    if t is None:
+        t = torch.zeros((), dtype=torch.float32, device=device)
+        _step_tensor_cache[device] = t
+    return t
 
 
 def adamw_update_foreach(
@@ -283,56 +131,59 @@ def adamw_update_foreach(
     epsilon: float,
     cautious_wd: bool = False,
 ):
-    """AdamW optimizer algorithm, multi-tensor-apply implementation.
+    """AdamW update for a list of tensors.
 
-    Processes all parameters in the list with a single Triton kernel launch,
-    replicating the math of ``torch._fused_adamw_`` (see
-    ``ATen/native/cuda/fused_adam_utils.cuh``) with an optional CWD branch.
+    Dispatches through ``torch._fused_adamw_``, which is already a
+    multi-tensor-apply kernel; avoids the ~6-call ``torch._foreach_*`` chain
+    that otherwise dispatches one aten op per tensor on the CPU side.
 
-    Requirements: all tensors in X/G/M/V must share device and dtype
-    (``float32`` / ``float16`` / ``bfloat16``) and be contiguous. Matches
-    ``torch._fused_adamw_``'s constraints and Dion's ``zeros_like(param)``
-    state initialization.
+    Cautious weight decay (https://arxiv.org/pdf/2510.12402) is applied as a
+    post-step correction rather than inside the kernel:
+
+        X_std   = X - lr*wd*X - update                    (standard AdamW)
+        X_cwd   = X - lr*wd*X*mask - update               (CWD)
+                = X_std + lr*wd*X*(1 - mask)
+
+    where ``mask = (sign(M_new · X_orig) >= 0)``. We add back the decay that
+    was over-applied on elements where momentum and param disagree in sign.
     """
     if not X:
         return
-    assert len(G) == len(X) and len(M) == len(X) and len(V) == len(X)
+    n = len(X)
+    assert n == len(G) == len(M) == len(V)
 
-    if not _TRITON_AVAILABLE:
-        raise RuntimeError(
-            "adamw_update_foreach requires Triton. Install triton or use "
-            "adamw_update (single-tensor) instead."
-        )
-
-    device = X[0].device
-    dtype = X[0].dtype
-
-    # Bias corrections are shared across all params in a Dion group (single
-    # ``group['step']``), so precompute on CPU and pass as kernel scalars,
-    # avoiding per-param scalar tensor staging.
     lr_f = float(lr)
     beta1_f = float(beta1)
     beta2_f = float(beta2)
-    weight_decay_f = float(weight_decay)
-    # float() unwraps 0-d tensors too; needed because Dion passes step/epsilon
-    # as tensors and ``float ** tensor`` would return a tensor (which Triton
-    # then treats as a pointer in the kernel signature).
-    step_f = float(step)
-    bc1 = 1.0 - beta1_f ** step_f
-    bc2_sqrt = (1.0 - beta2_f ** step_f) ** 0.5
+    wd_f = float(weight_decay)
+    eps_f = float(epsilon)
 
-    BLOCK_SIZE = 1024
-    buf = _get_mta_buffers(X, G, M, V, BLOCK_SIZE, device)
+    do_cwd_correction = cautious_wd and wd_f > 0.0
+    if do_cwd_correction:
+        X_orig = [x.clone() for x in X]
 
-    _fused_adamw_mta_kernel[(buf["total_blocks"],)](
-        buf["ptrs_x"], buf["ptrs_g"], buf["ptrs_m"], buf["ptrs_v"],
-        buf["numels"], buf["block_to_tensor"], buf["block_to_chunk_start"],
-        lr_f, beta1_f, beta2_f, weight_decay_f, float(epsilon),
-        bc1, bc2_sqrt,
-        BLOCK_SIZE=BLOCK_SIZE,
-        CAUTIOUS_WD=cautious_wd,
-        DTYPE=_TORCH_TO_TRITON_DTYPE[dtype],
+    # Cache the step scalar per device. ``torch.tensor(x, device="cuda")``
+    # from a Python float stages through pageable CPU memory and issues a
+    # blocking ``cudaMemcpy``, which defeats the point of going fused.
+    # ``fill_`` on a cached 0-d CUDA tensor is a kernel launch — async.
+    step_t = _get_step_tensor(X[0].device)
+    step_t.fill_(float(step))
+    torch._fused_adamw_(
+        X, G, M, V, [],
+        [step_t] * n,
+        amsgrad=False,
+        beta1=beta1_f, beta2=beta2_f,
+        lr=lr_f, weight_decay=wd_f, eps=eps_f,
+        maximize=False,
     )
+
+    if do_cwd_correction:
+        # mask == 0  <=>  sign(M_new) * sign(X_orig) < 0  (over-decayed).
+        signs = torch._foreach_mul(M, X_orig)
+        undo_masks = [(s < 0).to(x.dtype) for s, x in zip(signs, X_orig)]
+        correction = torch._foreach_mul(X_orig, undo_masks)
+        torch._foreach_mul_(correction, lr_f * wd_f)
+        torch._foreach_add_(X, correction)
 
 
 @torch.compile(fullgraph=True)
