@@ -107,83 +107,83 @@ def lion_update(
     X.add_(U, alpha=-lr)
 
 
-@torch.compile(fullgraph=True)
+_step_tensor_cache: dict = {}
+
+
+def _get_step_tensor(device: torch.device) -> Tensor:
+    t = _step_tensor_cache.get(device)
+    if t is None:
+        t = torch.zeros((), dtype=torch.float32, device=device)
+        _step_tensor_cache[device] = t
+    return t
+
+
 def adamw_update_foreach(
     X: List[Tensor],  # Model weights (modified in place)
     G: List[Tensor],  # Gradient
     M: List[Tensor],  # Momentum buffer (modified in place)
     V: List[Tensor],  # Variance buffer (modified in place)
-    lr: Tensor,  # Learning rate (scalar tensor)
-    beta1: Tensor,  # Beta 1 (scalar tensor)
-    beta2: Tensor,  # Beta 2 (scalar tensor)
-    weight_decay: Tensor,  # Weight decay (scalar tensor)
+    lr: Tensor,  # Learning rate (scalar tensor or float)
+    beta1: Tensor,  # Beta 1 (scalar tensor or float)
+    beta2: Tensor,  # Beta 2 (scalar tensor or float)
+    weight_decay: Tensor,  # Weight decay (scalar tensor or float)
     step: int,
     epsilon: float,
     cautious_wd: bool = False,
 ):
+    """AdamW update for a list of tensors.
+
+    Dispatches through ``torch._fused_adamw_``, which is already a
+    multi-tensor-apply kernel; avoids the ~6-call ``torch._foreach_*`` chain
+    that otherwise dispatches one aten op per tensor on the CPU side.
+
+    Cautious weight decay (https://arxiv.org/pdf/2510.12402) is applied as a
+    post-step correction rather than inside the kernel:
+
+        X_std   = X - lr*wd*X - update                    (standard AdamW)
+        X_cwd   = X - lr*wd*X*mask - update               (CWD)
+                = X_std + lr*wd*X*(1 - mask)
+
+    where ``mask = (sign(M_new · X_orig) >= 0)``. We add back the decay that
+    was over-applied on elements where momentum and param disagree in sign.
     """
-    AdamW optimizer algorithm (foreach implementation).
-    """
-    batch_size = len(X)
-    assert batch_size == len(G)
-    assert batch_size == len(M)
-    assert batch_size == len(V)
+    if not X:
+        return
+    n = len(X)
+    assert n == len(G) == len(M) == len(V)
 
-    M_dtype = M[0].dtype
-    V_dtype = V[0].dtype
+    lr_f = float(lr)
+    beta1_f = float(beta1)
+    beta2_f = float(beta2)
+    wd_f = float(weight_decay)
+    eps_f = float(epsilon)
 
-    # Update momentum and variance
-    # M = beta1 * M + (1 - beta1) * G
-    G = [g.to(dtype=M_dtype) for g in G]
-    torch._foreach_lerp_(M, G, [1 - beta1] * batch_size)
+    do_cwd_correction = cautious_wd and wd_f > 0.0
+    if do_cwd_correction:
+        X_orig = [x.clone() for x in X]
 
-    # V = beta2 * V + (1 - beta2) * G * G
-    G_square = torch._foreach_mul(G, G)
-    G_square = [g.to(dtype=V_dtype) for g in G_square]
-    torch._foreach_lerp_(V, G_square, [1 - beta2] * batch_size)
+    # Cache the step scalar per device. ``torch.tensor(x, device="cuda")``
+    # from a Python float stages through pageable CPU memory and issues a
+    # blocking ``cudaMemcpy``, which defeats the point of going fused.
+    # ``fill_`` on a cached 0-d CUDA tensor is a kernel launch — async.
+    step_t = _get_step_tensor(X[0].device)
+    step_t.fill_(float(step))
+    torch._fused_adamw_(
+        X, G, M, V, [],
+        [step_t] * n,
+        amsgrad=False,
+        beta1=beta1_f, beta2=beta2_f,
+        lr=lr_f, weight_decay=wd_f, eps=eps_f,
+        maximize=False,
+    )
 
-    # Bias correction
-    bias_correction1 = 1 - beta1**step
-    bias_correction2 = 1 - beta2**step
-    bias_correction2_sqrt = bias_correction2.sqrt()
-
-    # The goal is to compute the following in-place:
-    # M = M / bias_correction1
-    # V = V / bias_correction2
-    # X = X - lr * M / (sqrt(V) + epsilon)
-
-    # Compute the denominator for the weight update
-    # sqrt(V / bias_correction2) = sqrt(V) / sqrt(bias_correction2)
-    denom = torch._foreach_sqrt(V)
-    torch._foreach_div_(denom, bias_correction2_sqrt)
-    torch._foreach_add_(denom, [epsilon] * batch_size)
-
-    # Adjust learning rate to include bias correction 1
-    adj_lr = lr / bias_correction1
-
-    M_div = torch._foreach_div(M, denom)
-
-    if cautious_wd:
-        # Apply cautious weight decay: only where update and parameter signs align
-        # Reference: https://arxiv.org/pdf/2510.12402
-        coeff = lr * weight_decay
-
-        decay_masks = torch._foreach_mul(X, M_div)
-        decay_masks = torch._foreach_sign(decay_masks)  # {-1, 0, 1}
-        decay_masks = torch._foreach_add(decay_masks, 1)  # {0, 1, 2}
-        decay_masks = torch._foreach_minimum(decay_masks, 1)  # {0, 1, 1}
-
-        decay_terms = torch._foreach_mul(X, decay_masks)
-        torch._foreach_mul_(decay_terms, coeff)
-        torch._foreach_sub_(X, decay_terms)
-    else:
-        # Apply weight decay
-        torch._foreach_mul_(X, 1 - lr * weight_decay)
-
-    # Weight update
-    # X = X - adj_lr * M / denom
-    torch._foreach_mul_(M_div, adj_lr)
-    torch._foreach_sub_(X, M_div)
+    if do_cwd_correction:
+        # mask == 0  <=>  sign(M_new) * sign(X_orig) < 0  (over-decayed).
+        signs = torch._foreach_mul(M, X_orig)
+        undo_masks = [(s < 0).to(x.dtype) for s, x in zip(signs, X_orig)]
+        correction = torch._foreach_mul(X_orig, undo_masks)
+        torch._foreach_mul_(correction, lr_f * wd_f)
+        torch._foreach_add_(X, correction)
 
 
 @torch.compile(fullgraph=True)
