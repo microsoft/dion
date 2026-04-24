@@ -1,6 +1,10 @@
 import torch
 from torch import Tensor
 
+# Triton's tl.dot input_precision is backend-specific: CUDA accepts
+# "ieee"/"tf32"/"tf32x3", while ROCm only accepts "ieee" (see issue #61).
+_IS_HIP = torch.version.hip is not None
+
 try:
     import triton
     import triton.language as tl
@@ -165,7 +169,7 @@ def ns_line_1(A: Tensor, *, out: Tensor = None):
     batch_size = A.size(0) if A.ndim == 3 else 1
     input_batch_stride = A.stride(0) if A.ndim == 3 else 0
     output_batch_stride = out.stride(0) if out.ndim == 3 else 0
-    input_precision = "ieee" if A.dtype == torch.float32 else "tf32"
+    input_precision = "ieee" if (_IS_HIP or A.dtype == torch.float32) else "tf32"
 
     grid = lambda meta: (
         batch_size
@@ -299,7 +303,7 @@ def ns_line_2(A: Tensor, alpha: float, beta: float, *, out: Tensor = None):
     batch_size = A.size(0) if A.ndim == 3 else 1
     input_batch_stride = A.stride(0) if A.ndim == 3 else 0
     output_batch_stride = out.stride(0) if out.ndim == 3 else 0
-    input_precision = "ieee" if A.dtype == torch.float32 else "tf32"
+    input_precision = "ieee" if (_IS_HIP or A.dtype == torch.float32) else "tf32"
 
     grid = lambda meta: (
         batch_size
