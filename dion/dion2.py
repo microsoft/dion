@@ -40,6 +40,10 @@ class Dion2(DistributedOrthoBase):
             False: Tensors are not flattened. 3D+ tensors are treated as batches of 2D matrices.
         use_gram_newton_schulz: Whether to use Gram Newton-Schulz for orthogonalization.
         use_triton: Whether to use Triton kernel for Newton-Schulz. Ignored if custom function is provided.
+        use_polar_express: Whether to use Polar Express orthogonalization (default).
+            Overridden by ``use_hybrid_newton_schulz`` or ``newton_schulz_func``.
+        use_hybrid_newton_schulz: Whether to use the 10-step hybrid Newton-Schulz
+            schedule from DeepSeek-V4 (8 aggressive iterations + 2 stabilizing iterations).
         newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
             Signature is ``func(input: Tensor, epsilon: float) -> Tensor``.
         verbose: Whether to print debug information during updates. If True, it prints whether rows or columns are selected for the submatrix selection process.
@@ -61,6 +65,7 @@ class Dion2(DistributedOrthoBase):
         flatten: bool = False,
         use_triton: bool = False,
         use_polar_express: bool = True,
+        use_hybrid_newton_schulz: bool = False,
         use_gram_newton_schulz: bool = False,
         newton_schulz_func: Optional[Callable] = None,
         verbose: bool = False,
@@ -97,6 +102,7 @@ class Dion2(DistributedOrthoBase):
             use_gram_newton_schulz=use_gram_newton_schulz,
             use_triton=use_triton,
             use_polar_express=use_polar_express,
+            use_hybrid_newton_schulz=use_hybrid_newton_schulz,
             newton_schulz_func=newton_schulz_func,
         )
         self.verbose = verbose

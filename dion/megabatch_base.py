@@ -15,6 +15,7 @@ from .newton_schulz_triton import (
     zeropower_via_newtonschulz5,
 )
 from .polar_express import polar_express, polar_express_triton
+from .hybrid_newton_schulz import hybrid_newton_schulz
 from .opt_utils import AsyncRuntime, AsyncTask, to_local
 from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
 
@@ -37,6 +38,7 @@ class DistributedOrthoBase(Optimizer):
         use_gram_newton_schulz: bool = False,
         use_triton: bool = False,
         use_polar_express: bool = True,
+        use_hybrid_newton_schulz: bool = False,
         newton_schulz_func: Optional[Callable] = None,
     ):
         super().__init__(params, defaults)
@@ -92,6 +94,8 @@ class DistributedOrthoBase(Optimizer):
                 compile_kwargs=dict(fullgraph=True, mode="default"),
             )
             self._newton_schulz_func = lambda X, epsilon=None: _gns(X)
+        elif use_hybrid_newton_schulz:
+            self._newton_schulz_func = hybrid_newton_schulz
         elif use_polar_express and use_triton:
             self._newton_schulz_func = polar_express_triton
         elif use_polar_express:
