@@ -1,4 +1,4 @@
-"""Tests for hybrid Newton-Schulz orthogonalization (DeepSeek-V4)."""
+"""Tests for hybrid (8 Muon + 2 classical) Newton-Schulz orthogonalization."""
 
 import pytest
 import torch

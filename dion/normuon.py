@@ -45,7 +45,7 @@ class NorMuon(DistributedOrthoBase):
         use_polar_express: Whether to use Polar Express orthogonalization (default).
             Overridden by ``use_hybrid_newton_schulz`` or ``newton_schulz_func``.
         use_hybrid_newton_schulz: Whether to use the 10-step hybrid Newton-Schulz
-            schedule from DeepSeek-V4 (8 aggressive iterations + 2 stabilizing iterations).
+            schedule (8 Muon iterations + 2 classical stabilizing iterations).
         newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
             Signature is ``func(input: Tensor, epsilon: float) -> Tensor``.
 
