@@ -2,14 +2,15 @@
 """
 Newton-Schulz kernel benchmarks.
 
-Compares seven orthogonalization implementations:
+Compares eight orthogonalization implementations:
   1. zeropower_via_newtonschulz5  (pure PyTorch reference)
-  2. newton_schulz_triton         (Triton kernels)
-  3. polar_express                 (pure PyTorch)
-  4. polar_express_triton          (Triton kernels)
-  5. GramNewtonSchulz(ns_use_kernels=False, use_gram_newton_schulz=False)
-  6. GramNewtonSchulz(ns_use_kernels=True,  use_gram_newton_schulz=False)
-  7. GramNewtonSchulz(ns_use_kernels=True,  use_gram_newton_schulz=True, reset=[2])
+  2. polar_express                 (pure PyTorch)
+  3. GramNewtonSchulz(ns_use_kernels=False, use_gram_newton_schulz=False)
+  4. GramNewtonSchulz(ns_use_kernels=False, use_gram_newton_schulz=True)
+  5. newton_schulz_triton         (Triton kernels)
+  6. polar_express_triton          (Triton kernels)
+  7. GramNewtonSchulz(ns_use_kernels=True,  use_gram_newton_schulz=False)
+  8. GramNewtonSchulz(ns_use_kernels=True,  use_gram_newton_schulz=True, reset=[2])
 
 Examples
 --------
