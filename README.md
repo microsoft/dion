@@ -17,6 +17,7 @@ You can find the following optimizers:
 1. [Optimizers](#optimizers)
 1. [Building Parameter Groups](#building-parameter-groups)
    * [Example Code](#example-code)
+   * [Per-Head Newton-Schulz for Attention Projections](#per-head-newton-schulz-for-attention-projections)
 1. [Distributed Training Configuration](#distributed-training-configuration)
    * [Flattened Meshes](#flattened-meshes)
    * [Device Mesh for Muon](#device-mesh-for-muon)
@@ -239,6 +240,25 @@ param_groups = [
     dict(params=lm_head_params, algorithm="adamw", lr=lr / math.sqrt(model_dim), weight_decay=0)
 ]
 ```
+
+### Per-Head Newton-Schulz for Attention Projections
+
+Attention Q / K / V / gate projections are typically stored as a single 2D `nn.Linear` weight of shape `(num_heads * head_dim, in_features)`, but semantically each head is an independent `(head_dim, in_features)` matrix. Orthogonalizing the fused matrix blends information across heads — often not what you want.
+
+You can ask Dion2, Muon, or NorMuon to run Newton-Schulz independently per head without changing the model layout by setting `num_heads` on the parameter group:
+
+```python
+param_groups = [
+    dict(params=attn_proj_params, num_heads=config.num_attention_heads),
+    dict(params=other_matrix_params),
+    dict(params=vector_params, algorithm="adamw"),
+    ...
+]
+```
+
+When `num_heads > 1`, the optimizer views each 2D weight as a batch of `num_heads` matrices of shape `(head_dim, in_features)` internally. The learning-rate adjustment (`spectral_norm` / `rms_norm`) is computed per-head, and Newton-Schulz runs on each head independently. With FSDP, sharding dim 0 along head boundaries (i.e. `num_heads % world_size == 0`) avoids the all-to-all that would otherwise be needed to assemble the fused matrix before NS.
+
+Requirements: the parameter must be 2D, `num_heads` must divide dim 0, and when using FSDP it must also divide the world size. Place Q / K / V / gate projections in one group (axis-0 heads); O-projection heads are on axis 1 and are not covered by this option.
 
 ## Distributed Training Configuration
 

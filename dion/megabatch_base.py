@@ -7,7 +7,7 @@ from torch import Tensor
 from torch.distributed import ProcessGroup
 from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.optim.optimizer import Optimizer, ParamsT
-from typing import Callable, Generator, List, Optional, Union
+from typing import Callable, Generator, List, Optional, Tuple, Union
 
 from .newton_schulz_triton import (
     TRITON_AVAILABLE,
@@ -148,6 +148,94 @@ class DistributedOrthoBase(Optimizer):
             if algo == "adamw":
                 state["variance"] = torch.zeros_like(param)
         return state
+
+    def _resolve_num_heads(self, group: dict) -> Optional[int]:
+        """Validate the ``num_heads`` option on a param group.
+
+        Returns the group's ``num_heads`` when it is set and > 1 (the only case
+        that actually triggers the per-head code path). Returns ``None`` when
+        ``num_heads`` is unset or equals 1 (both are no-ops). Raises
+        ``ValueError`` for invalid values or incompatible combinations.
+        """
+        num_heads = group.get("num_heads")
+        if num_heads is None:
+            return None
+        # bool is a subclass of int in Python; reject it explicitly.
+        if isinstance(num_heads, bool) or not isinstance(num_heads, int) or num_heads < 1:
+            raise ValueError(
+                f"num_heads must be a positive integer if set, got {num_heads!r}."
+            )
+        if num_heads == 1:
+            return None
+        if group.get("flatten"):
+            raise ValueError(
+                "num_heads > 1 is incompatible with flatten=True: flattening "
+                "the per-head 3D view collapses heads back into a single 2D "
+                "matrix, defeating per-head Newton-Schulz."
+            )
+        return num_heads
+
+    def _prepare_head_split(
+        self,
+        num_heads: int,
+        params: List[Tensor],
+        *extras: List[Tensor],
+    ) -> Tuple[List[Tensor], ...]:
+        """Reshape 2D params (and same-dim-0 companion tensors) into 3D per-head views.
+
+        A 2D weight of shape ``(num_heads * head_dim, ...)`` is returned as
+        a 3D local tensor of shape ``(num_heads_local, head_dim, ...)``. The same
+        split is applied to any ``extras`` lists (grads, momentums, and NorMuon's
+        per-neuron variance buffer of shape ``(out, 1)``).
+
+        In-place updates on the returned views propagate to the underlying storage.
+        Callers must also mark the resulting tensors as batch-sharded (skip NS
+        all-to-all) since each rank's shard now holds whole heads.
+        """
+        first = params[0]
+        full_shape = first.shape
+        if first.ndim != 2:
+            raise ValueError(
+                f"num_heads is only supported for 2D parameters, got shape {tuple(full_shape)}."
+            )
+        if full_shape[0] % num_heads != 0:
+            raise ValueError(
+                f"num_heads ({num_heads}) must divide dim 0 of the parameter "
+                f"(got shape {tuple(full_shape)})."
+            )
+        head_dim = full_shape[0] // num_heads
+
+        if isinstance(first, DTensor):
+            shard_placements = [
+                (i, p)
+                for i, p in enumerate(first.placements)
+                if p.is_shard() and first.device_mesh.size(i) > 1
+            ]
+            if any(p.dim != 0 for _, p in shard_placements):
+                raise NotImplementedError(
+                    f"num_heads requires sharding on dim 0 (the heads dim) or no sharding; "
+                    f"got placements {first.placements}."
+                )
+            if shard_placements:
+                sharded_mesh_dim = shard_placements[0][0]
+                world = first.device_mesh.size(sharded_mesh_dim)
+                if num_heads % world != 0:
+                    raise ValueError(
+                        f"num_heads ({num_heads}) must be divisible by the sharding "
+                        f"world_size ({world}) so each rank holds whole heads."
+                    )
+
+        def _as_3d(t: Tensor) -> Tensor:
+            local = t.to_local() if isinstance(t, DTensor) else t
+            local_dim0 = local.shape[0]
+            if local_dim0 % head_dim != 0:
+                raise RuntimeError(
+                    f"Local shard dim 0 ({local_dim0}) is not a multiple of head_dim "
+                    f"({head_dim}); shard boundaries must align with heads."
+                )
+            return local.view(local_dim0 // head_dim, head_dim, *local.shape[1:])
+
+        return tuple([_as_3d(t) for t in lst] for lst in (params,) + extras)
 
     def _get_shard_info(self, param: Tensor, group: dict):
         """Determine sharding info. Returns (is_batch_sharded, is_matrix_sharded, sharded_tensor_dim)."""
