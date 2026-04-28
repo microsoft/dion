@@ -28,8 +28,8 @@ class DistributedOrthoBase(Optimizer):
         distributed_mesh: Optional[Union[DeviceMesh, ProcessGroup]],
         algo_name: str,
         defaults: dict,
-        use_gram_newton_schulz: bool = False,
-        use_triton: bool = False,
+        use_gram_newton_schulz: bool = True,
+        ns_use_kernels: bool = False,
         newton_schulz_func: Optional[Callable] = None,
     ):
         super().__init__(params, defaults)
@@ -77,7 +77,7 @@ class DistributedOrthoBase(Optimizer):
                     "Install it with: pip install gram-newton-schulz, or provide a custom newton_schulz_func."
                 )
             _gns = GramNewtonSchulz(
-                ns_use_kernels=use_triton,
+                ns_use_kernels=ns_use_kernels,
                 use_gram_newton_schulz=use_gram_newton_schulz,
                 gram_newton_schulz_reset_iterations=[2],
                 # Some compiler crashes were observed with mode="reduce-overhead" when we also compile the entire optimizer step.

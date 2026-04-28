@@ -80,10 +80,7 @@ def test_pure_and_kernels_match(shape, use_gram):
     X_kern = gns_kern(G)
 
     assert X_pure.shape == X_kern.shape
-    max_diff = (X_pure.float() - X_kern.float()).abs().max().item()
-    assert max_diff < 0.03, (
-        f"Pure vs kernels mismatch for shape {shape}: max_diff = {max_diff:.4f}"
-    )
+    torch.testing.assert_close(X_pure.float(), X_kern.float(), atol=0.001, rtol=0)
 
 
 @pytest.mark.parametrize("shape", SHAPES)
@@ -95,21 +92,32 @@ def test_output_shape_matches_input(gns, shape):
     assert X.shape == G.shape
 
 
-@pytest.mark.parametrize("shape", SHAPES)
-def test_gns_vs_newton_schulz_reference(gns, shape):
-    """GNS and the legacy Newton-Schulz reference should both be approximately orthogonal."""
+def _get_reference_fns():
+    """Return named reference orthogonalization functions for comparison."""
     from dion.muon import zeropower_via_newtonschulz5
+
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "benchmark"))
+    from polar_express import polar_express
+
+    return {
+        "newton_schulz": zeropower_via_newtonschulz5,
+        "polar_express": polar_express,
+    }
+
+
+@pytest.mark.parametrize("shape", SHAPES)
+@pytest.mark.parametrize("ref_name", ["newton_schulz", "polar_express"])
+def test_gns_vs_reference(gns, shape, ref_name):
+    """GNS output should roughly match legacy reference implementations."""
+    ref_fn = _get_reference_fns()[ref_name]
 
     torch.manual_seed(42)
     G = torch.randn(shape, device=DEVICE)
 
     X_gns = gns(G)
-    X_ns = zeropower_via_newtonschulz5(G)
+    X_ref = ref_fn(G)
 
-    assert X_gns.shape == X_ns.shape
-
-    for label, X in [("GNS", X_gns), ("NS", X_ns)]:
-        err = orthogonality_error(X, shape)
-        assert err < ORTHO_ATOL, (
-            f"{label} not orthogonal for shape {shape}: {err:.4f}"
-        )
+    assert X_gns.shape == X_ref.shape
+    torch.testing.assert_close(X_gns.float(), X_ref.float(), atol=0.05, rtol=0)

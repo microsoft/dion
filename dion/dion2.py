@@ -39,7 +39,7 @@ class Dion2(DistributedOrthoBase):
             True: Tensors with 3+ dimensions are flattened to 2D. Use this for convolutional layers.
             False: Tensors are not flattened. 3D+ tensors are treated as batches of 2D matrices.
         use_gram_newton_schulz: Whether to use Gram Newton-Schulz for orthogonalization.
-        use_triton: Whether to use Triton kernel for Newton-Schulz. Ignored if custom function is provided.
+        ns_use_kernels: Whether to use Quack (CuTeDSL) kernels for Newton-Schulz. Ignored if custom `newton_schulz_func` is provided.
         newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
             Signature is ``func(input: Tensor, epsilon: float) -> Tensor``.
         verbose: Whether to print debug information during updates. If True, it prints whether rows or columns are selected for the submatrix selection process.
@@ -59,8 +59,8 @@ class Dion2(DistributedOrthoBase):
         epsilon: float = 1e-8,
         adjust_lr: Optional[str] = "spectral_norm",
         flatten: bool = False,
-        use_triton: bool = False,
-        use_gram_newton_schulz: bool = False,
+        ns_use_kernels: bool = False,
+        use_gram_newton_schulz: bool = True,
         newton_schulz_func: Optional[Callable] = None,
         verbose: bool = False,
     ):
@@ -94,7 +94,7 @@ class Dion2(DistributedOrthoBase):
         super().__init__(
             params, distributed_mesh, "dion2", defaults,
             use_gram_newton_schulz=use_gram_newton_schulz,
-            use_triton=use_triton,
+            ns_use_kernels=ns_use_kernels,
             newton_schulz_func=newton_schulz_func,
         )
         self.verbose = verbose

@@ -201,7 +201,7 @@ def parse_cli_args():
         "--no_compile", action="store_true", help="Disable torch.compile for model"
     )
     parser.add_argument(
-        "--no_triton", action="store_true", help="Disable CuTeDSL kernels in GramNewtonSchulz"
+        "--no_kernels", action="store_true", help="Disable CuTeDSL kernels in GramNewtonSchulz"
     )
     parser.add_argument(
         "--use_gram_newton_schulz", action="store_true", help="Use Gram Newton-Schulz for orthogonalization"
@@ -226,7 +226,7 @@ def parse_cli_args():
             "fast_fsdp",
             "no_wandb",
             "no_compile",
-            "no_triton",
+            "no_kernels",
             "use_gram_newton_schulz",
             "debug",
         ):
@@ -423,7 +423,7 @@ def init_optimizer(
             distributed_mesh = ddp_model.process_group  # using ProcessGroup for DDP
             comm_method = "all-gather"
         print0(f"Muon LR adjust method: {hp.adjust_lr}")
-        print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
+        print0(f"CuTeDSL Newton-Schulz kernels: {not cli_args.no_kernels}")
         print0(f"Distributed Muon using: {comm_method}")
         opt = Muon(
             param_groups,
@@ -434,7 +434,7 @@ def init_optimizer(
             nesterov=True,
             adjust_lr=hp.adjust_lr,
             use_gram_newton_schulz=cli_args.use_gram_newton_schulz,
-            use_triton=(not cli_args.no_triton),
+            ns_use_kernels=(not cli_args.no_kernels),
         )
     elif hp.optimizer == "dion2":
         if device_mesh is not None:
@@ -450,7 +450,7 @@ def init_optimizer(
             distributed_mesh = ddp_model.process_group  # using ProcessGroup for DDP
             comm_method = "all-gather"
         print0(f"LR adjust method: {hp.adjust_lr}")
-        print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
+        print0(f"CuTeDSL Newton-Schulz kernels: {not cli_args.no_kernels}")
         print0(f"Distributed Dion2 using: {comm_method}")
         opt = Dion2(
             param_groups,
@@ -461,7 +461,7 @@ def init_optimizer(
             weight_decay=hp.weight_decay,
             adjust_lr=hp.adjust_lr,
             use_gram_newton_schulz=cli_args.use_gram_newton_schulz,
-            use_triton=(not cli_args.no_triton),
+            ns_use_kernels=(not cli_args.no_kernels),
             verbose=hp.verbose,
         )
     elif hp.optimizer == "normuon":
@@ -478,7 +478,7 @@ def init_optimizer(
             distributed_mesh = ddp_model.process_group  # using ProcessGroup for DDP
             comm_method = "all-gather"
         print0(f"NorMuon LR adjust method: {hp.adjust_lr}")
-        print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
+        print0(f"CuTeDSL Newton-Schulz kernels: {not cli_args.no_kernels}")
         print0(f"Distributed NorMuon using: {comm_method}")
         opt = NorMuon(
             param_groups,
@@ -489,7 +489,7 @@ def init_optimizer(
             weight_decay=hp.weight_decay,
             nesterov=True,
             adjust_lr=hp.adjust_lr,
-            use_triton=(not cli_args.no_triton),
+            ns_use_kernels=(not cli_args.no_kernels),
             use_gram_newton_schulz=cli_args.use_gram_newton_schulz,
         )
 
