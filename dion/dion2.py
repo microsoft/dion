@@ -264,13 +264,20 @@ def dion2_update_megabatch_async(
     )
 
 
-# Workaround for a torch.compile bug in PyTorch 2.11's inductor backend:
+# Workaround for a torch.compile bug in PyTorch ≤2.11's inductor backend:
 # the post-fusion loop reordering pass crashes when ForeachKernelSchedulerNode
-# appears inside a FusedSchedulerNode.
+# appears inside a FusedSchedulerNode.  Only triggered by recompilation across
+# different tensor dimensionalities (e.g. 2D then 3D).
 # https://github.com/pytorch/pytorch/issues/176591
-# Disabling this pass is safe — it only affects a minor loop-order
-# optimization, not correctness.
-@torch._inductor.config.patch(loop_ordering_after_fusion=False)
+# TODO: remove this decorator when pytorch/pytorch#176591 is fixed.
+_inductor_workaround = (
+    torch._inductor.config.patch(loop_ordering_after_fusion=False)
+    if torch.__version__ < "2.13"
+    else lambda fn: fn
+)
+
+
+@_inductor_workaround
 @torch.compile(fullgraph=True)
 def dion2_pre_orthogonalize(
     G: List[Tensor],
@@ -345,6 +352,9 @@ def dion2_pre_orthogonalize(
     return U_selected, indices_list
 
 
+# NOTE: if this function starts failing with an InductorError on recompilation
+# across tensor ranks, apply the same _inductor_workaround used on
+# dion2_pre_orthogonalize above.  See pytorch/pytorch#176591.
 @torch.compile(fullgraph=True)
 def dion2_post_orthogonalize(
     X: List[Tensor],
