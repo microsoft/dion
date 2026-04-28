@@ -41,11 +41,11 @@ except ImportError:
         "Install it with: pip install dion[triton]  (or: pip install triton)"
     )
 
-from dion.newton_schulz_triton import (
+from newton_schulz_triton import (
     newton_schulz_triton,
     zeropower_via_newtonschulz5,
 )
-from dion.polar_express import polar_express, polar_express_triton
+from polar_express import polar_express, polar_express_triton
 
 from gram_newton_schulz import GramNewtonSchulz
 

@@ -66,7 +66,6 @@ class NorMuon(DistributedOrthoBase):
         flatten: bool = False,
         use_gram_newton_schulz: bool = False,
         use_triton: bool = False,
-        use_polar_express: bool = True,
         newton_schulz_func: Optional[Callable] = None,
     ):
         if lr < 0.0:
@@ -101,7 +100,6 @@ class NorMuon(DistributedOrthoBase):
             params, distributed_mesh, "normuon", defaults,
             use_gram_newton_schulz=use_gram_newton_schulz,
             use_triton=use_triton,
-            use_polar_express=use_polar_express,
             newton_schulz_func=newton_schulz_func,
         )
 

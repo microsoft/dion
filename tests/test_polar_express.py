@@ -3,8 +3,13 @@
 import pytest
 import torch
 
-from dion.polar_express import polar_express, polar_express_triton
-from dion.newton_schulz_triton import zeropower_via_newtonschulz5
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "benchmark"))
+
+from polar_express import polar_express, polar_express_triton
+from newton_schulz_triton import zeropower_via_newtonschulz5
 
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

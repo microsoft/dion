@@ -1,7 +1,7 @@
 import torch
 from torch import Tensor
 
-from .newton_schulz_triton import ns_line_1, ns_line_2
+from newton_schulz_triton import ns_line_1, ns_line_2
 
 # Polar Express coefficients (computed for num_iters=5, safety_factor=2e-2, cushion=2)
 # From https://arxiv.org/pdf/2505.16932

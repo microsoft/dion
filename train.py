@@ -201,10 +201,7 @@ def parse_cli_args():
         "--no_compile", action="store_true", help="Disable torch.compile for model"
     )
     parser.add_argument(
-        "--no_triton", action="store_true", help="Disable Triton kernels"
-    )
-    parser.add_argument(
-        "--use_polar_express", action="store_true", help="Use Polar Express for orthogonalization"
+        "--no_triton", action="store_true", help="Disable CuTeDSL kernels in GramNewtonSchulz"
     )
     parser.add_argument(
         "--use_gram_newton_schulz", action="store_true", help="Use Gram Newton-Schulz for orthogonalization"
@@ -230,7 +227,6 @@ def parse_cli_args():
             "no_wandb",
             "no_compile",
             "no_triton",
-            "use_polar_express",
             "use_gram_newton_schulz",
             "debug",
         ):
@@ -439,7 +435,6 @@ def init_optimizer(
             adjust_lr=hp.adjust_lr,
             use_gram_newton_schulz=cli_args.use_gram_newton_schulz,
             use_triton=(not cli_args.no_triton),
-            use_polar_express=cli_args.use_polar_express,
         )
     elif hp.optimizer == "dion2":
         if device_mesh is not None:
@@ -467,7 +462,6 @@ def init_optimizer(
             adjust_lr=hp.adjust_lr,
             use_gram_newton_schulz=cli_args.use_gram_newton_schulz,
             use_triton=(not cli_args.no_triton),
-            use_polar_express=cli_args.use_polar_express,
             verbose=hp.verbose,
         )
     elif hp.optimizer == "normuon":
@@ -496,7 +490,6 @@ def init_optimizer(
             nesterov=True,
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
-            use_polar_express=cli_args.use_polar_express,
             use_gram_newton_schulz=cli_args.use_gram_newton_schulz,
         )
 
