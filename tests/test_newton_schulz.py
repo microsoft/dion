@@ -1,4 +1,4 @@
-# tests/test_newton_shulz.py
+# tests/test_newton_schulz.py
 """
 Accuracy tests for Triton Newton-Schulz kernels against a numpy float64
 CPU reference. Each test asserts that the Triton kernel has similar or
