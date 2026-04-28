@@ -14,14 +14,17 @@ Compares seven orthogonalization implementations:
 Examples
 --------
 # One-off timing (1024 x 1024, batch=1 & 4)
-python benchmark/benchmark_newton_schulz.py --single --m 1024
-python benchmark/benchmark_newton_schulz.py --single --m 1024 --n 1024 --batch_size 4
+python benchmark/benchmark_newton_schulz.py single --m 1024
+python benchmark/benchmark_newton_schulz.py single --m 1024 --n 1024 --batch_size 4
 
-# Grid sweep
-python benchmark/benchmark_newton_schulz.py --grid --batch_size 4 --expansion 1
+# Grid sweep (default starts at 512, doubling each step)
+python benchmark/benchmark_newton_schulz.py grid --batch_size 4 --expansion 1
+
+# Grid sweep starting at a different dimension
+python benchmark/benchmark_newton_schulz.py grid --start_dim 256 --batch_size 4
 
 # TFLOPS plot (writes PNG & PDF in ./plots)
-python benchmark/benchmark_newton_schulz.py --plot --batch_size 1
+python benchmark/benchmark_newton_schulz.py plot --batch_size 1
 """
 import argparse
 from collections import OrderedDict
@@ -192,24 +195,36 @@ def parse() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Benchmarks for Newton-Schulz orthogonalization variants"
     )
-    mode = p.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--single", action="store_true", help="run a single benchmark")
-    mode.add_argument("--grid", action="store_true", help="sweep a list of sizes")
-    mode.add_argument(
-        "--plot", action="store_true", help="generate TFLOPS curves and write plots"
-    )
-    p.add_argument("--m", type=int, help="rows")
-    p.add_argument("--n", type=int, help="cols (defaults to m)")
-    p.add_argument("--batch_size", type=int, default=1)
-    p.add_argument(
-        "--expansion", type=int, default=1, help="n = m * expansion (grid mode)"
-    )
-    p.add_argument(
-        "--dtype",
-        default="bfloat16",
-        choices=["float16", "bfloat16"],
+    sub = p.add_subparsers(dest="mode", required=True)
+
+    # -- single --
+    sp_single = sub.add_parser("single", help="run a single benchmark")
+    sp_single.add_argument("--m", type=int, required=True, help="rows")
+    sp_single.add_argument("--n", type=int, help="cols (defaults to m)")
+    sp_single.add_argument("--batch_size", type=int, default=1)
+    sp_single.add_argument(
+        "--dtype", default="bfloat16", choices=["float16", "bfloat16"],
         help="input dtype",
     )
+
+    # -- grid --
+    sp_grid = sub.add_parser("grid", help="sweep a list of sizes")
+    sp_grid.add_argument("--batch_size", type=int, default=1)
+    sp_grid.add_argument(
+        "--start_dim", type=int, default=512, help="smallest dimension (doubled each step)",
+    )
+    sp_grid.add_argument(
+        "--expansion", type=int, default=1, help="n = m * expansion",
+    )
+    sp_grid.add_argument(
+        "--dtype", default="bfloat16", choices=["float16", "bfloat16"],
+        help="input dtype",
+    )
+
+    # -- plot --
+    sp_plot = sub.add_parser("plot", help="generate TFLOPS curves and write plots")
+    sp_plot.add_argument("--batch_size", type=int, default=1)
+
     return p.parse_args()
 
 
@@ -217,10 +232,9 @@ def main():
     args = parse()
     torch._dynamo.config.cache_size_limit = 100  # noqa: SLF001
 
-    dtype = getattr(torch, args.dtype)
-
-    if args.grid:
-        dims = [512, 1024, 2048, 4096, 8192]
+    if args.mode == "grid":
+        dtype = getattr(torch, args.dtype)
+        dims = [args.start_dim * (2 ** i) for i in range(5)]
         bench_grid(
             dims,
             PROVIDERS,
@@ -228,9 +242,10 @@ def main():
             batch_size=args.batch_size,
             dtype=dtype,
         )
-    elif args.plot:
+    elif args.mode == "plot":
         bench_plot(PROVIDERS, args.batch_size)
-    else:  # single run
+    else:  # single
+        dtype = getattr(torch, args.dtype)
         m = args.m
         n = args.n or m
         bench_once(m, n, PROVIDERS, batch_size=args.batch_size, dtype=dtype)
