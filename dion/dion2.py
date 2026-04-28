@@ -264,6 +264,13 @@ def dion2_update_megabatch_async(
     )
 
 
+# Workaround for a torch.compile bug in PyTorch 2.11's inductor backend:
+# the post-fusion loop reordering pass crashes when ForeachKernelSchedulerNode
+# appears inside a FusedSchedulerNode.
+# https://github.com/pytorch/pytorch/issues/176591
+# Disabling this pass is safe — it only affects a minor loop-order
+# optimization, not correctness.
+@torch._inductor.config.patch(loop_ordering_after_fusion=False)
 @torch.compile(fullgraph=True)
 def dion2_pre_orthogonalize(
     G: List[Tensor],
