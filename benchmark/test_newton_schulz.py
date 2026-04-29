@@ -9,11 +9,6 @@ import numpy as np
 import pytest
 import torch
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "benchmark"))
-
 from newton_schulz_triton import (
     TRITON_AVAILABLE,
     ns_line_1,
