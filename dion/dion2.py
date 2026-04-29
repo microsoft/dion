@@ -42,7 +42,7 @@ class Dion2(DistributedOrthoBase):
             Newton-Schulz (False). Both paths use the gram-newton-schulz package; this only controls which algorithm variant is used.
         ns_use_kernels: Whether to use Quack (CuTeDSL) kernels for Newton-Schulz. Ignored if custom `newton_schulz_func` is provided.
         newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
-            Signature is ``func(input: Tensor, epsilon: float) -> Tensor``.
+            Signature is ``func(input: Tensor) -> Tensor``.
         verbose: Whether to print debug information during updates. If True, it prints whether rows or columns are selected for the submatrix selection process.
 
     Dion2 optimizer by Ahn et al.: TBD
@@ -122,7 +122,6 @@ class Dion2(DistributedOrthoBase):
                 ef_decay=torch.tensor(group["ef_decay"]),
                 fraction=group["fraction"],
                 weight_decay=torch.tensor(group["weight_decay"]),
-                epsilon=torch.tensor(group["epsilon"]),
                 flatten=group["flatten"],
                 adjust_lr=group["adjust_lr"],
                 device_rank=self._device_rank,
@@ -178,7 +177,6 @@ def dion2_update_megabatch_async(
     ef_decay: Tensor,  # Error-feedback factor (scalar tensor)
     fraction: float,  # Fraction of submatrix to orthogonalize (0 < fraction <= 1)
     weight_decay: Tensor,  # Weight decay (scalar tensor)
-    epsilon: Tensor,  # Epsilon (scalar tensor)
     flatten: bool,  # Whether to flatten 3D+ tensors to 2D
     adjust_lr: Optional[str],  # How to adjust learning rate
     device_rank: int,  # Rank of the current device
@@ -237,7 +235,6 @@ def dion2_update_megabatch_async(
         process_group=process_group,
         newton_schulz_func=newton_schulz_func,
         flatten=flatten,
-        epsilon=epsilon,
     )
 
     # Compute scaled learning rate

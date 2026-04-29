@@ -76,14 +76,13 @@ class DistributedOrthoBase(Optimizer):
                     "but is not installed. "
                     "Install it with: pip install gram-newton-schulz, or provide a custom newton_schulz_func."
                 )
-            _gns = GramNewtonSchulz(
+            self._newton_schulz_func = GramNewtonSchulz(
                 ns_use_kernels=ns_use_kernels,
                 use_gram_newton_schulz=use_gram_newton_schulz,
                 gram_newton_schulz_reset_iterations=[2],
                 # Some compiler crashes were observed with mode="reduce-overhead" when we also compile the entire optimizer step.
                 compile_kwargs=dict(fullgraph=True, mode="default"),
             )
-            self._newton_schulz_func = lambda X, epsilon=None: _gns(X)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -336,7 +335,6 @@ def megabatch_orthogonalize_async(
     process_group: Optional[ProcessGroup],
     newton_schulz_func: Callable,
     flatten: bool,
-    epsilon: Tensor,
 ) -> Generator[None, None, List[Tensor]]:
     """
     Shared megabatch communication + Newton-Schulz orthogonalization.
@@ -356,7 +354,6 @@ def megabatch_orthogonalize_async(
         process_group: Distributed process group. None for single-GPU.
         newton_schulz_func: Newton-Schulz orthogonalization function.
         flatten: Whether to flatten 3D+ tensors to 2D.
-        epsilon: Small value for numerical stability.
     """
     N = len(U)
 
@@ -389,7 +386,6 @@ def megabatch_orthogonalize_async(
             full_matrices,
             newton_schulz_func=newton_schulz_func,
             flatten=flatten,
-            epsilon=epsilon,
         )
 
         split_chunks = [
@@ -415,7 +411,6 @@ def megabatch_orthogonalize_async(
             my_matrices,
             newton_schulz_func=newton_schulz_func,
             flatten=flatten,
-            epsilon=epsilon,
         )
 
         all_chunks = [torch.empty_like(my_matrices) for _ in range(world_size)]
@@ -434,7 +429,6 @@ def megabatch_orthogonalize_async(
                 U[0],
                 newton_schulz_func=newton_schulz_func,
                 flatten=flatten,
-                epsilon=epsilon,
             )
         ]
 
@@ -445,7 +439,6 @@ def megabatch_orthogonalize_async(
             stacked,
             newton_schulz_func=newton_schulz_func,
             flatten=flatten,
-            epsilon=epsilon,
         )
         return [stacked[i] for i in range(N)]
 
@@ -454,7 +447,6 @@ def muon_update_newton_schulz(
     X: Tensor,
     newton_schulz_func: Callable,
     flatten: bool,
-    epsilon: Tensor,
 ) -> Tensor:
     """
     Flatten the input tensor if needed and call the Newton-Schulz function.
@@ -465,7 +457,7 @@ def muon_update_newton_schulz(
     elif X.ndim >= 4:
         X = X.flatten(end_dim=-3)
 
-    return newton_schulz_func(X, epsilon=epsilon).reshape(original_shape)
+    return newton_schulz_func(X).reshape(original_shape)
 
 
 def adjust_lr_rms_norm(lr, param_shape, flatten):

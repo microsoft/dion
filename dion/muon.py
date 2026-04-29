@@ -43,7 +43,7 @@ class Muon(DistributedOrthoBase):
         use_gram_newton_schulz: Toggle between the Gram Newton-Schulz algorithm (True) and standard
             Newton-Schulz (False). Both paths use the gram-newton-schulz package; this only controls which algorithm variant is used.        
         newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
-            Signature is ``func(input: Tensor, epsilon: float) -> Tensor``.
+            Signature is ``func(input: Tensor) -> Tensor``.
 
     Muon optimizer algorithm by Keller Jordan: https://kellerjordan.github.io/posts/muon/
     FSDP2 Muon uses all-to-all communications: https://www.essential.ai/blog/infra
@@ -119,7 +119,6 @@ class Muon(DistributedOrthoBase):
                 lr=torch.tensor(group["lr"]),
                 momentum=torch.tensor(group["mu"]),
                 weight_decay=torch.tensor(group["weight_decay"]),
-                epsilon=torch.tensor(group["epsilon"]),
                 nesterov=group["nesterov"],
                 flatten=group["flatten"],
                 adjust_lr=group["adjust_lr"],
@@ -175,7 +174,6 @@ def muon_update_megabatch_async(
     lr: Tensor,
     momentum: Tensor,
     weight_decay: Tensor,
-    epsilon: Tensor,
     nesterov: bool,
     flatten: bool,
     adjust_lr: Optional[str],
@@ -210,7 +208,6 @@ def muon_update_megabatch_async(
         process_group=process_group,
         newton_schulz_func=newton_schulz_func,
         flatten=flatten,
-        epsilon=epsilon,
     )
 
     # Compute scaled learning rate

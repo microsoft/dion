@@ -44,7 +44,7 @@ class NorMuon(DistributedOrthoBase):
             Newton-Schulz (False). Both paths use the gram-newton-schulz package; this only controls which algorithm variant is used.        
         ns_use_kernels: Whether to use Quack (CuTeDSL) kernels for Newton-Schulz. Ignored if custom `newton_schulz_func` is provided.
         newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
-            Signature is ``func(input: Tensor, epsilon: float) -> Tensor``.
+            Signature is ``func(input: Tensor) -> Tensor``.
 
     Muon optimizer algorithm by Keller Jordan: https://kellerjordan.github.io/posts/muon/
     FSDP2 Muon uses all-to-all communications: https://www.essential.ai/blog/infra
@@ -142,7 +142,6 @@ class NorMuon(DistributedOrthoBase):
                 momentum=torch.tensor(group["mu"]),
                 muon_beta2=torch.tensor(group["muon_beta2"]),
                 weight_decay=torch.tensor(group["weight_decay"]),
-                epsilon=torch.tensor(group["epsilon"]),
                 nesterov=group["nesterov"],
                 flatten=group["flatten"],
                 adjust_lr=group["adjust_lr"],
@@ -204,7 +203,6 @@ def normuon_update_megabatch_async(
     momentum: Tensor,
     muon_beta2: Tensor,
     weight_decay: Tensor,
-    epsilon: Tensor,
     nesterov: bool,
     flatten: bool,
     adjust_lr: Optional[str],
@@ -239,7 +237,6 @@ def normuon_update_megabatch_async(
         process_group=process_group,
         newton_schulz_func=newton_schulz_func,
         flatten=flatten,
-        epsilon=epsilon,
     )
 
     # NorMuon normalization using stacked tensors for fewer kernel launches
