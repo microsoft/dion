@@ -137,10 +137,15 @@ class MuonSphere(DistributedOrthoBase):
     def _get_or_initialize_state(self, param: Tensor, algo: str) -> dict:
         state = super()._get_or_initialize_state(param, algo)
         if algo == self._algo_name and "spectral_initialized" not in state:
-            # Random-vector warmstart for power iteration. Replicated per
-            # rank so all ranks agree on the (u, v) pair.
+            # Random-vector warmstart for power iteration. The cache holds
+            # the GLOBAL (un-sharded) u, v vectors: each rank materializes
+            # the full ``W`` via ``DTensor.full_tensor()`` inside
+            # ``_power_iteration`` and runs the iteration locally, so the
+            # cache dimensions must match the global tensor shape, not the
+            # per-rank shard. ``param.shape`` is the global shape for both
+            # plain Tensor and DTensor.
+            d_out, d_in = param.shape[-2:]
             local = param.to_local() if isinstance(param, DTensor) else param
-            d_out, d_in = local.shape[-2:]
             generator = torch.Generator(device=local.device).manual_seed(0)
             state["u_cache"] = torch.randn(
                 d_out, 1, device=local.device, dtype=torch.float32, generator=generator
