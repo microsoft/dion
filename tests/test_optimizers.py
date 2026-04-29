@@ -382,6 +382,60 @@ class TestMuonSphere:
         with pytest.raises(NotImplementedError, match="num_heads"):
             opt.step()
 
+    def test_state_dict_roundtrip(self):
+        """state_dict / load_state_dict must preserve u_cache, v_cache, and
+        momentum so a resumed run continues identically. The u/v caches are
+        plain Tensors (not DTensor) and live alongside the standard momentum
+        buffer in ``self.state``; this regression-tests that the default
+        ``Optimizer.state_dict`` machinery captures them all and that a
+        resumed run is bit-identical to one that never saved/loaded.
+        """
+        import copy
+        from dion import MuonSphere
+
+        # Reference run: 4 steps end-to-end.
+        ref_params = _make_params([(64, 128)])
+        ref_opt = MuonSphere(ref_params, lr=0.01)
+        grads = []
+        for step in range(4):
+            torch.manual_seed(100 + step)
+            g = torch.randn_like(ref_params[0])
+            grads.append(g)
+            ref_params[0].grad = g.clone()
+            ref_opt.step()
+
+        # Resumed run: 3 steps, save state, instantiate a fresh optimizer
+        # on a fresh param, restore state and W, then take the 4th step.
+        params_a = _make_params([(64, 128)])
+        opt_a = MuonSphere(params_a, lr=0.01)
+        for step in range(3):
+            params_a[0].grad = grads[step].clone()
+            opt_a.step()
+        # ``load_state_dict`` on PyTorch optimizers can alias the saved
+        # tensors into the live state buffers, so a stepping ``opt_a``
+        # would silently mutate the state we just "loaded" into ``opt_b``.
+        # Deep-copy on the way out to mimic save-to-disk + reload.
+        saved = copy.deepcopy(opt_a.state_dict())
+
+        params_b = _make_params([(64, 128)])
+        opt_b = MuonSphere(params_b, lr=0.01)
+        opt_b.load_state_dict(saved)
+
+        state_a = opt_a.state[params_a[0]]
+        state_b = opt_b.state[params_b[0]]
+        for key in ("momentum", "u_cache", "v_cache"):
+            assert key in state_b, f"{key} missing after load_state_dict"
+            assert torch.equal(state_a[key], state_b[key]), (
+                f"{key} did not survive state_dict roundtrip"
+            )
+
+        params_b[0].data.copy_(params_a[0].data)
+        params_b[0].grad = grads[3].clone()
+        opt_b.step()
+        assert torch.equal(params_b[0].data, ref_params[0].data), (
+            "resumed optimizer diverged from reference run after state_dict roundtrip"
+        )
+
 
 # ---------------------------------------------------------------------------
 # num_heads per-group option (per-head Newton-Schulz on 2D weights)
