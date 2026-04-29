@@ -220,6 +220,124 @@ class TestDion2:
 
 
 # ---------------------------------------------------------------------------
+# MuonSphere
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA required")
+class TestMuonSphere:
+    def test_basic(self):
+        from dion import MuonSphere
+        params = _make_params([(64, 128), (128, 64)])
+        _run_steps(MuonSphere, params, dict(lr=0.01))
+
+    def test_determinism(self):
+        from dion import MuonSphere
+        p1 = _make_params([(64, 128)])
+        r1 = _run_steps(MuonSphere, p1, dict(lr=0.01))
+        p2 = _make_params([(64, 128)])
+        r2 = _run_steps(MuonSphere, p2, dict(lr=0.01))
+        assert torch.equal(r1[0], r2[0])
+
+    def test_params_change(self):
+        from dion import MuonSphere
+        params = _make_params([(64, 128)])
+        before = params[0].data.clone()
+        _run_steps(MuonSphere, params, dict(lr=0.01), n_steps=1)
+        assert not torch.equal(params[0].data, before)
+
+    def test_retraction_holds_spectral_norm(self):
+        """After several steps, ||W||_2 should sit close to R = c * sqrt(d_out/d_in)."""
+        import math
+        from dion import MuonSphere
+        d_out, d_in = 64, 128
+        radius_scale = 2.0
+        R = radius_scale * math.sqrt(d_out / d_in)
+        params = _make_params([(d_out, d_in)])
+        _run_steps(MuonSphere, params, dict(lr=0.01, radius_scale=radius_scale), n_steps=5)
+        sigma = torch.linalg.matrix_norm(params[0].data.float(), ord=2).item()
+        # Allow 1% slack: retraction is pre-update + lr is small, so the
+        # post-update spectral norm tracks R within a hair.
+        assert abs(sigma - R) / R < 0.02, (
+            f"Expected ||W||_2 ~= {R:.4f}, got {sigma:.4f} (radius_scale={radius_scale})"
+        )
+
+    def test_radius_scale_default_one(self):
+        """With radius_scale=1.0 (default), R = sqrt(d_out/d_in) — the standard Spectral muP scale."""
+        import math
+        from dion import MuonSphere
+        d_out, d_in = 64, 128
+        R = math.sqrt(d_out / d_in)
+        params = _make_params([(d_out, d_in)])
+        _run_steps(MuonSphere, params, dict(lr=0.01), n_steps=5)
+        sigma = torch.linalg.matrix_norm(params[0].data.float(), ord=2).item()
+        assert abs(sigma - R) / R < 0.02
+
+    def test_nesterov(self):
+        from dion import MuonSphere
+        params = _make_params([(64, 128)])
+        _run_steps(MuonSphere, params, dict(lr=0.01, nesterov=True))
+
+    def test_adjust_lr_options(self):
+        from dion import MuonSphere
+        for adjust_lr in ["spectral_norm", "rms_norm", None]:
+            params = _make_params([(64, 128)])
+            _run_steps(MuonSphere, params, dict(lr=0.01, adjust_lr=adjust_lr))
+
+    def test_megabatch_same_shape(self):
+        from dion import MuonSphere
+        params = _make_params([(64, 128)] * 5)
+        _run_steps(MuonSphere, params, dict(lr=0.01))
+
+    def test_mixed_shapes(self):
+        from dion import MuonSphere
+        params = _make_params([(64, 128), (128, 64), (32, 32)])
+        _run_steps(MuonSphere, params, dict(lr=0.01))
+
+    def test_invalid_radius_scale(self):
+        from dion import MuonSphere
+        with pytest.raises(ValueError, match="radius_scale"):
+            MuonSphere(_make_params([(32, 64)]), lr=0.01, radius_scale=-1.0)
+
+    def test_invalid_power_iter_steps(self):
+        from dion import MuonSphere
+        with pytest.raises(ValueError, match="power_iter_steps"):
+            MuonSphere(_make_params([(32, 64)]), lr=0.01, power_iter_steps=0)
+
+    def test_uv_cache_state(self):
+        """MuonSphere should maintain u/v singular-vector caches across steps."""
+        from dion import MuonSphere
+        params = _make_params([(64, 128)])
+        opt = MuonSphere(params, lr=0.01)
+        params[0].grad = torch.randn_like(params[0])
+        opt.step()
+        state = opt.state[params[0]]
+        assert "u_cache" in state
+        assert "v_cache" in state
+        assert state["u_cache"].shape == (64, 1)
+        assert state["v_cache"].shape == (128, 1)
+
+    def test_muon_sphere_with_adamw_scalars(self):
+        from dion import MuonSphere
+        torch.manual_seed(42)
+        weights = [
+            torch.nn.Parameter(torch.randn(64, 128, device=DEVICE)),
+            torch.nn.Parameter(torch.randn(128, 64, device=DEVICE)),
+        ]
+        biases = [
+            torch.nn.Parameter(torch.randn(64, device=DEVICE)),
+            torch.nn.Parameter(torch.randn(128, device=DEVICE)),
+        ]
+        opt = MuonSphere([
+            {"params": weights},
+            {"params": biases, "algorithm": "adamw"},
+        ], lr=0.01)
+        for step in range(3):
+            for p in weights + biases:
+                p.grad = torch.randn_like(p)
+            opt.step()
+
+
+# ---------------------------------------------------------------------------
 # num_heads per-group option (per-head Newton-Schulz on 2D weights)
 # ---------------------------------------------------------------------------
 

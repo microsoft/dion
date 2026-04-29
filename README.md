@@ -4,7 +4,8 @@ This repository provides efficient implementations of orthonormal optimizers for
 You can find the following optimizers:
 * [Muon](https://kellerjordan.github.io/posts/muon/)
 * [Dion2](https://arxiv.org/abs/2512.16928) and [Dion](https://arxiv.org/pdf/2504.05295) (Dion is a legacy optimizer; we recommend using Dion2)
-* [NorMuon](https://arxiv.org/abs/2510.05491) 
+* [NorMuon](https://arxiv.org/abs/2510.05491)
+* [MuonSphere](https://arxiv.org/abs/2601.08393) — Muon with a per-step retraction of weights onto the spectral sphere. The lambda=0 variant of Spectral Sphere Optimizer (SSO) by Xie et al.
 
 
 ## Table of Contents
