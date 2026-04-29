@@ -11,6 +11,15 @@ from .megabatch_base import DistributedOrthoBase, megabatch_orthogonalize_async
 from .opt_utils import AsyncTask, to_local
 from .muon import adjust_lr_spectral_norm, adjust_lr_rms_norm
 
+# Prefer MAGMA over cusolver. Some CUDA images ship a cusolver stub that
+# raises on cusolverDnCreate; MAGMA gives us a working GPU linalg path.
+# Best-effort: if MAGMA isn't available we leave the default and let
+# the per-call try/except in _aro_ortho_fn_impl fall back to CPU.
+try:
+    torch.backends.cuda.preferred_linalg_library("magma")
+except (RuntimeError, ValueError):
+    pass
+
 
 class ARO(DistributedOrthoBase):
     """
@@ -227,12 +236,15 @@ def aro_update_megabatch_async(
         cross = M_f32 @ f_rotated.mT
         del f_rotated, M_f32
 
-        # Phase 2: QR on GPU. CPU fallback was previously needed because
-        # torch.compile corrupted cusolver state on B200/CUDA 13.0; on the
-        # current image (CUDA 13.1) we attempt GPU QR for ~14x throughput
-        # improvement. If cusolver fails on this image, this will raise
-        # and we'll need to revert to .cpu() here.
-        Q, _ = torch.linalg.qr(cross)
+        # Phase 2: QR on GPU. Some images (e.g. NVIDIA vllm:nv25.12) ship
+        # a cusolver stub which fails with "Unknown cusolver error" on
+        # cusolverDnCreate. Switching to MAGMA avoids cusolver entirely.
+        # CPU fallback covers the case where neither backend works.
+        try:
+            Q, _ = torch.linalg.qr(cross)
+        except RuntimeError:
+            Q, _ = torch.linalg.qr(cross.cpu())
+            Q = Q.to(device=cross.device, dtype=cross.dtype)
         del cross
         R_new_holder[0] = Q
 
