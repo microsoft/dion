@@ -336,6 +336,52 @@ class TestMuonSphere:
                 p.grad = torch.randn_like(p)
             opt.step()
 
+    def test_4d_conv_flatten(self):
+        import math
+        from dion import MuonSphere
+        d_out, in_ch, kH, kW = 64, 32, 3, 3
+        d_in = in_ch * kH * kW
+        params = _make_params([(d_out, in_ch, kH, kW)])
+        _run_steps(MuonSphere, params, dict(lr=0.01, flatten=True), n_steps=5)
+        W = params[0].data.float().flatten(start_dim=1)
+        sigma = torch.linalg.matrix_norm(W, ord=2).item()
+        R = math.sqrt(d_out / d_in)
+        assert abs(sigma - R) / R < 0.05
+
+    def test_3d_flatten_batched(self):
+        import math
+        from dion import MuonSphere
+        params = _make_params([(2, 64, 128)])
+        _run_steps(MuonSphere, params, dict(lr=0.01, flatten=True), n_steps=5)
+        W = params[0].data.float().flatten(start_dim=1)
+        sigma = torch.linalg.matrix_norm(W, ord=2).item()
+        d_out, d_in = 2, 64 * 128
+        R = math.sqrt(d_out / d_in)
+        assert abs(sigma - R) / R < 0.05
+
+    def test_3d_no_flatten_rejected(self):
+        """3D+ params with ``flatten=False`` are rejected: per-matrix
+        retraction in a batch is not yet implemented."""
+        from dion import MuonSphere
+        params = _make_params([(2, 64, 128)])
+        opt = MuonSphere(params, lr=0.01, flatten=False)
+        params[0].grad = torch.randn_like(params[0])
+        with pytest.raises(NotImplementedError, match="flatten=False"):
+            opt.step()
+
+    def test_num_heads_rejected(self):
+        """``num_heads > 1`` is rejected: per-head retraction is not yet
+        implemented and the per-head LR scaling would be inconsistent with
+        a single whole-matrix retraction."""
+        from dion import MuonSphere
+        params = _make_params([(64, 128)])
+        opt = MuonSphere(
+            [{"params": params, "num_heads": 4}], lr=0.01
+        )
+        params[0].grad = torch.randn_like(params[0])
+        with pytest.raises(NotImplementedError, match="num_heads"):
+            opt.step()
+
 
 # ---------------------------------------------------------------------------
 # num_heads per-group option (per-head Newton-Schulz on 2D weights)

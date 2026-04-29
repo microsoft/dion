@@ -7,14 +7,9 @@ from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.optim.optimizer import ParamsT
 from typing import Callable, Generator, List, Optional, Tuple, Union
 
-from .megabatch_base import (
-    DistributedOrthoBase,
-    adjust_lr_rms_norm,
-    adjust_lr_spectral_norm,
-    megabatch_orthogonalize_async,
-)
-from .muon import muon_update_pre_orthogonalize, muon_update_post_orthogonalize
-from .opt_utils import AsyncTask, to_local
+from .megabatch_base import DistributedOrthoBase
+from .muon import muon_update_megabatch_async
+from .opt_utils import AsyncTask
 
 
 class MuonSphere(DistributedOrthoBase):
@@ -26,16 +21,17 @@ class MuonSphere(DistributedOrthoBase):
     the Spectral muP radius (Yang, Simon, Bernstein 2024). The update direction
     is the same Muon msign(M); the only changes are:
 
-    1. An init-time projection ``W <- R * W / ||W||_2`` on the first step.
-    2. A per-step retraction ``W <- W * R / sigma`` (where ``sigma`` is the
+    1. A per-step retraction ``W <- W * R / sigma`` (where ``sigma`` is the
        top singular value, estimated by warmstarted power iteration) before
-       the standard Muon update is applied.
-    3. A learning-rate scale of ``R = radius_scale * sqrt(d_out/d_in)`` on
+       the standard Muon update is applied. The first call doubles as the
+       init-time projection onto the sphere.
+    2. A learning-rate scale of ``R = radius_scale * sqrt(d_out/d_in)`` on
        the orthogonalized update (i.e. the existing ``adjust_lr=spectral_norm``
        scale, multiplied by ``radius_scale``).
-    4. Weight decay defaults to ``0`` (the retraction subsumes its role on
+    3. Weight decay defaults to ``0`` (the retraction subsumes its role on
        hidden 2D weights). Set ``weight_decay > 0`` only on params where you
-       want it.
+       want it. Weight decay is scaled by the unscaled ``lr``, not by
+       ``lr * radius_scale``.
 
     This is the lambda=0 ablation of the Spectral Sphere Optimizer (SSO) from
     Xie et al., "Controlled LLM Training on Spectral Sphere", arXiv:2601.08393.
@@ -43,6 +39,18 @@ class MuonSphere(DistributedOrthoBase):
     projection (h(lambda)=0 by bisection); MuonSphere drops that step in
     exchange for ~1% added latency over Muon (vs. ~11% for full SSO) while
     capturing most of the downstream-quality gain.
+
+    Supported parameter shapes:
+    - 2D matrices (the standard LLM linear-layer case).
+    - 3D+ tensors with ``flatten=True`` (e.g. conv weights), retracted as
+      a single 2D matrix of shape ``(d_out, prod(d_in...))``.
+
+    Not yet supported (raise ``NotImplementedError``):
+    - 3D+ tensors with ``flatten=False`` (per-matrix retraction in a batch
+      requires batched power iteration with replicated DTensor multipliers).
+    - ``num_heads > 1`` (per-head retraction needs sharding-aware power
+      iteration on the per-head view).
+    Both are natural follow-ups; the paper itself targets 2D LLM weights.
 
     Args:
         params: Parameters for the optimizer.
@@ -134,36 +142,14 @@ class MuonSphere(DistributedOrthoBase):
             newton_schulz_func=newton_schulz_func,
         )
 
-    def _get_or_initialize_state(self, param: Tensor, algo: str) -> dict:
-        state = super()._get_or_initialize_state(param, algo)
-        if algo == self._algo_name and "spectral_initialized" not in state:
-            # Random-vector warmstart for power iteration. The cache holds
-            # the GLOBAL (un-sharded) u, v vectors: each rank materializes
-            # the full ``W`` via ``DTensor.full_tensor()`` inside
-            # ``_power_iteration`` and runs the iteration locally, so the
-            # cache dimensions must match the global tensor shape, not the
-            # per-rank shard. ``param.shape`` is the global shape for both
-            # plain Tensor and DTensor.
-            d_out, d_in = param.shape[-2:]
-            local = param.to_local() if isinstance(param, DTensor) else param
-            generator = torch.Generator(device=local.device).manual_seed(0)
-            state["u_cache"] = torch.randn(
-                d_out, 1, device=local.device, dtype=torch.float32, generator=generator
-            )
-            state["v_cache"] = torch.randn(
-                d_in, 1, device=local.device, dtype=torch.float32, generator=generator
-            )
-            state["spectral_initialized"] = False
-        return state
-
     def _retract_to_sphere(self, group: dict) -> None:
         """Project each ``W`` in ``group`` onto the spectral sphere of
         radius ``R = radius_scale * sqrt(d_out / d_in)``.
 
         Done in-place on the parameter tensor before the Muon update is
         computed. Caches updated (u, v) singular vectors in optimizer state.
-        On the very first call per param, also runs the init projection
-        ``W <- R * W / ||W||_2`` (the paper's Algorithm 1 line 1).
+        On the very first call per param, the same rescale serves as the
+        init-time projection (paper Algorithm 1 line 1).
         """
         flatten = group["flatten"]
         radius_scale = group["radius_scale"]
@@ -173,8 +159,32 @@ class MuonSphere(DistributedOrthoBase):
                 continue
             if p.ndim < 2:
                 continue
+            if not flatten and p.ndim > 2:
+                raise NotImplementedError(
+                    f"MuonSphere does not yet support {p.ndim}D parameters with "
+                    f"flatten=False (got shape {tuple(p.shape)}). Per-matrix "
+                    f"retraction in a batch requires batched power iteration "
+                    f"with replicated DTensor multipliers; pass flatten=True "
+                    f"to retract as a single 2D view, or split the batch into "
+                    f"separate 2D parameters."
+                )
             state = self._get_or_initialize_state(p, self._algo_name)
             d_out, d_in = _spectral_shape(p.shape, flatten=flatten)
+            if "u_cache" not in state:
+                # Random-vector warmstart for power iteration. The cache holds
+                # the GLOBAL (un-sharded) u, v vectors: each rank materializes
+                # the full ``W`` via ``DTensor.full_tensor()`` inside
+                # ``_power_iteration`` and runs the iteration locally, so the
+                # cache dimensions must match the global, post-flatten matrix
+                # shape.
+                local = p.to_local() if isinstance(p, DTensor) else p
+                generator = torch.Generator(device=local.device).manual_seed(0)
+                state["u_cache"] = torch.randn(
+                    d_out, 1, device=local.device, dtype=torch.float32, generator=generator
+                )
+                state["v_cache"] = torch.randn(
+                    d_in, 1, device=local.device, dtype=torch.float32, generator=generator
+                )
             R = radius_scale * math.sqrt(d_out / d_in)
 
             sigma, u, v = _power_iteration(
@@ -186,19 +196,7 @@ class MuonSphere(DistributedOrthoBase):
             )
             state["u_cache"].copy_(u)
             state["v_cache"].copy_(v)
-
-            if not state["spectral_initialized"]:
-                # First-step projection onto the sphere (paper Algorithm 1
-                # line 1): the cached u, v are random, so we don't trust the
-                # current sigma direction; instead just rescale by the
-                # Frobenius-derived spectral estimate from one extra iter.
-                sigma = sigma.clamp(min=p.new_tensor(1e-12))
-                p.mul_(R / sigma)
-                state["spectral_initialized"] = True
-            else:
-                # Subsequent retractions: rescale to keep ||W||_2 = R.
-                sigma = sigma.clamp(min=p.new_tensor(1e-12))
-                p.mul_(R / sigma)
+            p.mul_(R / sigma.clamp(min=1e-12))
 
     def _create_ortho_tasks(
         self, param_groups: List[dict]
@@ -213,16 +211,24 @@ class MuonSphere(DistributedOrthoBase):
             if not group_params:
                 continue
 
+            num_heads = self._resolve_num_heads(group)
+            if num_heads is not None:
+                raise NotImplementedError(
+                    "MuonSphere does not yet support num_heads > 1: per-head "
+                    "retraction needs sharding-aware power iteration on the "
+                    "per-head view. Use Muon for num_heads splits or drop the "
+                    "num_heads option."
+                )
+
             # Retract every param in this group onto the spectral sphere
             # before computing the orthogonalized update. This is the only
             # thing MuonSphere does beyond standard Muon.
             self._retract_to_sphere(group)
 
-            # The remaining flow mirrors Muon._create_ortho_tasks. We compute
-            # an effective LR equal to ``lr * radius_scale``: the existing
-            # adjust_lr=spectral_norm path already multiplies by
-            # sqrt(fan_out/fan_in), and combining with radius_scale gives
-            # the full ``R = radius_scale * sqrt(fan_out/fan_in)`` paper scale.
+            # We thread two LRs into the shared muon helper: ``lr`` carries
+            # the radius_scale (so the post-orthogonalize update is scaled by
+            # ``R = radius_scale * sqrt(fan_out/fan_in)`` after adjust_lr),
+            # and ``base_lr`` is the unscaled lr used for weight decay.
             update_args = dict(
                 lr=torch.tensor(group["lr"] * group["radius_scale"]),
                 base_lr=torch.tensor(group["lr"]),
@@ -244,8 +250,6 @@ class MuonSphere(DistributedOrthoBase):
                 sharding = p.placements if isinstance(p, DTensor) else None
                 shape_groups[(p.shape, sharding, p.dtype)].append(p)
 
-            num_heads = self._resolve_num_heads(group)
-
             for (_shape, _sharding, _dtype), params in shape_groups.items():
                 gradients = [p.grad for p in params]
                 states = [
@@ -253,23 +257,16 @@ class MuonSphere(DistributedOrthoBase):
                 ]
                 momentums = [s["momentum"] for s in states]
 
-                if num_heads is not None:
-                    params, gradients, momentums = self._prepare_head_split(
-                        num_heads, params, gradients, momentums
-                    )
+                is_batch_sharded, is_matrix_sharded, sharded_tensor_dim = (
+                    self._get_shard_info(params[0], group)
+                )
+                megabatch_args = update_args
+                if is_batch_sharded and not is_matrix_sharded:
                     megabatch_args = {**update_args, "process_group": None}
-                    shard_dim = None
-                else:
-                    is_batch_sharded, is_matrix_sharded, sharded_tensor_dim = (
-                        self._get_shard_info(params[0], group)
-                    )
-                    megabatch_args = update_args
-                    if is_batch_sharded and not is_matrix_sharded:
-                        megabatch_args = {**update_args, "process_group": None}
-                    shard_dim = sharded_tensor_dim
+                shard_dim = sharded_tensor_dim
 
                 yield AsyncTask(
-                    muon_sphere_update_megabatch_async(
+                    muon_update_megabatch_async(
                         X=params,
                         G=gradients,
                         M=momentums,
@@ -279,73 +276,6 @@ class MuonSphere(DistributedOrthoBase):
                 )
 
 
-def muon_sphere_update_megabatch_async(
-    X: List[Tensor],
-    G: List[Tensor],
-    M: List[Tensor],
-    lr: Tensor,         # already includes radius_scale
-    base_lr: Tensor,    # for weight_decay scaling, matches Muon's base_lr
-    momentum: Tensor,
-    weight_decay: Tensor,
-    epsilon: Tensor,
-    nesterov: bool,
-    flatten: bool,
-    adjust_lr: Optional[str],
-    device_rank: int,
-    world_size: int,
-    shard_dim: Optional[int] = None,
-    process_group: Optional[ProcessGroup] = None,
-    newton_schulz_func: Optional[Callable] = None,
-    cautious_wd: bool = False,
-) -> Generator[None, None, None]:
-    """Identical to ``muon_update_megabatch_async`` except that ``lr`` is
-    pre-multiplied by ``radius_scale`` so the post-orthogonalize update is
-    scaled by ``R = radius_scale * sqrt(fan_out/fan_in)`` rather than just
-    ``sqrt(fan_out/fan_in)``.
-
-    The retraction step happens before this function is called (in
-    ``MuonSphere._create_ortho_tasks._retract_to_sphere``); by the time we
-    get here, ``X`` is already on the spectral sphere.
-    """
-    N = len(X)
-    assert N == len(G) == len(M)
-
-    U = muon_update_pre_orthogonalize(
-        G=to_local(G), M=to_local(M), momentum=momentum, nesterov=nesterov,
-    )
-
-    comm_dim = (shard_dim - X[0].ndim) if shard_dim is not None else None
-
-    U = yield from megabatch_orthogonalize_async(
-        U,
-        comm_dim=comm_dim,
-        device_rank=device_rank,
-        world_size=world_size,
-        process_group=process_group,
-        newton_schulz_func=newton_schulz_func,
-        flatten=flatten,
-        epsilon=epsilon,
-    )
-
-    if adjust_lr is None:
-        adjusted_lr = lr
-    elif adjust_lr == "spectral_norm":
-        adjusted_lr = adjust_lr_spectral_norm(lr, X[0].shape, flatten=flatten)
-    elif adjust_lr == "rms_norm":
-        adjusted_lr = adjust_lr_rms_norm(lr, X[0].shape, flatten=flatten)
-    else:
-        raise ValueError(f"Unknown adjust_lr value: {adjust_lr}")
-
-    muon_update_post_orthogonalize(
-        X=to_local(X),
-        U=U,
-        base_lr=base_lr,
-        adjusted_lr=adjusted_lr,
-        weight_decay=weight_decay,
-        cautious_wd=cautious_wd,
-    )
-
-
 def _spectral_shape(shape: torch.Size, flatten: bool) -> Tuple[int, int]:
     """Return ``(d_out, d_in)`` used for the spectral-norm retraction.
 
@@ -353,22 +283,8 @@ def _spectral_shape(shape: torch.Size, flatten: bool) -> Tuple[int, int]:
     ``megabatch_base.py``.
     """
     if flatten and len(shape) >= 3:
-        return shape[0], int(torch.tensor(list(shape[1:])).prod().item())
+        return shape[0], math.prod(shape[1:])
     return shape[-2], shape[-1]
-
-
-def _flatten_for_spectral(W: Tensor, flatten: bool) -> Tensor:
-    """Flatten a >=3D tensor into 2D for power iteration, matching the
-    ``flatten`` semantics used by the rest of dion."""
-    if flatten and W.ndim >= 3:
-        return W.flatten(start_dim=1)
-    if W.ndim >= 3:
-        # Treat as a batch of 2D matrices: power-iterate each independently
-        # by collapsing the leading batch dims into a single dim. We only
-        # need ||W||_2 per matrix here. Callers that hit this path get a
-        # batched (sigma, u, v).
-        return W.reshape(-1, W.shape[-2], W.shape[-1])
-    return W
 
 
 def _power_iteration(
@@ -386,25 +302,27 @@ def _power_iteration(
     O(numel(W) * 2 bytes) and is dominated by the existing Muon all-to-alls;
     a sharded power iteration is a natural follow-up.
 
-    Returns ``(sigma, u, v)`` all in fp32.
+    Returns ``(sigma, u, v)`` all in fp32. ``sigma`` is a 0-d tensor;
+    ``u`` is ``(d_out, 1)`` and ``v`` is ``(d_in, 1)``, matching
+    ``_spectral_shape(W.shape, flatten)``.
 
-    Caveat: only the 2D path is supported. 3D+ params are flattened or
-    treated as batches; in either case we return the spectral norm of the
-    flattened/first matrix, which is sufficient for the retraction
-    multiplier on a uniformly-sized batch.
+    Only the 2D path (post-flatten) is supported; ``_retract_to_sphere``
+    rejects 3D+ params with ``flatten=False`` upstream.
     """
     W_full = W.full_tensor() if isinstance(W, DTensor) else W
     W_full = W_full.detach().to(torch.float32)
-    W_2d = _flatten_for_spectral(W_full, flatten=flatten)
-    if W_2d.ndim == 3:
-        # Batch of matrices: pick the first as a representative for sigma.
-        # All matrices in this code path come from the same param-group
-        # shape bucket so they share scale.
-        W_2d = W_2d[0]
+    if flatten and W_full.ndim >= 3:
+        W_2d = W_full.flatten(start_dim=1)
+    else:
+        W_2d = W_full
+    assert W_2d.ndim == 2, (
+        f"_power_iteration expects a 2D matrix after flatten, got shape "
+        f"{tuple(W_2d.shape)}."
+    )
 
     u = u_init.to(torch.float32)
     v = v_init.to(torch.float32)
-    eps = W_2d.new_tensor(1e-12)
+    eps = 1e-12
 
     for _ in range(iters):
         u = W_2d @ v

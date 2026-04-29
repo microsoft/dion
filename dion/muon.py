@@ -186,10 +186,15 @@ def muon_update_megabatch_async(
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
     cautious_wd: bool = False,
+    base_lr: Optional[Tensor] = None,
 ) -> Generator[None, None, None]:
     """
     Mega-batched Muon update: processes ALL same-shape parameters in one
     communication round instead of world_size-sized batches.
+
+    ``base_lr`` is the LR used to scale weight decay. It defaults to ``lr``
+    (vanilla Muon). MuonSphere passes a separate ``base_lr`` so that the
+    radius-scaled ``lr`` does not also inflate weight decay.
     """
     N = len(X)
     assert N == len(G) == len(M)
@@ -228,7 +233,7 @@ def muon_update_megabatch_async(
     muon_update_post_orthogonalize(
         X=to_local(X),
         U=U,
-        base_lr=lr,
+        base_lr=base_lr if base_lr is not None else lr,
         adjusted_lr=adjusted_lr,
         weight_decay=weight_decay,
         cautious_wd=cautious_wd,
