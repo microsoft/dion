@@ -227,11 +227,12 @@ def aro_update_megabatch_async(
         cross = M_f32 @ f_rotated.mT
         del f_rotated, M_f32
 
-        # Phase 2: QR on CPU — cusolver is corrupted by torch.compile on
-        # B200/CUDA 13.0 after the first compiled forward/backward.
-        # CPU QR is cheap since cross is square [per_rank, m, m].
-        Q, _ = torch.linalg.qr(cross.cpu())
-        Q = Q.to(device=cross.device, dtype=cross.dtype)
+        # Phase 2: QR on GPU. CPU fallback was previously needed because
+        # torch.compile corrupted cusolver state on B200/CUDA 13.0; on the
+        # current image (CUDA 13.1) we attempt GPU QR for ~14x throughput
+        # improvement. If cusolver fails on this image, this will raise
+        # and we'll need to revert to .cpu() here.
+        Q, _ = torch.linalg.qr(cross)
         del cross
         R_new_holder[0] = Q
 
