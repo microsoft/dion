@@ -31,7 +31,7 @@ You can find the following optimizers:
 1. [Experimental Features](#experimental-features)
    * [Mixed Precision Dion](#mixed-precision-dion)
    * [Accelerating Optimization Step for Lower Ranks](#accelerating-optimization-step-for-lower-ranks)
-   * [Triton Kernels for Muon Newton-Schulz](#triton-kernels-for-muon-newton-schulz)
+   * [Accelerated Newton-Schulz Kernels](#accelerated-newton-schulz-kernels)
 1. [Citation](#citation)
 
 </details>
@@ -501,11 +501,29 @@ optimizer = Dion(
 )
 ```
  
-### Triton Kernels for Muon Newton-Schulz
+### Accelerated Newton-Schulz Kernels
 
-Muon's Newton-Schulz iteration involves multiplying a matrix by its own transpose. The result is symmetric, so we can accelerate this computation by only computing half of the output and mirroring the result across the diagonal. We implemented this technique with Triton kernels in `optimizers/newton_schulz_triton.py`.
+Orthogonalization in Muon, NorMuon, and Dion2 is handled by the [`gram-newton-schulz`](https://pypi.org/project/gram-newton-schulz/) package. This package supports two algorithm variants, controlled by `use_gram_newton_schulz`:
 
-Triton kernels can be enabled in Muon with the option `use_triton=True`. Note that compiling and tuning the kernels may take several minutes when it is first run.
+- `use_gram_newton_schulz=True` (default): Uses the **Gram Newton-Schulz** algorithm, which operates on the Gram matrix for improved efficiency.
+- `use_gram_newton_schulz=False`: Uses the **standard Newton-Schulz** iteration.
+
+Both variants are implemented by the same `gram-newton-schulz` backend — the flag only selects which algorithm is used, not the backend itself.
+
+To enable the accelerated [Quack (CuTeDSL)](https://github.com/Dao-AILab/quack) kernels, which exploit the symmetry of the Newton-Schulz iteration to compute only half of the output, pass `ns_use_kernels=True`:
+
+```python
+optimizer = Muon(model.parameters(), lr=0.02, ns_use_kernels=True)
+```
+
+Or from the CLI:
+
+```bash
+torchrun ... train.py --config configs/muon_160m.yaml  # kernels on by default
+torchrun ... train.py --config configs/muon_160m.yaml --no_kernels  # disable kernels
+```
+
+**Note:** The Quack kernels require an Ampere or newer GPU (compute capability ≥ 8.0). Compiling the kernels may take several minutes on the first run.
 
 
 # Citation 

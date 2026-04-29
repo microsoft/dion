@@ -40,7 +40,8 @@ class NorMuon(DistributedOrthoBase):
         flatten: Whether to flatten 3D+ tensors to 2D for Muon updates.
             True: Tensors with 3+ dimensions are flattened to 2D. Use this for convolutional layers.
             False: Tensors are not flattened. 3D+ tensors are treated as batches of 2D matrices.
-        use_gram_newton_schulz: Whether to use Gram Newton-Schulz for orthogonalization.
+        use_gram_newton_schulz: Toggle between the Gram Newton-Schulz algorithm (True) and standard
+            Newton-Schulz (False). Both paths use the gram-newton-schulz package; this only controls which algorithm variant is used.        
         ns_use_kernels: Whether to use Quack (CuTeDSL) kernels for Newton-Schulz. Ignored if custom `newton_schulz_func` is provided.
         newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
             Signature is ``func(input: Tensor, epsilon: float) -> Tensor``.
