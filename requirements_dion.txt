@@ -1,3 +1,3 @@
 numpy
 torch>=2.7.1
-gram-newton-schulz==0.1.2
+gram-newton-schulz @ git+https://github.com/Dao-AILab/gram-newton-schulz@2763e8b
