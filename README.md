@@ -3,6 +3,7 @@
 This repository provides efficient implementations of orthonormal optimizers for distributed ML training.
 You can find the following optimizers:
 * [Muon](https://kellerjordan.github.io/posts/muon/)
+* [MuonH](https://tinyurl.com/muonh)
 * [Dion2](https://arxiv.org/abs/2512.16928) and [Dion](https://arxiv.org/pdf/2504.05295) (Dion is a legacy optimizer; we recommend using Dion2)
 * [NorMuon](https://arxiv.org/abs/2510.05491) 
 
@@ -15,6 +16,7 @@ You can find the following optimizers:
 1. [Quick Start](#-quick-start)
 1. [Introduction](#introduction)
 1. [Optimizers](#optimizers)
+   * [MuonH](#muonh)
 1. [Building Parameter Groups](#building-parameter-groups)
    * [Example Code](#example-code)
    * [Per-Head Newton-Schulz for Attention Projections](#per-head-newton-schulz-for-attention-projections)
@@ -53,7 +55,7 @@ pip install git+https://github.com/microsoft/dion.git
 Then in your code, you can use:
 
 ```python
-from dion import Dion2, Muon, NorMuon, Dion
+from dion import Dion2, Muon, MuonH, NorMuon, Dion
 ```
 
 Please carefully go through this readme for detailed instructions on using our optimizers. There are major differences compared to PyTorch built-in optimizers, such as `Adam`/`AdamW`.
@@ -146,12 +148,12 @@ The practical effectiveness of orthonormal optimizers was first demonstrated by 
 
 Our current implementations support the following parallelization techniques:
 
-| Parallelization    | Dion | Dion2 | Muon | NorMuon |
-|--------------------|------|-------|------|---------| 
-| Single device      | Yes  |  Yes  | Yes  |   Yes   |
-| PyTorch DDP        | Yes  |  Yes  | Yes  |   Yes   |
-| PyTorch FSDP2      | Yes  |  Yes  | Yes  |   Yes   |
-| PyTorch FSDP2 + TP | Yes  |  No   | No   |   No    |
+| Parallelization    | Dion | Dion2 | Muon | MuonH | NorMuon |
+|--------------------|------|-------|------|-------|---------| 
+| Single device      | Yes  |  Yes  | Yes  |  Yes  |   Yes   |
+| PyTorch DDP        | Yes  |  Yes  | Yes  |  Yes  |   Yes   |
+| PyTorch FSDP2      | Yes  |  Yes  | Yes  |  Yes  |   Yes   |
+| PyTorch FSDP2 + TP | Yes  |  No   | No   |   No  |   No    |
 
 For faster performance, these optimizers will process parameters in batches and interleave multiple batches to overlap compute with communication.
 
@@ -159,8 +161,33 @@ We include optimizer implementations in the `dion/` directory of this repo.
  
 * `dion.py`: High-performance version of Dion. Depending on how each batch of matrices is sharded, we select the best communication patterns to compute Dion's orthonormal update. All-reduce operations may be split into reduce-scatter and all-gather across the batch dimension to more efficiently distribute work and avoid redundant computation.
 * `muon.py`: High-performance version of Muon. For sharded matrices, all-to-all communication is used to simultaneously unshard and distribute a batch of matrices. For replicated matrices, Muon will distribute work across all devices and all-gather final results.
+* `muonh.py`: Muon with a hyperball update. After Newton-Schulz orthonormalization (and optional update normalization), each matrix update is scaled relative to that matrix's Frobenius norm and projected back to its initial Frobenius norm.
 * **`dion2.py`**: High-performance implementation of Dion2, using a similar all-to-all communication pattern for distributed orthonormalization. Only an α-fraction of the momentum matrix is communicated and orthonormalized, significantly reducing both communication overhead and computation cost.
 * `normuon.py`: A variant of the Muon optimizer that introduces neuron-wise normalization to improve stability and convergence efficiency, modified to take similar arguments as `muon.py`. See [the paper](https://arxiv.org/abs/2510.05491) for more details.
+
+### MuonH
+
+MuonH combines Muon's momentum + Newton-Schulz direction with a hyperball projection step. Conceptually, the optimizer keeps each matrix parameter on a Frobenius sphere: after forming the Muon-style update direction, MuonH moves along that direction and projects back to the matrix's initial Frobenius norm. This implementation follows [Fantastic Pretraining Optimizers and Where to Find Them 2.1: Hyperball Optimization](https://tinyurl.com/muonh).
+
+Compared with Muon, MuonH has a few important usage constraints and semantics:
+
+* **Non-zero initialization is required.** MuonH initializes its hyperball radius from the parameter norm on the first optimizer step, so a zero-initialized matrix will raise an error.
+* **Hyperball state is per matrix.** For ordinary 2D weights this is one radius per parameter. For packed matrix tensors such as MoE expert weights of shape `(n_experts, d_out, d_in)`, MuonH treats each trailing 2D matrix independently when `flatten=False`, so each expert gets its own momentum / normalization / hyperball radius.
+* **`flatten=False` is the right mode for packed experts.** A tensor of shape `(..., d_out, d_in)` is treated as a batch of matrices. This is the intended mode for MoE expert MLP weights and other native 3D matrix batches.
+* **`flatten=True` changes the semantics.** With `flatten=True`, MuonH flattens the parameter to one 2D matrix before orthonormalization and hyperball projection. Use this for convolution kernels only when you explicitly want the whole tensor treated as one matrix.
+* **`num_heads` is not supported.** MuonH deliberately rejects `num_heads > 1`. If you want per-head MuonH behavior, represent heads as explicit matrices, e.g. a native 3D tensor of shape `(num_heads, head_dim, in_features)` or separate `Parameter`s.
+* **Optional normalization matches NorMuon-style update normalization.** `normalization=None` disables it, `normalization="neuron"` normalizes along the last dimension, and `normalization="short_axis"` normalizes along the shorter matrix axis.
+* **Matrix params do not use decoupled weight decay.** As with Muon, embeddings, LM heads, biases, and normalization parameters should remain on AdamW or Lion parameter groups.
+
+Example:
+
+```python
+optimizer = MuonH(
+    param_groups,
+    lr=0.01,
+    normalization="short_axis",
+)
+```
 
 We also provide some reference implementations:
 
@@ -172,17 +199,19 @@ We also provide some reference implementations:
 
 ## Building Parameter Groups
 
-Unlike typical PyTorch optimizers (e.g. `Adam`/`AdamW`), Dion and Muon require separating your model's parameters into different groups (same in spirit as [Modula](https://docs.modula.systems/)). These orthonormal optimization algorithms are only applicable to two-dimensional matrix weights. Non-matrix parameters require a different scalar optimizer algorithm (element-wise updates) and may also use a different learning rate. We currently support Lion and AdamW.
+Unlike typical PyTorch optimizers (e.g. `Adam`/`AdamW`), Dion and the Muon-family optimizers require separating your model's parameters into different groups (same in spirit as [Modula](https://docs.modula.systems/)). These orthonormal optimization algorithms are intended for matrix weights. For Muon, MuonH, and NorMuon, a parameter with shape `(..., d_out, d_in)` may also be treated as a batch of matrices when that matches the model semantics. Non-matrix parameters require a different scalar optimizer algorithm (element-wise updates) and may also use a different learning rate. We currently support Lion and AdamW.
 
 The details of parameter grouping are dependent on model architecture and implementation. Therefore, we leave it up to you to categorize your model's parameters and create the necessary parameter groups.
 
-* In transformer models and many other neural networks, most parameters are `nn.Linear` layers with two-dimensional weight matrices. These parameters should use Dion or Muon. A shape-dependent learning rate scale factor will be automatically applied for each matrix.
+* In transformer models and many other neural networks, most parameters are `nn.Linear` layers with two-dimensional weight matrices. These parameters should use Dion, Muon, MuonH, or NorMuon. A shape-dependent learning rate scale factor will be automatically applied for each matrix.
 * Biases in `nn.Linear` layers (if used) are one-dimensional vectors, which must be placed into a separate parameter group from the weight matrices. Use Lion or AdamW.
 * Normalization layers (e.g. `nn.LayerNorm`, `nn.RMSNorm`) may contain vectors of learnable weights. Use Lion or AdamW.
 * Embedding layers (e.g. `nn.Embedding`) are stored as 2D tensors, but should be treated as a collection of 1D vectors using Lion or AdamW. (Warning: using Dion here will run without error, but will give poor performance.)
 * Unembedding layers (e.g. LM head) are typically implemented as a `nn.Linear` layer, but shoud also be treated as a collection of 1D vectors. Furthermore, they should use a **smaller scaled learning rate**. It is very important to manually identify this layer and place it into its own parameter group, as it is otherwise indistinguishable from weight matrices!
 (Warning: using Dion here will run without error, but will give poor performance.)
-* Convolution layers typically use parameter tensors with 3+ dimensions. These are currently not supported for Dion. Support for convolution layers in Muon is experimental, and can be enabled with the option `flatten=True` to automatically flatten them to 2D matrices when computing the optimizer update.
+* Packed expert weights such as MoE MLP parameters with shape `(n_experts, d_out, d_in)` are a natural fit for Muon, MuonH, and NorMuon with `flatten=False`, since each expert is treated as an independent matrix.
+* Convolution layers typically use parameter tensors with 3+ dimensions. These are currently not supported for Dion. Support for convolution layers in Muon-family optimizers is experimental and generally requires `flatten=True` so the whole kernel tensor is treated as one 2D matrix.
+* MuonH requires non-zero matrix initialization. Do not assign zero-initialized output projections or other zero-initialized matrices to MuonH.
 
 We summarize the above in this table. Let `d_in` be the input dimension of the unembedding layer. In transformer language models, this is the base dimension of the model.
 
@@ -258,15 +287,15 @@ param_groups = [
 
 When `num_heads > 1`, the optimizer views each 2D weight as a batch of `num_heads` matrices of shape `(head_dim, in_features)` internally. The learning-rate adjustment (`spectral_norm` / `rms_norm`) is computed per-head, and Newton-Schulz runs on each head independently. With FSDP, sharding dim 0 along head boundaries (i.e. `num_heads % world_size == 0`) avoids the all-to-all that would otherwise be needed to assemble the fused matrix before NS.
 
-Requirements: the parameter must be 2D, `num_heads` must divide dim 0, and when using FSDP it must also divide the world size. Place Q / K / V / gate projections in one group (axis-0 heads); O-projection heads are on axis 1 and are not covered by this option.
+Requirements: the parameter must be 2D, `num_heads` must divide dim 0, and when using FSDP it must also divide the world size. Place Q / K / V / gate projections in one group (axis-0 heads); O-projection heads are on axis 1 and are not covered by this option. MuonH does not implement this option; use an explicit 3D parameter or separate Parameters if you want per-head MuonH behavior.
 
 ## Distributed Training Configuration
 
 For our efficient distributed optimizers to work correctly, they need information about the model's parallelization scheme. This is provided by passing `DeviceMesh` objects during optimizer construction.
 
-### 1D Sharding Configuration (Dion2, Muon, NorMuon)
+### 1D Sharding Configuration (Dion2, Muon, MuonH, NorMuon)
 
-Most optimizers in this codebase (Dion2, Muon, NorMuon) currently support only 1D sharding. They accept a single 1D device mesh via the `distributed_mesh` argument and adapt their behavior based on how this mesh is used:
+Most optimizers in this codebase (Dion2, Muon, MuonH, NorMuon) currently support only 1D sharding. They accept a single 1D device mesh via the `distributed_mesh` argument and adapt their behavior based on how this mesh is used:
 
 - **If the mesh is used for parameter sharding**: The optimizer efficiently unshards parameters using all-to-all communication
 - **If the mesh is not used for sharding**: The optimizer distributes work across devices and all-gathers the final results
@@ -285,7 +314,7 @@ mesh = init_device_mesh(
 fully_shard(model, mesh=mesh)
 
 # Pass only the sharded dimension to the optimizer
-optimizer = Dion2(                     # or Muon or NorMuon
+optimizer = Dion2(                     # or Muon or MuonH or NorMuon
     param_groups,
     distributed_mesh=mesh["shard"],    # 1D sub-mesh (sharded dimension only)
     ...
@@ -308,7 +337,7 @@ mesh = init_device_mesh(
 fs_mesh = mesh["dp", "cp"]._flatten()
 fully_shard(model, mesh=fs_mesh)
 
-optimizer = Dion2(                  # or Muon or NorMuon
+optimizer = Dion2(                  # or Muon or MuonH or NorMuon
     param_groups,
     distributed_mesh = fs_mesh,     # Sharded data parallel across flattened mesh 
     ...
@@ -322,7 +351,7 @@ Training with DistributedDataParallel (DDP) is also supported. DDP uses PyTorch 
 ```python
 ddp_model = DistributedDataParallel(model, ...)
 
-optimizer = Dion2(                              # or Muon or NorMuon
+optimizer = Dion2(                              # or Muon or MuonH or NorMuon
     param_groups,
     distributed_mesh=ddp_model.process_group,
     ...
@@ -363,6 +392,7 @@ optimizer = Dion(
 * **2D sharding:** If weights are sharded with both FSDP and TP, it is required that the sharding methods are applied to different matrix dimensions. The TP sharding dimension is controlled via `RowwiseParallel` and `ColwiseParallel`, but the FSDP sharding dimension needs to be manually specified when applied on top of TP. See `models/gpt_model.py` for an example of explicitly providing `fully_shard()` with per-parameter shard dimensions. Double-sharded matrices along the same dimension will raise an error in Dion.
 * **Learning rate scaling:** Dion will automatically scale the provided learning rate by `sqrt(d_out / d_in)` for matrix parameters. Muon will apply the same scaling by default, but also supports the `0.2 * sqrt(max(d_in, d_out))` scale factor recommended by Moonshot AI. Our default scale factor is intended to induce a consistent change to activation vector values, which enables learning rate transfer across model size. See [Deriving Muon](https://jeremybernste.in/writing/deriving-muon) for more information.
 * **Nesterov momentum:** In Muon, we set Nesterov momentum to `False` by default, as we observed better performance without it. Dion does not implement Nesterov momentum.
+* **MuonH initialization and batching:** MuonH requires non-zero matrix initialization. For packed expert tensors such as `(n_experts, d_out, d_in)`, keep `flatten=False` so each expert is treated as its own matrix. For convolution kernels, `flatten=True` is usually the only sensible MuonH mode.
 
 
 ## Other Features

@@ -3,6 +3,7 @@ from .dion import DionMixedPrecisionConfig
 from .dion_simple import Dion as DionSimple
 from .dion_reference import Dion as DionReference
 from .muon import Muon
+from .muonh import MuonH
 from .muon_reference import Muon as MuonReference
 from .dion2 import Dion2
 from .normuon import NorMuon

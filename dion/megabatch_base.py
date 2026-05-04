@@ -19,6 +19,36 @@ from .opt_utils import AsyncRuntime, AsyncTask, to_local
 from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
 
 
+def canonical_normalization(
+    normalization: Optional[str],
+    allow_none: bool = False,
+) -> Optional[str]:
+    """Validate and canonicalize an update-normalization mode string.
+
+    Accepts ``'neuron'``/``'short_axis'`` (case-insensitive). When
+    ``allow_none=True``, also accepts ``None`` and the string ``'None'``,
+    returning Python ``None`` for both. Raises ``ValueError`` otherwise.
+    """
+    if normalization is None or (
+        isinstance(normalization, str) and normalization.lower() == "none"
+    ):
+        if allow_none:
+            return None
+        raise ValueError(
+            f"Invalid normalization: {normalization}. Must be 'neuron' or 'short_axis'."
+        )
+    if isinstance(normalization, str):
+        value = normalization.lower()
+        if value in ("neuron", "short_axis"):
+            return value
+    valid = (
+        "None, 'None', 'neuron', or 'short_axis'"
+        if allow_none
+        else "'neuron' or 'short_axis'"
+    )
+    raise ValueError(f"Invalid normalization: {normalization}. Must be {valid}.")
+
+
 class DistributedOrthoBase(Optimizer):
     """
     Shared base class for distributed orthogonalization optimizers (NorMuon, Dion2).
