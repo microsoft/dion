@@ -392,6 +392,29 @@ def megabatch_orthogonalize_async(
 
     if comm_dim is not None and process_group is not None:
         # --- Mega-batched sharded FSDP2 path ---
+
+        # Pad each rank's local shard along comm_dim to a rank-consistent
+        # ``padded_local_size`` so dist.all_to_all sees uniform per-pair
+        # sizes. FSDP2 contiguous chunking otherwise leaves some ranks with
+        # empty (numel=0) shards when the sharded global dim is smaller than
+        # world_size or doesn't divide evenly to fill all ranks (e.g. shape
+        # (18, D) over world_size=8: ranks 6 and 7 hold (0, D) shards). Without
+        # padding the alltoall has mismatched per-pair sizes and hangs.
+        # Newton-Schulz preserves zero rows (they contribute nothing to U^T U),
+        # so padding doesn't change the orthogonalization of the real rows.
+        original_local_size = U_work[0].size(comm_dim)
+        local_size_t = torch.tensor(
+            [original_local_size], device=U_work[0].device, dtype=torch.long
+        )
+        dist.all_reduce(local_size_t, op=dist.ReduceOp.MAX, group=process_group)
+        padded_local_size = int(local_size_t.item())
+
+        if padded_local_size != original_local_size:
+            # F.pad's pad-spec is built from the LAST dim backwards. comm_dim
+            # is negative; pad only the END of comm_dim.
+            pad_spec = [0, 0] * (-comm_dim - 1) + [0, padded_local_size - original_local_size]
+            U_work = [torch.nn.functional.pad(u, pad_spec) for u in U_work]
+
         input_chunks = [
             torch.stack(U_work[r * per_rank : (r + 1) * per_rank])
             for r in range(world_size)
@@ -425,7 +448,13 @@ def megabatch_orthogonalize_async(
         yield
         work.wait()
 
-        result = [recv_chunks[r][i] for r in range(world_size) for i in range(per_rank)]
+        # Narrow each per-rank result back to the rank's original local size.
+        # On padding-only ranks original_local_size == 0 and the slice is empty.
+        result = [
+            recv_chunks[r][i].narrow(comm_dim, 0, original_local_size).contiguous()
+            for r in range(world_size)
+            for i in range(per_rank)
+        ]
         return result[:N]
 
     elif N > 1 and process_group is not None:
