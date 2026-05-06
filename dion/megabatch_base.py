@@ -358,7 +358,7 @@ def megabatch_orthogonalize_async(
     newton_schulz_func: Callable,
     flatten: bool,
     epsilon: Tensor,
-    global_comm_dim_size: Optional[int] = None,
+    global_comm_dim_size: Optional[int],
 ) -> Generator[None, None, List[Tensor]]:
     """
     Shared megabatch communication + Newton-Schulz orthogonalization.
@@ -379,10 +379,11 @@ def megabatch_orthogonalize_async(
         newton_schulz_func: Newton-Schulz orthogonalization function.
         flatten: Whether to flatten 3D+ tensors to 2D.
         epsilon: Small value for numerical stability.
-        global_comm_dim_size: Required when ``comm_dim is not None``. The
-            unsharded (global) size along ``comm_dim``, taken from the
-            DTensor's global shape (``param.shape[comm_dim]``). Used to
-            compute ``padded_local_size = ceil(global / world_size)`` so the
+        global_comm_dim_size: Required (non-None) when ``comm_dim is not
+            None``; pass ``None`` otherwise. The unsharded (global) size
+            along ``comm_dim``, taken from the DTensor's global shape
+            (``param.shape[comm_dim]``). Used to compute
+            ``padded_local_size = ceil(global / world_size)`` so the
             alltoall sees uniform per-pair sizes across ranks.
     """
     N = len(U)
@@ -413,18 +414,22 @@ def megabatch_orthogonalize_async(
         # NOTE: this assumes FSDP2-style contiguous chunking, where every rank
         # holds at most ceil(global / world_size) elements along comm_dim. If
         # FSDP2 ever switches to a non-contiguous strategy (e.g. block-cyclic),
-        # this derivation would be wrong; the assert below catches that case.
-        assert global_comm_dim_size is not None, (
-            "global_comm_dim_size must be passed when comm_dim is not None; "
-            "callers should pass the unsharded DTensor's global size along "
-            "comm_dim."
-        )
-        padded_local_size = -(-global_comm_dim_size // world_size)
+        # this derivation would be wrong; the size check below catches that.
+        if global_comm_dim_size is None:
+            raise ValueError(
+                "global_comm_dim_size must be passed when comm_dim is not "
+                "None; callers should pass the unsharded DTensor's global "
+                "size along comm_dim."
+            )
+        padded_local_size = (global_comm_dim_size + world_size - 1) // world_size
         original_local_size = U_work[0].size(comm_dim)
-        assert padded_local_size >= original_local_size, (
-            f"padded_local_size ({padded_local_size}) < this rank's local "
-            f"size ({original_local_size}); FSDP2 sharding assumption violated."
-        )
+        if padded_local_size < original_local_size:
+            raise RuntimeError(
+                f"padded_local_size ({padded_local_size}) < this rank's "
+                f"local size ({original_local_size}); FSDP2 contiguous-"
+                f"chunking assumption violated (global_comm_dim_size="
+                f"{global_comm_dim_size}, world_size={world_size})."
+            )
 
         if padded_local_size != original_local_size:
             # F.pad's pad-spec is built from the LAST dim backwards. comm_dim

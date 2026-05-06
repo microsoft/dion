@@ -111,3 +111,33 @@ def test_megabatch_orthogonalize_async_handles_empty_shards(global_dim_0, world_
         nprocs=world_size,
         join=True,
     )
+
+
+def test_megabatch_orthogonalize_async_requires_global_comm_dim_size():
+    # Pins the explicit-exception contract: the sharded branch must raise
+    # ValueError when global_comm_dim_size is omitted, not assert (which
+    # vanishes under ``python -O``). Uses a single-rank gloo PG so this
+    # runs CPU-only and stays out of the GPU test budget.
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29401")
+    already_init = dist.is_initialized()
+    if not already_init:
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+    try:
+        U = [torch.zeros(2, 4) for _ in range(4)]
+        gen = megabatch_orthogonalize_async(
+            U,
+            comm_dim=-2,
+            device_rank=0,
+            world_size=1,
+            process_group=dist.group.WORLD,
+            newton_schulz_func=_ns_func,
+            flatten=False,
+            epsilon=torch.tensor(1e-7),
+            global_comm_dim_size=None,
+        )
+        with pytest.raises(ValueError, match="global_comm_dim_size"):
+            next(gen)
+    finally:
+        if not already_init and dist.is_initialized():
+            dist.destroy_process_group()

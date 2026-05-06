@@ -229,10 +229,20 @@ def dion2_update_megabatch_async(
     # comm_dim for sharded communication: use select_dim (which equals normalized shard_dim)
     comm_dim = select_dim if is_sharded else None
 
-    # X[0] is still a DTensor here, so .shape[comm_dim] is the global
-    # (unsharded) size. The megabatch fn uses this to compute the rank-
-    # consistent pad size for its alltoall.
-    global_comm_dim_size = X[0].shape[comm_dim] if comm_dim is not None else None
+    # On the sharded path X[0] must still be a DTensor, so .shape[comm_dim]
+    # is the unsharded global size. The megabatch fn uses this to compute
+    # the rank-consistent pad size for its alltoall. Catch the case where a
+    # future refactor moves to_local(X) above this point and silently
+    # collapses .shape to the local size.
+    if comm_dim is not None:
+        if not isinstance(X[0], DTensor):
+            raise TypeError(
+                "Sharded path requires X[0] to be a DTensor so .shape gives "
+                f"the global size; got {type(X[0]).__name__}."
+            )
+        global_comm_dim_size = X[0].shape[comm_dim]
+    else:
+        global_comm_dim_size = None
 
     # Orthogonalize via shared megabatch communication
     U_ortho = yield from megabatch_orthogonalize_async(
