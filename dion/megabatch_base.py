@@ -358,6 +358,7 @@ def megabatch_orthogonalize_async(
     newton_schulz_func: Callable,
     flatten: bool,
     epsilon: Tensor,
+    global_comm_dim_size: Optional[int],
 ) -> Generator[None, None, List[Tensor]]:
     """
     Shared megabatch communication + Newton-Schulz orthogonalization.
@@ -378,6 +379,12 @@ def megabatch_orthogonalize_async(
         newton_schulz_func: Newton-Schulz orthogonalization function.
         flatten: Whether to flatten 3D+ tensors to 2D.
         epsilon: Small value for numerical stability.
+        global_comm_dim_size: Required (non-None) when ``comm_dim is not
+            None``; pass ``None`` otherwise. The unsharded (global) size
+            along ``comm_dim``, taken from the DTensor's global shape
+            (``param.shape[comm_dim]``). Used to compute
+            ``padded_local_size = ceil(global / world_size)`` so the
+            alltoall sees uniform per-pair sizes across ranks.
     """
     N = len(U)
 
@@ -392,6 +399,44 @@ def megabatch_orthogonalize_async(
 
     if comm_dim is not None and process_group is not None:
         # --- Mega-batched sharded FSDP2 path ---
+
+        # Pad each rank's local shard along comm_dim to a rank-consistent
+        # ``padded_local_size = ceil(global / world_size)`` so dist.all_to_all
+        # sees uniform per-pair sizes. FSDP2 contiguous chunking otherwise
+        # leaves some ranks with empty (numel=0) shards when the sharded
+        # global dim is smaller than world_size or doesn't divide evenly to
+        # fill all ranks (e.g. shape (18, D) over world_size=8: ranks 6 and 7
+        # hold (0, D) shards). Without padding the alltoall has mismatched
+        # per-pair sizes and hangs. Newton-Schulz preserves zero rows (they
+        # contribute nothing to U^T U), so padding doesn't change the
+        # orthogonalization of the real rows.
+        #
+        # NOTE: this assumes FSDP2-style contiguous chunking, where every rank
+        # holds at most ceil(global / world_size) elements along comm_dim. If
+        # FSDP2 ever switches to a non-contiguous strategy (e.g. block-cyclic),
+        # this derivation would be wrong; the size check below catches that.
+        if global_comm_dim_size is None:
+            raise ValueError(
+                "global_comm_dim_size must be passed when comm_dim is not "
+                "None; callers should pass the unsharded DTensor's global "
+                "size along comm_dim."
+            )
+        padded_local_size = (global_comm_dim_size + world_size - 1) // world_size
+        original_local_size = U_work[0].size(comm_dim)
+        if padded_local_size < original_local_size:
+            raise RuntimeError(
+                f"padded_local_size ({padded_local_size}) < this rank's "
+                f"local size ({original_local_size}); FSDP2 contiguous-"
+                f"chunking assumption violated (global_comm_dim_size="
+                f"{global_comm_dim_size}, world_size={world_size})."
+            )
+
+        if padded_local_size != original_local_size:
+            # F.pad's pad-spec is built from the LAST dim backwards. comm_dim
+            # is negative; pad only the END of comm_dim.
+            pad_spec = [0, 0] * (-comm_dim - 1) + [0, padded_local_size - original_local_size]
+            U_work = [torch.nn.functional.pad(u, pad_spec) for u in U_work]
+
         input_chunks = [
             torch.stack(U_work[r * per_rank : (r + 1) * per_rank])
             for r in range(world_size)
@@ -425,7 +470,13 @@ def megabatch_orthogonalize_async(
         yield
         work.wait()
 
-        result = [recv_chunks[r][i] for r in range(world_size) for i in range(per_rank)]
+        # Narrow each per-rank result back to the rank's original local size.
+        # On padding-only ranks original_local_size == 0 and the slice is empty.
+        result = [
+            recv_chunks[r][i].narrow(comm_dim, 0, original_local_size).contiguous()
+            for r in range(world_size)
+            for i in range(per_rank)
+        ]
         return result[:N]
 
     elif N > 1 and process_group is not None:
