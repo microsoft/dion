@@ -1,4 +1,7 @@
+import warnings
+
 import torch
+import torch.distributed as dist
 from collections import defaultdict
 from torch import Tensor
 from torch.distributed import ProcessGroup
@@ -44,6 +47,15 @@ class NorMuon(DistributedOrthoBase):
         use_triton: Whether to use Triton kernel for Newton-Schulz. Ignored if custom function is provided.
         newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
             Signature is ``func(input: Tensor, epsilon: float) -> Tensor``.
+        nan_guard_fallback: If True, after each megabatch Newton-Schulz call,
+            check for non-finite values in the orthogonalized update and skip
+            the update on all ranks if any rank sees one. Adds a single
+            ``all_reduce(MAX)`` of one byte per shape group per step when
+            enabled and the optimizer is distributed. Defensive guard for
+            issues like microsoft/dion#76 where a Newton-Schulz backend
+            intermittently produces NaNs; safer than letting the corrupt
+            update propagate into the parameter and poisoning the run.
+            Default ``False`` (no extra collective, no extra check).
 
     Muon optimizer algorithm by Keller Jordan: https://kellerjordan.github.io/posts/muon/
     FSDP2 Muon uses all-to-all communications: https://www.essential.ai/blog/infra
@@ -68,6 +80,7 @@ class NorMuon(DistributedOrthoBase):
         use_triton: bool = False,
         use_polar_express: bool = True,
         newton_schulz_func: Optional[Callable] = None,
+        nan_guard_fallback: bool = False,
     ):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -104,6 +117,7 @@ class NorMuon(DistributedOrthoBase):
             use_polar_express=use_polar_express,
             newton_schulz_func=newton_schulz_func,
         )
+        self._nan_guard_fallback = nan_guard_fallback
 
     def _get_or_initialize_state(self, param: Tensor, algo: str) -> dict:
         state = super()._get_or_initialize_state(param, algo)
@@ -152,6 +166,7 @@ class NorMuon(DistributedOrthoBase):
                 process_group=self._process_group,
                 newton_schulz_func=self._newton_schulz_func,
                 cautious_wd=group["cautious_wd"],
+                nan_guard_fallback=self._nan_guard_fallback,
             )
 
             shape_groups: dict[tuple, list] = defaultdict(list)
@@ -215,6 +230,7 @@ def normuon_update_megabatch_async(
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
     cautious_wd: bool = False,
+    nan_guard_fallback: bool = False,
 ) -> Generator[None, None, None]:
     """
     Mega-batched NorMuon update: processes ALL same-shape parameters in one
@@ -263,6 +279,33 @@ def normuon_update_megabatch_async(
     V_local = to_local(V)
     U_stacked = torch.stack(U)
     V_stacked = torch.stack(V_local)
+
+    if nan_guard_fallback:
+        # Defensive guard: if any rank's NS output went non-finite, all ranks
+        # must take the same fallback or DDP will diverge / a future
+        # collective will mismatch. Sync a single-byte ``ReduceOp.MAX`` flag
+        # across the process group, then on detection bail out of the rest
+        # of this step's update on all ranks. Skipping the post-ortho path
+        # (rather than zeroing U) keeps the variance buffer V and the param
+        # X strictly unchanged, so the run state is identical to "this batch
+        # never happened" for these params. Momentum M was already updated
+        # in pre-orthogonalize from the (clean) gradient and is left alone.
+        # Cost when triggered: one tiny allreduce + one device->host sync per
+        # shape group per step. Cost when off: a single Python branch.
+        local_nonfinite = (~torch.isfinite(U_stacked).all()).to(torch.uint8).reshape(1)
+        if process_group is not None:
+            dist.all_reduce(local_nonfinite, op=dist.ReduceOp.MAX, group=process_group)
+        if bool(local_nonfinite.item()):
+            if device_rank == 0:
+                warnings.warn(
+                    f"[NorMuon nan_guard_fallback] non-finite Newton-Schulz "
+                    f"output detected; skipping update for this step on all "
+                    f"ranks (shape={tuple(U_stacked.shape)}). See microsoft/"
+                    f"dion#76.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            return
     U_stacked, V_stacked = normuon_normalization_stacked(U_stacked, V_stacked, muon_beta2)
     for i in range(N):
         V_local[i].copy_(V_stacked[i])
