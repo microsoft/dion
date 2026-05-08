@@ -64,6 +64,7 @@ class Dion2(DistributedOrthoBase):
         use_gram_newton_schulz: bool = False,
         newton_schulz_func: Optional[Callable] = None,
         verbose: bool = False,
+        zero_mode: bool = False,
     ):
         # Validate hyperparameters
         if lr < 0.0:
@@ -100,6 +101,7 @@ class Dion2(DistributedOrthoBase):
             newton_schulz_func=newton_schulz_func,
         )
         self.verbose = verbose
+        self._zero_mode = zero_mode
 
     def _create_ortho_tasks(
         self, param_groups: List[dict]
@@ -131,6 +133,7 @@ class Dion2(DistributedOrthoBase):
                 process_group=self._process_group,
                 newton_schulz_func=self._newton_schulz_func,
                 verbose=self.verbose,
+                zero_mode=self._zero_mode,
             )
 
             shape_groups: dict[tuple, list] = defaultdict(list)
@@ -188,6 +191,7 @@ def dion2_update_megabatch_async(
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
     verbose: bool = False,
+    zero_mode: bool = False,
 ) -> Generator[None, None, None]:
     """
     Mega-batched Dion2 update: processes ALL same-shape parameters in one
@@ -218,13 +222,23 @@ def dion2_update_megabatch_async(
         _print_selection_choice(X[0].shape, shard_dim, select_dim, ndim)
 
     # Pre-orthogonalize: momentum update + submatrix selection
-    U_selected, indices_list = dion2_pre_orthogonalize(
-        G=to_local(G),
-        M=to_local(M),
-        fraction=fraction,
-        ef_decay=ef_decay,
-        select_dim=select_dim,
-    )
+    if zero_mode:
+        U_selected = dion2_pre_orthogonalize_zero(
+            G=to_local(G),
+            M=to_local(M),
+            fraction=fraction,
+            ef_decay=ef_decay,
+            select_dim=select_dim,
+        )
+        indices_list = None
+    else:
+        U_selected, indices_list = dion2_pre_orthogonalize(
+            G=to_local(G),
+            M=to_local(M),
+            fraction=fraction,
+            ef_decay=ef_decay,
+            select_dim=select_dim,
+        )
 
     # comm_dim for sharded communication: use select_dim (which equals normalized shard_dim)
     comm_dim = select_dim if is_sharded else None
@@ -268,16 +282,25 @@ def dion2_update_megabatch_async(
     else:
         raise ValueError(f"Unknown adjust_lr: {adjust_lr}")
 
-    # Post-orthogonalize: apply update to selected indices only
-    dion2_post_orthogonalize(
-        X=to_local(X),
-        U=U_ortho,
-        indices=indices_list,
-        base_lr=lr,
-        adjusted_lr=adjusted_lr,
-        weight_decay=weight_decay,
-        select_dim=select_dim,
-    )
+    # Post-orthogonalize: apply update
+    if zero_mode:
+        dion2_post_orthogonalize_full(
+            X=to_local(X),
+            U=U_ortho,
+            base_lr=lr,
+            adjusted_lr=adjusted_lr,
+            weight_decay=weight_decay,
+        )
+    else:
+        dion2_post_orthogonalize(
+            X=to_local(X),
+            U=U_ortho,
+            indices=indices_list,
+            base_lr=lr,
+            adjusted_lr=adjusted_lr,
+            weight_decay=weight_decay,
+            select_dim=select_dim,
+        )
 
 
 # Workaround for a torch.compile bug in PyTorch ≤2.11's inductor backend:
@@ -368,6 +391,62 @@ def dion2_pre_orthogonalize(
     return U_selected, indices_list
 
 
+@_inductor_workaround
+@torch.compile(fullgraph=True)
+def dion2_pre_orthogonalize_zero(
+    G: List[Tensor],
+    M: List[Tensor],
+    fraction: Tensor,
+    ef_decay: Tensor,
+    select_dim: int,
+) -> List[Tensor]:
+    """
+    Zero-mode variant of dion2_pre_orthogonalize: instead of gathering selected
+    rows/cols into a compact submatrix, returns a full-sized matrix where
+    unselected entries are zeroed out. Avoids element-wise gather/scatter.
+    """
+    dtype = M[0].dtype
+    num_select = M[0].size(select_dim)
+    norm_dim = -1 if select_dim == -2 else -2
+    k = max(1, int(math.ceil(fraction * num_select)))
+
+    # Update momentum: M = M + G
+    G = [g.to(dtype=dtype) for g in G]
+    torch._foreach_add_(M, G)
+
+    M_stacked = torch.stack(M, dim=0)
+
+    # Compute L1 norm along norm_dim
+    slice_norms = M_stacked.norm(p=1, dim=norm_dim)
+
+    # Batched topk
+    _, indices = torch.topk(slice_norms, k, dim=-1, sorted=False)
+
+    # Build a boolean mask along select_dim (1 for selected, 0 for unselected)
+    mask = torch.zeros_like(slice_norms)
+    mask.scatter_(-1, indices, 1.0)
+    # Expand mask to match M_stacked shape
+    if select_dim == -2:
+        mask = mask.unsqueeze(-1)  # (batch, num_select, 1)
+    else:
+        mask = mask.unsqueeze(-2)  # (batch, 1, num_select)
+
+    # U = M * mask: full-sized with zeros for unselected entries
+    U_stacked = M_stacked * mask
+
+    # EF decay: M[selected] *= ef_decay, unselected unchanged
+    # Since U has zeros for unselected: M -= U * (1 - ef_decay)
+    # selected:   M - M * (1 - ef_decay) = M * ef_decay
+    # unselected: M - 0 = M (unchanged)
+    M_updated = M_stacked - U_stacked * (1 - ef_decay)
+    for i, m in enumerate(M):
+        m.copy_(M_updated[i])
+
+    # Convert to bf16 and unstack
+    U = list(U_stacked.to(dtype=torch.bfloat16).unbind(dim=0))
+    return U
+
+
 # NOTE: if this function starts failing with an InductorError on recompilation
 # across tensor ranks, apply the same _inductor_workaround used on
 # dion2_pre_orthogonalize above.  See pytorch/pytorch#176591.
@@ -404,6 +483,27 @@ def dion2_post_orthogonalize(
         else:
             idx_exp = idx.unsqueeze(-2).expand_as(u_scaled)
         x.scatter_add_(dim=select_dim, index=idx_exp, src=u_scaled)
+
+
+@torch.compile(fullgraph=True)
+def dion2_post_orthogonalize_full(
+    X: List[Tensor],
+    U: List[Tensor],
+    base_lr: Tensor,
+    adjusted_lr: Tensor,
+    weight_decay: Tensor,
+):
+    """
+    Apply weight decay and full update without index bookkeeping.
+    Used when U is already full-sized (zero_mode or fraction=1).
+    """
+    torch._foreach_mul_(X, 1 - base_lr * weight_decay)
+
+    dtype = X[0].dtype
+    U = [u.to(dtype=dtype) for u in U]
+    neg_lr = -adjusted_lr
+    U_scaled = [neg_lr * u for u in U]
+    torch._foreach_add_(X, U_scaled)
 
 
 # A helper function to print selection choice for each matrix
