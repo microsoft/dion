@@ -167,6 +167,13 @@ class NorMuon(DistributedOrthoBase):
                 newton_schulz_func=self._newton_schulz_func,
                 cautious_wd=group["cautious_wd"],
                 nan_guard_fallback=self._nan_guard_fallback,
+                # Sync the nan flag on the optimizer's full process group,
+                # not the megabatch's: the head-split and batch-sharded
+                # paths below override ``process_group`` to ``None`` (no
+                # alltoall is needed there), but the nan-skip decision
+                # still has to agree across all ranks or DDP drifts and
+                # sharded params end up torn.
+                nan_sync_process_group=self._process_group,
             )
 
             shape_groups: dict[tuple, list] = defaultdict(list)
@@ -231,6 +238,7 @@ def normuon_update_megabatch_async(
     newton_schulz_func: Optional[Callable] = None,
     cautious_wd: bool = False,
     nan_guard_fallback: bool = False,
+    nan_sync_process_group: Optional[ProcessGroup] = None,
 ) -> Generator[None, None, None]:
     """
     Mega-batched NorMuon update: processes ALL same-shape parameters in one
@@ -293,8 +301,14 @@ def normuon_update_megabatch_async(
         # Cost when triggered: one tiny allreduce + one device->host sync per
         # shape group per step. Cost when off: a single Python branch.
         local_nonfinite = (~torch.isfinite(U_stacked).all()).to(torch.uint8).reshape(1)
-        if process_group is not None:
-            dist.all_reduce(local_nonfinite, op=dist.ReduceOp.MAX, group=process_group)
+        # Sync on the optimizer's process group rather than the megabatch's:
+        # head-split and FSDP2 batch-sharded paths run with no megabatch
+        # alltoall (process_group=None) but the nan-skip decision must still
+        # agree across all ranks, or DDP-replicated params drift and
+        # sharded params end up torn (some shards stepped, some not).
+        sync_pg = nan_sync_process_group if nan_sync_process_group is not None else process_group
+        if sync_pg is not None:
+            dist.all_reduce(local_nonfinite, op=dist.ReduceOp.MAX, group=sync_pg)
         if bool(local_nonfinite.item()):
             if device_rank == 0:
                 warnings.warn(
