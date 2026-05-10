@@ -152,6 +152,21 @@ class TestAurora:
         with pytest.raises(ValueError, match="pp_iterations"):
             Aurora(_make_params([(32, 64)]), pp_iterations=-1)
 
+    def test_reference_runs(self):
+        """Single-file AuroraReference should run on tall/square/wide."""
+        from dion import AuroraReference
+        params = _make_params([(128, 64), (64, 64), (64, 128)])
+        _run_steps(AuroraReference, params, dict(lr=0.05))
+
+    def test_reference_matches_polar_reference_on_square(self):
+        """AuroraReference's polar should equal its bundled simple-quintic
+        polar on square inputs (the diag-preconditioning loop is bypassed)."""
+        from dion.aurora_reference import polar, aurora_polar
+        torch.manual_seed(0)
+        G = torch.randn(128, 128, device=DEVICE)
+        # max(1, m/n)**0.5 = 1 for square, so the aspect-ratio scaling is 1.
+        assert torch.equal(aurora_polar(G), polar(G))
+
     def test_square_matches_muon_polar(self):
         """For square matrices, Aurora's orthogonalization should equal the
         underlying polar function bit-for-bit (the diagonal preconditioning
@@ -164,8 +179,6 @@ class TestAurora:
         ap = make_aurora_polar(polar_express, pp_iterations=2, pp_beta=0.5)
         u_std = polar_express(G, epsilon=1e-7)
         u_aur = ap(G, epsilon=1e-7)
-        # Aurora's aspect-ratio scaling is max(1, m/n)**0.5 = 1 for square,
-        # so the outputs should be exactly equal.
         assert torch.equal(u_std, u_aur)
 
     def test_row_norms_more_uniform_than_polar(self):
@@ -180,9 +193,7 @@ class TestAurora:
         G = torch.randn(512, 128, device=DEVICE, dtype=torch.float32)
         u_std = polar_express(G, epsilon=1e-7).to(torch.float32)
         ap = make_aurora_polar(polar_express, pp_iterations=2, pp_beta=0.5)
-        # Strip Aurora's max(1, m/n)**0.5 scaling to compare just the polar shape.
-        scale = max(1.0, 512 / 128) ** 0.5
-        u_aur = (ap(G, epsilon=1e-7).to(torch.float32)) / scale
+        u_aur = ap(G, epsilon=1e-7).to(torch.float32)
 
         rn_std = u_std.norm(dim=-1)
         rn_aur = u_aur.norm(dim=-1)

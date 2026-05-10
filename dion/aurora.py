@@ -39,17 +39,19 @@ class Aurora(DistributedOrthoBase):
         params: Parameters for the optimizer.
         distributed_mesh: DeviceMesh or ProcessGroup for distributed training.
             Use DeviceMesh for FSDP2 and ProcessGroup for DistributedDataParallel.
-        lr: Base learning rate. Aurora bakes the tall-aspect-ratio scaling
-            ``max(1, m/n)**0.5`` into the update, so ``adjust_lr`` defaults to None.
+        lr: Base learning rate. Scaled by ``adjust_lr`` to convert from spectral
+            norm 1 to a comparable RMS operator norm, same as Muon/NorMuon.
         mu: Momentum factor.
         betas: Tuple of (beta1, beta2) for AdamW and Lion algorithms.
         weight_decay: Weight decay factor.
         cautious_wd: Whether to apply weight decay only where update and parameter signs align.
         epsilon: Small value to avoid division by zero.
         nesterov: Whether to use Nesterov momentum.
-        adjust_lr: Optional Muon-style LR adjustment ("spectral_norm", "rms_norm", or None).
-            None is the Aurora default; the algorithm already applies its own
-            ``max(1, m/n)**0.5`` aspect-ratio scaling inside the orthogonalization.
+        adjust_lr: How to adjust the learning rate ("spectral_norm" or "rms_norm" or None).
+            Same semantics and default as Muon/NorMuon. Note that this differs
+            slightly from the Aurora reference (which uses ``max(1, m/n)^0.5``
+            and so leaves wide matrices unscaled); dion's ``spectral_norm``
+            applies ``sqrt(m/n)`` regardless of orientation, matching Muon.
         flatten: Whether to flatten 3D+ tensors to 2D for the orthogonalization step.
         pp_iterations: Number of preconditioned-polar iterations. Each iteration
             calls the base polar (Newton-Schulz) once. ``pp_iterations=2`` is the
@@ -76,7 +78,7 @@ class Aurora(DistributedOrthoBase):
         cautious_wd: bool = False,
         epsilon: float = 1e-8,
         nesterov: bool = True,
-        adjust_lr: Optional[str] = None,
+        adjust_lr: Optional[str] = "spectral_norm",
         flatten: bool = False,
         pp_iterations: int = 2,
         pp_beta: float = 0.5,
@@ -325,10 +327,9 @@ def make_aurora_polar(
     For square matrices this is just ``base_polar(X, epsilon)``. For
     non-square matrices it transposes to tall, then runs ``pp_iterations``
     rounds of diagonal row-preconditioning, calling ``base_polar`` once per
-    round. The output is multiplied by ``max(1, m/n)**0.5`` to apply the
-    same aspect-ratio scaling as in the Aurora reference (this replaces
-    Muon's per-LR ``sqrt(m/n)`` scaling, hence the optimizer's
-    ``adjust_lr=None`` default).
+    round. Aspect-ratio scaling is left to the optimizer's ``adjust_lr``
+    pathway (the same one Muon/NorMuon use), so the output here has
+    spectral norm at most 1 and unit row-norm structure.
 
     Reference: https://github.com/tilde-research/aurora-release/blob/main/aurora.py
     """
@@ -358,12 +359,6 @@ def make_aurora_polar(
             if transposed:
                 U = U.mT
 
-        # Aurora aspect-ratio scaling: max(1, m/n)**0.5. Baked here rather
-        # than in the LR so callers can use adjust_lr=None and still get the
-        # correct tall scaling regardless of input orientation.
-        scale = max(1.0, m / n) ** 0.5
-        if scale != 1.0:
-            U = U * scale
         return U
 
     return aurora_polar
