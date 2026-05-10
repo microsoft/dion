@@ -152,6 +152,25 @@ class TestAurora:
         with pytest.raises(ValueError, match="pp_iterations"):
             Aurora(_make_params([(32, 64)]), pp_iterations=-1)
 
+    def test_pp_iterations_mutation_takes_effect(self):
+        """Mutating ``pp_iterations`` on a param group at runtime must change
+        the update — the wrapper should be rebuilt each step (mirroring how
+        ``lr`` is re-read from the group)."""
+        from dion import Aurora
+        torch.manual_seed(0)
+        # Tall non-square so pp_iterations actually changes the answer.
+        params = [torch.nn.Parameter(torch.randn(128, 32, device=DEVICE))]
+        opt = Aurora(params, lr=0.01, pp_iterations=1)
+        params[0].grad = torch.randn_like(params[0])
+        opt.step()
+
+        opt.param_groups[0]["pp_iterations"] = 3
+        params[0].grad = torch.randn_like(params[0])
+        # Bad value should now raise from the mutated group state.
+        opt.param_groups[0]["pp_iterations"] = 0
+        with pytest.raises(ValueError, match="pp_iterations"):
+            opt.step()
+
     def test_reference_runs(self):
         """Single-file AuroraReference should run on tall/square/wide."""
         from dion import AuroraReference

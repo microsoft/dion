@@ -14,7 +14,6 @@ Aurora: https://blog.tilderesearch.com/blog/aurora
 Reference: https://github.com/tilde-research/aurora-release
 """
 
-import math
 import torch
 from torch.distributed.tensor import DTensor
 from torch.optim.optimizer import Optimizer, ParamsT

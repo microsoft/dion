@@ -142,11 +142,11 @@ class Aurora(DistributedOrthoBase):
         else:
             base_polar = zeropower_via_newtonschulz5
 
-        aurora_polar_func = make_aurora_polar(
-            base_polar=base_polar,
-            pp_iterations=pp_iterations,
-            pp_beta=pp_beta,
-        )
+        # Stash the unwrapped base polar so ``_create_ortho_tasks`` can rebuild
+        # the Aurora wrapper each step using the param group's current
+        # ``pp_iterations`` / ``pp_beta`` (which an LR scheduler or warmup
+        # might mutate, just like ``lr``/``mu``).
+        self._aurora_base_polar = base_polar
 
         defaults = dict(
             lr=lr,
@@ -164,11 +164,13 @@ class Aurora(DistributedOrthoBase):
             pp_iterations=pp_iterations,
             pp_beta=pp_beta,
         )
-        # Pass the Aurora-wrapped polar through the base class's
-        # ``newton_schulz_func`` slot so the existing megabatch path uses it.
+        # Pass an init-time wrapper as the base ``newton_schulz_func`` so the
+        # parent class is happy; ``_create_ortho_tasks`` overrides it per-step.
         super().__init__(
             params, distributed_mesh, "aurora", defaults,
-            newton_schulz_func=aurora_polar_func,
+            newton_schulz_func=make_aurora_polar(
+                base_polar=base_polar, pp_iterations=pp_iterations, pp_beta=pp_beta,
+            ),
         )
 
     def _create_ortho_tasks(
@@ -188,6 +190,18 @@ class Aurora(DistributedOrthoBase):
             if not group_params:
                 continue
 
+            # Re-read pp_iterations / pp_beta from the group every step so an
+            # LR scheduler or warmup can mutate them (matching how lr/mu/etc.
+            # are re-read here). Validate to fail fast on bad runtime values.
+            pp_iterations = group["pp_iterations"]
+            pp_beta = group["pp_beta"]
+            if not isinstance(pp_iterations, int) or pp_iterations < 1:
+                raise ValueError(
+                    f"Invalid pp_iterations: {pp_iterations}. Must be a positive integer."
+                )
+            if pp_beta < 0.0:
+                raise ValueError(f"Invalid pp_beta: {pp_beta}")
+
             update_args = dict(
                 lr=torch.tensor(group["lr"]),
                 momentum=torch.tensor(group["mu"]),
@@ -199,7 +213,11 @@ class Aurora(DistributedOrthoBase):
                 device_rank=self._device_rank,
                 world_size=self._world_size,
                 process_group=self._process_group,
-                newton_schulz_func=self._newton_schulz_func,
+                newton_schulz_func=make_aurora_polar(
+                    base_polar=self._aurora_base_polar,
+                    pp_iterations=pp_iterations,
+                    pp_beta=pp_beta,
+                ),
                 cautious_wd=group["cautious_wd"],
             )
 
