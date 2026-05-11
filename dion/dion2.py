@@ -64,7 +64,7 @@ class Dion2(DistributedOrthoBase):
         use_gram_newton_schulz: bool = False,
         newton_schulz_func: Optional[Callable] = None,
         verbose: bool = False,
-        zero_mode: bool = False,
+        zero_mode: Union[bool, str] = False,
     ):
         # Validate hyperparameters
         if lr < 0.0:
@@ -78,6 +78,11 @@ class Dion2(DistributedOrthoBase):
         if adjust_lr not in ("spectral_norm", "rms_norm", None):
             raise ValueError(
                 f"Invalid adjust_lr value: {adjust_lr}. Must be 'spectral_norm', 'rms_norm', or None."
+            )
+
+        if zero_mode not in (False, True, "triton"):
+            raise ValueError(
+                f"Invalid zero_mode: {zero_mode!r}. Must be False, True, or 'triton'."
             )
 
         defaults = dict(
@@ -191,7 +196,7 @@ def dion2_update_megabatch_async(
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
     verbose: bool = False,
-    zero_mode: bool = False,
+    zero_mode: Union[bool, str] = False,
 ) -> Generator[None, None, None]:
     """
     Mega-batched Dion2 update: processes ALL same-shape parameters in one
@@ -222,7 +227,8 @@ def dion2_update_megabatch_async(
         _print_selection_choice(X[0].shape, shard_dim, select_dim, ndim)
 
     # Pre-orthogonalize: momentum update + submatrix selection
-    if zero_mode:
+    # "triton" mode uses default gather-based pre-ortho (needs indices for the kernel)
+    if zero_mode and zero_mode != "triton":
         U_selected = dion2_pre_orthogonalize_zero(
             G=to_local(G),
             M=to_local(M),
@@ -283,7 +289,19 @@ def dion2_update_megabatch_async(
         raise ValueError(f"Unknown adjust_lr: {adjust_lr}")
 
     # Post-orthogonalize: apply update
-    if zero_mode:
+    if zero_mode == "triton":
+        from .dion2_triton import dion2_post_orthogonalize_triton
+
+        dion2_post_orthogonalize_triton(
+            X=to_local(X),
+            U=U_ortho,
+            indices=indices_list,
+            base_lr=lr,
+            adjusted_lr=adjusted_lr,
+            weight_decay=weight_decay,
+            select_dim=select_dim,
+        )
+    elif zero_mode:
         dion2_post_orthogonalize_full(
             X=to_local(X),
             U=U_ortho,
