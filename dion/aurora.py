@@ -11,6 +11,7 @@ from .megabatch_base import (
     megabatch_orthogonalize_async,
     adjust_lr_spectral_norm,
     adjust_lr_rms_norm,
+    adjust_lr_aurora_aspect,
 )
 from .muon import muon_update_pre_orthogonalize, muon_update_post_orthogonalize
 from .newton_schulz_triton import (
@@ -47,11 +48,15 @@ class Aurora(DistributedOrthoBase):
         cautious_wd: Whether to apply weight decay only where update and parameter signs align.
         epsilon: Small value to avoid division by zero.
         nesterov: Whether to use Nesterov momentum.
-        adjust_lr: How to adjust the learning rate ("spectral_norm" or "rms_norm" or None).
-            Same semantics and default as Muon/NorMuon. Note that this differs
-            slightly from the Aurora reference (which uses ``max(1, m/n)^0.5``
-            and so leaves wide matrices unscaled); dion's ``spectral_norm``
-            applies ``sqrt(m/n)`` regardless of orientation, matching Muon.
+        adjust_lr: How to adjust the learning rate ("spectral_norm", "rms_norm",
+            "aurora_aspect", or None).
+            "spectral_norm" (default, same as Muon/NorMuon): scales by sqrt(m/n)
+            regardless of orientation.
+            "aurora_aspect": scales by ``max(1, m/n)^0.5``, matching the Aurora
+            reference exactly (wide matrices unscaled). Use this for
+            reference-faithful Aurora.
+            "rms_norm": Adam-comparable RMS scaling.
+            None: no LR adjustment.
         flatten: Whether to flatten 3D+ tensors to 2D for the orthogonalization step.
         pp_iterations: Number of preconditioned-polar iterations. Each iteration
             calls the base polar (Newton-Schulz) once. ``pp_iterations=2`` is the
@@ -93,9 +98,10 @@ class Aurora(DistributedOrthoBase):
             raise ValueError(f"Invalid momentum factor (mu): {mu}")
         if len(betas) != 2 or betas[0] < 0.0 or betas[1] < 0.0:
             raise ValueError(f"Invalid betas: {betas}")
-        if adjust_lr not in ("spectral_norm", "rms_norm", None):
+        if adjust_lr not in ("spectral_norm", "rms_norm", "aurora_aspect", None):
             raise ValueError(
-                f"Invalid adjust_lr value: {adjust_lr}. Must be 'spectral_norm', 'rms_norm', or None."
+                f"Invalid adjust_lr value: {adjust_lr}. "
+                "Must be 'spectral_norm', 'rms_norm', 'aurora_aspect', or None."
             )
         if not isinstance(pp_iterations, int) or pp_iterations < 1:
             raise ValueError(
@@ -319,6 +325,8 @@ def aurora_update_megabatch_async(
         adjusted_lr = adjust_lr_spectral_norm(lr, X[0].shape, flatten=flatten)
     elif adjust_lr == "rms_norm":
         adjusted_lr = adjust_lr_rms_norm(lr, X[0].shape, flatten=flatten)
+    elif adjust_lr == "aurora_aspect":
+        adjusted_lr = adjust_lr_aurora_aspect(lr, X[0].shape, flatten=flatten)
     else:
         raise ValueError(f"Unknown adjust_lr value: {adjust_lr}")
 

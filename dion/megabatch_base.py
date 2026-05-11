@@ -559,3 +559,20 @@ def adjust_lr_spectral_norm(lr, param_shape, flatten):
     else:
         fan_out, fan_in = param_shape[-2:]
     return lr * math.sqrt(fan_out / fan_in)
+
+
+def adjust_lr_aurora_aspect(lr, param_shape, flatten):
+    """One-sided tall aspect-ratio scaling: ``max(1, m/n)^0.5``.
+
+    Matches the Aurora reference's scaling
+    (https://github.com/tilde-research/aurora-release/blob/main/src/aurora.py):
+    tall matrices get ``sqrt(m/n) > 1`` boost, wide matrices are unscaled.
+    Differs from ``adjust_lr_spectral_norm``, which applies ``sqrt(m/n)``
+    regardless of orientation (so wide matrices get LR shrunk by ``< 1``).
+    """
+    if flatten:
+        fan_out = param_shape[0]
+        fan_in = math.prod(param_shape[1:])
+    else:
+        fan_out, fan_in = param_shape[-2:]
+    return lr * math.sqrt(max(1.0, fan_out / fan_in))
