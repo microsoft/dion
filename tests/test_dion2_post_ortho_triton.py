@@ -7,7 +7,7 @@ Two levels of testing:
    - Selected entries differ at the FP-rounding level because the Triton kernel
      fuses ``a*x - b*u`` in one expression (one rounding) while the compiled
      version does ``x *= a`` then ``scatter_add_`` (two roundings).
-2. **End-to-end**: run Dion2 optimizer with ``zero_mode="triton"`` vs default
+2. **End-to-end**: run Dion2 optimizer with ``use_triton=True`` vs default
    and verify parameters are close.
 """
 
@@ -192,7 +192,7 @@ class TestPostOrthoTritonKernel:
 
 @pytest.mark.skipif(not TRITON_AND_CUDA, reason="CUDA and Triton required")
 class TestDion2TritonEndToEnd:
-    """Run Dion2 optimizer with zero_mode='triton' vs default and compare."""
+    """Run Dion2 optimizer with use_triton=True vs default and compare."""
 
     def _make_params(self, shapes):
         torch.manual_seed(42)
@@ -219,10 +219,10 @@ class TestDion2TritonEndToEnd:
         kwargs = dict(lr=0.01, fraction=fraction, ef_decay=ef_decay)
 
         p_default = self._make_params(shapes)
-        opt_default = self._run_steps(p_default, {**kwargs, "zero_mode": False}, n_steps=3)
+        opt_default = self._run_steps(p_default, {**kwargs, "use_triton": False}, n_steps=3)
 
         p_triton = self._make_params(shapes)
-        opt_triton = self._run_steps(p_triton, {**kwargs, "zero_mode": "triton"}, n_steps=3)
+        opt_triton = self._run_steps(p_triton, {**kwargs, "use_triton": True}, n_steps=3)
 
         # Momentum should be bitwise identical (same pre-ortho path)
         for pd, pt in zip(p_default, p_triton):
@@ -230,9 +230,10 @@ class TestDion2TritonEndToEnd:
             mt = opt_triton.state[pt]["momentum"]
             assert torch.equal(md, mt), "Momentum buffers differ"
 
-        # Parameters differ only at fused-rounding level
+        # Parameters differ due to both different Newton-Schulz implementations
+        # and fused post-ortho rounding (use_triton changes both)
         for pd, pt in zip(p_default, p_triton):
-            assert torch.allclose(pd.data, pt.data, atol=1e-6, rtol=1e-5), (
+            assert torch.allclose(pd.data, pt.data, atol=2e-3, rtol=2e-3), (
                 f"Parameters differ beyond tolerance: "
                 f"max diff = {(pd.data - pt.data).abs().max().item():.2e}"
             )
