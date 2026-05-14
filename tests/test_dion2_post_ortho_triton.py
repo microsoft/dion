@@ -29,11 +29,11 @@ torch._dynamo.config.cache_size_limit = 64
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_test_data(shape, k, select_dim, seed=42):
+def _make_test_data(shape, k, select_dim, seed=42, x_dtype=torch.float32):
     """Create X, U, indices for a single tensor.
 
     Returns:
-        X: (*leading, M, N) float32
+        X: (*leading, M, N) in x_dtype
         U: (*leading, k, N) or (*leading, M, k) bfloat16
         indices: (*leading, k) int64
     """
@@ -41,7 +41,7 @@ def _make_test_data(shape, k, select_dim, seed=42):
     M, N = shape[-2], shape[-1]
     leading = shape[:-2]
 
-    X = torch.randn(shape, device=DEVICE, dtype=torch.float32)
+    X = torch.randn(shape, device=DEVICE, dtype=x_dtype)
 
     if select_dim == -2:
         u_shape = (*leading, k, N)
@@ -112,11 +112,12 @@ class TestPostOrthoTritonKernel:
         ((64, 128), -2, 1/64, 0.01),     # k = 1 (single row selected)
         ((64, 128), -2, 0.25, 0.0),      # zero weight decay
     ])
-    def test_single_tensor(self, shape, select_dim, fraction, weight_decay):
+    @pytest.mark.parametrize("x_dtype", [torch.float64, torch.float32, torch.bfloat16])
+    def test_single_tensor(self, shape, select_dim, fraction, weight_decay, x_dtype):
         full_dim = shape[-2] if select_dim == -2 else shape[-1]
         k = max(1, int(math.ceil(fraction * full_dim)))
 
-        X_ref, U_ref, indices = _make_test_data(shape, k, select_dim)
+        X_ref, U_ref, indices = _make_test_data(shape, k, select_dim, x_dtype=x_dtype)
         X_tri = X_ref.clone()
         U_tri = U_ref.clone()
 
@@ -132,20 +133,30 @@ class TestPostOrthoTritonKernel:
         # Build mask for selected vs unselected
         sel_mask = _build_selected_mask(indices, select_dim, shape)
 
-        # Unselected entries: both compute a*x — should be bitwise identical
+        # Dtype-aware tolerances: bf16 has coarser rounding (~1 ULP = 2^-7 * value)
+        # so the one-vs-two-rounding difference is larger.
+        if x_dtype == torch.bfloat16:
+            atol, rtol = 1e-2, 1e-2
+        elif x_dtype == torch.float64:
+            atol, rtol = 1e-8, 1e-8
+        else:
+            atol, rtol = 1e-6, 1e-5
+
+        # Unselected entries: both compute a*x with the same rounding path
+        # (promote to f32, multiply, store back) — should be bitwise identical
         assert torch.equal(X_ref[~sel_mask], X_tri[~sel_mask]), (
             f"Unselected entries differ! "
             f"max diff = {(X_ref[~sel_mask] - X_tri[~sel_mask]).abs().max().item():.2e}"
         )
 
         # Selected entries: fused vs two-step rounding
-        assert torch.allclose(X_ref[sel_mask], X_tri[sel_mask], atol=1e-6, rtol=1e-5), (
+        assert torch.allclose(X_ref[sel_mask], X_tri[sel_mask], atol=atol, rtol=rtol), (
             f"Selected entries differ beyond tolerance: "
             f"max diff = {(X_ref[sel_mask] - X_tri[sel_mask]).abs().max().item():.2e}"
         )
 
         # Overall comparison
-        assert torch.allclose(X_ref, X_tri, atol=1e-6, rtol=1e-5), (
+        assert torch.allclose(X_ref, X_tri, atol=atol, rtol=rtol), (
             f"Overall max diff = {(X_ref - X_tri).abs().max().item():.2e}"
         )
 

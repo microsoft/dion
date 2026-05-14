@@ -101,6 +101,13 @@ class Dion2(DistributedOrthoBase):
             newton_schulz_func=newton_schulz_func,
         )
         self.verbose = verbose
+        if triton_post_ortho:
+            from .dion2_triton import TRITON_AVAILABLE
+            if not TRITON_AVAILABLE:
+                raise ImportError(
+                    "triton_post_ortho=True requires the 'triton' package, which is not installed. "
+                    "Install it with: pip install dion[triton]  (or: pip install triton)"
+                )
         self._triton_post_ortho = triton_post_ortho
 
     def _create_ortho_tasks(
@@ -383,7 +390,6 @@ def dion2_pre_orthogonalize(
     U_selected = list(selected_stacked.to(dtype=torch.bfloat16).unbind(dim=0))
 
     return U_selected, indices_list
-
 
 
 # NOTE: if this function starts failing with an InductorError on recompilation

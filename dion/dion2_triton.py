@@ -152,8 +152,8 @@ def dion2_post_orthogonalize_triton(
       unselected: x = (1 - base_lr*wd)*x
 
     Args:
-        X: list of parameter tensors (*leading, M, N), dtype=float32
-        U: list of update tensors, dtype=bfloat16
+        X: list of parameter tensors (*leading, M, N)
+        U: list of update tensors (any dtype; upcast to float32 in-kernel)
         indices: list of index tensors (*leading, k), dtype=int64
         base_lr, adjusted_lr, weight_decay: scalar tensors
         select_dim: -2 (row selection) or -1 (column selection)
@@ -165,10 +165,7 @@ def dion2_post_orthogonalize_triton(
     b = adjusted_lr.item()
     SELECT_ROWS = select_dim == -2
 
-    dtype = X[0].dtype
-    U_cast = [u.to(dtype=dtype) for u in U]
-
-    for x, u, idx in zip(X, U_cast, indices):
+    for x, u, idx in zip(X, U, indices):
         if not x.is_contiguous():
             raise ValueError("dion2_post_orthogonalize_triton requires contiguous X tensors")
         orig_shape = x.shape
