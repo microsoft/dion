@@ -205,9 +205,9 @@ class TestPostOrthoTritonKernel:
 class TestDion2TritonEndToEnd:
     """Run Dion2 optimizer with use_triton=True vs default and compare."""
 
-    def _make_params(self, shapes):
+    def _make_params(self, shapes, dtype=torch.float32):
         torch.manual_seed(42)
-        return [torch.nn.Parameter(torch.randn(s, device=DEVICE)) for s in shapes]
+        return [torch.nn.Parameter(torch.randn(s, device=DEVICE, dtype=dtype)) for s in shapes]
 
     def _run_steps(self, params, opt_kwargs, n_steps=3):
         from dion import Dion2
@@ -227,17 +227,18 @@ class TestDion2TritonEndToEnd:
     ])
     @pytest.mark.parametrize("use_triton", [False, True])
     @pytest.mark.parametrize("use_gram_newton_schulz", [False, True])
-    def test_triton_vs_default(self, shapes, fraction, ef_decay, use_triton, use_gram_newton_schulz):
+    @pytest.mark.parametrize("param_dtype", [torch.float32, torch.bfloat16])
+    def test_triton_vs_default(self, shapes, fraction, ef_decay, use_triton, use_gram_newton_schulz, param_dtype):
         """Triton post-ortho should match default up to fused-rounding tolerance."""
         kwargs = dict(
             lr=0.01, fraction=fraction, ef_decay=ef_decay,
             use_triton=use_triton, use_gram_newton_schulz=use_gram_newton_schulz,
         )
 
-        p_default = self._make_params(shapes)
+        p_default = self._make_params(shapes, dtype=param_dtype)
         opt_default = self._run_steps(p_default, {**kwargs, "triton_post_ortho": False}, n_steps=3)
 
-        p_triton = self._make_params(shapes)
+        p_triton = self._make_params(shapes, dtype=param_dtype)
         opt_triton = self._run_steps(p_triton, {**kwargs, "triton_post_ortho": True}, n_steps=3)
 
         # Momentum should be bitwise identical (same pre-ortho path)
@@ -246,10 +247,16 @@ class TestDion2TritonEndToEnd:
             mt = opt_triton.state[pt]["momentum"]
             assert torch.equal(md, mt), "Momentum buffers differ"
 
+        # Dtype-aware tolerance: bf16 rounding compounds across steps
+        if param_dtype == torch.bfloat16:
+            atol, rtol = 1e-2, 1e-2
+        else:
+            atol, rtol = 1e-6, 1e-5
+
         # Parameters differ only at fused-rounding level (triton fuses a*x - b*u
         # in one expression vs two separate ops in the compiled version)
         for pd, pt in zip(p_default, p_triton):
-            assert torch.allclose(pd.data, pt.data, atol=1e-6, rtol=1e-5), (
+            assert torch.allclose(pd.data, pt.data, atol=atol, rtol=rtol), (
                 f"Parameters differ beyond tolerance: "
                 f"max diff = {(pd.data - pt.data).abs().max().item():.2e}"
             )

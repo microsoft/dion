@@ -161,6 +161,9 @@ def dion2_post_orthogonalize_triton(
     if not TRITON_AVAILABLE:
         raise RuntimeError("Triton is required for dion2_post_orthogonalize_triton")
 
+    if select_dim not in (-2, -1):
+        raise ValueError(f"select_dim must be -2 or -1, got {select_dim}")
+
     a = (1 - base_lr * weight_decay).item()
     b = adjusted_lr.item()
     SELECT_ROWS = select_dim == -2
