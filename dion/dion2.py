@@ -64,6 +64,7 @@ class Dion2(DistributedOrthoBase):
         use_gram_newton_schulz: bool = False,
         newton_schulz_func: Optional[Callable] = None,
         verbose: bool = False,
+        triton_post_ortho: bool = False,
     ):
         # Validate hyperparameters
         if lr < 0.0:
@@ -100,7 +101,7 @@ class Dion2(DistributedOrthoBase):
             newton_schulz_func=newton_schulz_func,
         )
         self.verbose = verbose
-        self._use_triton = use_triton
+        self._triton_post_ortho = triton_post_ortho
 
     def _create_ortho_tasks(
         self, param_groups: List[dict]
@@ -132,7 +133,7 @@ class Dion2(DistributedOrthoBase):
                 process_group=self._process_group,
                 newton_schulz_func=self._newton_schulz_func,
                 verbose=self.verbose,
-                use_triton=self._use_triton,
+                triton_post_ortho=self._triton_post_ortho,
             )
 
             shape_groups: dict[tuple, list] = defaultdict(list)
@@ -190,7 +191,7 @@ def dion2_update_megabatch_async(
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
     verbose: bool = False,
-    use_triton: bool = False,
+    triton_post_ortho: bool = False,
 ) -> Generator[None, None, None]:
     """
     Mega-batched Dion2 update: processes ALL same-shape parameters in one
@@ -272,7 +273,7 @@ def dion2_update_megabatch_async(
         raise ValueError(f"Unknown adjust_lr: {adjust_lr}")
 
     # Post-orthogonalize: apply update
-    if use_triton:
+    if triton_post_ortho:
         from .dion2_triton import dion2_post_orthogonalize_triton
 
         dion2_post_orthogonalize_triton(

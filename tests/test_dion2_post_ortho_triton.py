@@ -214,15 +214,20 @@ class TestDion2TritonEndToEnd:
         ([(4, 32, 128)], 0.5, 0.95),
         ([(64, 128)] * 4, 0.25, 0.9),
     ])
-    def test_triton_vs_default(self, shapes, fraction, ef_decay):
+    @pytest.mark.parametrize("use_triton", [False, True])
+    @pytest.mark.parametrize("use_gram_newton_schulz", [False, True])
+    def test_triton_vs_default(self, shapes, fraction, ef_decay, use_triton, use_gram_newton_schulz):
         """Triton post-ortho should match default up to fused-rounding tolerance."""
-        kwargs = dict(lr=0.01, fraction=fraction, ef_decay=ef_decay)
+        kwargs = dict(
+            lr=0.01, fraction=fraction, ef_decay=ef_decay,
+            use_triton=use_triton, use_gram_newton_schulz=use_gram_newton_schulz,
+        )
 
         p_default = self._make_params(shapes)
-        opt_default = self._run_steps(p_default, {**kwargs, "use_triton": False}, n_steps=3)
+        opt_default = self._run_steps(p_default, {**kwargs, "triton_post_ortho": False}, n_steps=3)
 
         p_triton = self._make_params(shapes)
-        opt_triton = self._run_steps(p_triton, {**kwargs, "use_triton": True}, n_steps=3)
+        opt_triton = self._run_steps(p_triton, {**kwargs, "triton_post_ortho": True}, n_steps=3)
 
         # Momentum should be bitwise identical (same pre-ortho path)
         for pd, pt in zip(p_default, p_triton):
@@ -230,10 +235,10 @@ class TestDion2TritonEndToEnd:
             mt = opt_triton.state[pt]["momentum"]
             assert torch.equal(md, mt), "Momentum buffers differ"
 
-        # Parameters differ due to both different Newton-Schulz implementations
-        # and fused post-ortho rounding (use_triton changes both)
+        # Parameters differ only at fused-rounding level (triton fuses a*x - b*u
+        # in one expression vs two separate ops in the compiled version)
         for pd, pt in zip(p_default, p_triton):
-            assert torch.allclose(pd.data, pt.data, atol=2e-3, rtol=2e-3), (
+            assert torch.allclose(pd.data, pt.data, atol=1e-6, rtol=1e-5), (
                 f"Parameters differ beyond tolerance: "
                 f"max diff = {(pd.data - pt.data).abs().max().item():.2e}"
             )
