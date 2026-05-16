@@ -1,3 +1,5 @@
+from .aurora import Aurora
+from .aurora_reference import Aurora as AuroraReference
 from .dion import Dion
 from .dion import DionMixedPrecisionConfig
 from .dion_simple import Dion as DionSimple
