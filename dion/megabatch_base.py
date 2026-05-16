@@ -93,6 +93,11 @@ class DistributedOrthoBase(Optimizer):
             )
             self._newton_schulz_func = lambda X, epsilon=None: _gns(X)
         elif use_polar_express and use_triton:
+            if not TRITON_AVAILABLE:
+                raise ImportError(
+                    "use_triton=True requires the 'triton' package, which is not installed. "
+                    "Install it with: pip install dion[triton]  (or: pip install triton)"
+                )
             self._newton_schulz_func = polar_express_triton
         elif use_polar_express:
             self._newton_schulz_func = polar_express

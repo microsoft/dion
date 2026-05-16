@@ -469,6 +469,7 @@ def init_optimizer(
             use_triton=(not cli_args.no_triton),
             use_polar_express=cli_args.use_polar_express,
             verbose=hp.verbose,
+            triton_post_ortho=(not cli_args.no_triton),
         )
     elif hp.optimizer == "normuon":
         if device_mesh is not None:

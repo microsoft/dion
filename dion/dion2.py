@@ -64,6 +64,7 @@ class Dion2(DistributedOrthoBase):
         use_gram_newton_schulz: bool = False,
         newton_schulz_func: Optional[Callable] = None,
         verbose: bool = False,
+        triton_post_ortho: bool = False,
     ):
         # Validate hyperparameters
         if lr < 0.0:
@@ -100,6 +101,14 @@ class Dion2(DistributedOrthoBase):
             newton_schulz_func=newton_schulz_func,
         )
         self.verbose = verbose
+        if triton_post_ortho:
+            from .dion2_triton import TRITON_AVAILABLE
+            if not TRITON_AVAILABLE:
+                raise ImportError(
+                    "triton_post_ortho=True requires the 'triton' package, which is not installed. "
+                    "Install it with: pip install dion[triton]  (or: pip install triton)"
+                )
+        self._triton_post_ortho = triton_post_ortho
 
     def _create_ortho_tasks(
         self, param_groups: List[dict]
@@ -131,6 +140,7 @@ class Dion2(DistributedOrthoBase):
                 process_group=self._process_group,
                 newton_schulz_func=self._newton_schulz_func,
                 verbose=self.verbose,
+                triton_post_ortho=self._triton_post_ortho,
             )
 
             shape_groups: dict[tuple, list] = defaultdict(list)
@@ -188,6 +198,7 @@ def dion2_update_megabatch_async(
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
     verbose: bool = False,
+    triton_post_ortho: bool = False,
 ) -> Generator[None, None, None]:
     """
     Mega-batched Dion2 update: processes ALL same-shape parameters in one
@@ -268,16 +279,29 @@ def dion2_update_megabatch_async(
     else:
         raise ValueError(f"Unknown adjust_lr: {adjust_lr}")
 
-    # Post-orthogonalize: apply update to selected indices only
-    dion2_post_orthogonalize(
-        X=to_local(X),
-        U=U_ortho,
-        indices=indices_list,
-        base_lr=lr,
-        adjusted_lr=adjusted_lr,
-        weight_decay=weight_decay,
-        select_dim=select_dim,
-    )
+    # Post-orthogonalize: apply update
+    if triton_post_ortho:
+        from .dion2_triton import dion2_post_orthogonalize_triton
+
+        dion2_post_orthogonalize_triton(
+            X=to_local(X),
+            U=U_ortho,
+            indices=indices_list,
+            base_lr=lr,
+            adjusted_lr=adjusted_lr,
+            weight_decay=weight_decay,
+            select_dim=select_dim,
+        )
+    else:
+        dion2_post_orthogonalize(
+            X=to_local(X),
+            U=U_ortho,
+            indices=indices_list,
+            base_lr=lr,
+            adjusted_lr=adjusted_lr,
+            weight_decay=weight_decay,
+            select_dim=select_dim,
+        )
 
 
 # Workaround for a torch.compile bug in PyTorch ≤2.11's inductor backend:
