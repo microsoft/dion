@@ -139,6 +139,67 @@ class TestNorMuon:
 
 
 # ---------------------------------------------------------------------------
+# NorDion2
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA required")
+class TestNorDion2:
+    def test_basic(self):
+        from dion import NorDion2
+        params = _make_params([(64, 128), (128, 64)])
+        _run_steps(NorDion2, params, dict(lr=0.01))
+
+    def test_determinism(self):
+        from dion import NorDion2
+        p1 = _make_params([(64, 128)])
+        r1 = _run_steps(NorDion2, p1, dict(lr=0.01))
+        p2 = _make_params([(64, 128)])
+        r2 = _run_steps(NorDion2, p2, dict(lr=0.01))
+        assert torch.equal(r1[0], r2[0])
+
+    def test_params_change(self):
+        from dion import NorDion2
+        params = _make_params([(64, 128)])
+        before = params[0].data.clone()
+        _run_steps(NorDion2, params, dict(lr=0.01), n_steps=1)
+        assert not torch.equal(params[0].data, before)
+
+    def test_variance_neuron_shape(self):
+        """variance_neuron should have shape [rows, 1]."""
+        from dion import NorDion2
+        params = _make_params([(64, 128)])
+        opt = NorDion2(params, lr=0.01)
+        params[0].grad = torch.randn_like(params[0])
+        opt.step()
+        state = opt.state[params[0]]
+        assert "variance_neuron" in state
+        assert state["variance_neuron"].shape == (64, 1)
+
+    def test_fraction(self):
+        from dion import NorDion2
+        for fraction in [0.1, 0.25, 0.5, 1.0, 1]:
+            params = _make_params([(64, 128)])
+            _run_steps(NorDion2, params, dict(lr=0.01, fraction=fraction))
+
+    def test_megabatch_same_shape(self):
+        from dion import NorDion2
+        params = _make_params([(64, 128)] * 5)
+        _run_steps(NorDion2, params, dict(lr=0.01))
+
+    def test_output_dtype_matches_param(self):
+        """After optimizer step, param dtype should be unchanged."""
+        from dion import NorDion2
+        for param_dtype in [torch.float32, torch.bfloat16]:
+            params = [torch.nn.Parameter(torch.randn(64, 128, device=DEVICE, dtype=param_dtype))]
+            opt = NorDion2(params, lr=0.01)
+            params[0].grad = torch.randn_like(params[0])
+            opt.step()
+            assert params[0].dtype == param_dtype, (
+                f"param dtype changed from {param_dtype} to {params[0].dtype}"
+            )
+
+
+# ---------------------------------------------------------------------------
 # Dion2
 # ---------------------------------------------------------------------------
 
