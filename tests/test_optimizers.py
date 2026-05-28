@@ -178,6 +178,16 @@ class TestNorDion2:
         for fraction in [0.1, 0.25, 0.5, 1.0, 1]:
             params = _make_params([(64, 128)])
             _run_steps(NorDion2, params, dict(lr=0.01, fraction=fraction))
+            if fraction == 1.0:
+                #ensure all variance values are updated after 1 step as all rows are selected
+                opt = NorDion2(params, lr=0.01, fraction=fraction)
+                params[0].grad = torch.randn_like(params[0])
+                opt.step()
+                v_before = opt.state[params[0]]["variance_neuron"].clone()
+                params[0].grad = torch.randn_like(params[0])
+                opt.step()
+                v_after = opt.state[params[0]]["variance_neuron"]
+                assert (v_after != v_before).all()
 
     def test_megabatch_same_shape(self):
         from dion import NorDion2
@@ -196,6 +206,22 @@ class TestNorDion2:
                 f"param dtype changed from {param_dtype} to {params[0].dtype}"
             )
 
+    def test_triton_post_ortho(self):
+        """Test that the post-ortho Triton kernel runs without error."""
+        from dion import NorDion2
+        params = _make_params([(64, 128)])
+        opt = NorDion2(params, lr=0.01, triton_post_ortho=True)
+        params[0].grad = torch.randn_like(params[0])
+        opt.step()
+
+    def test_triton_post_ortho_parity(self):
+        """Triton post-ortho should produce same/similar result as eager path."""
+        from dion import NorDion2
+        p1 = _make_params([(64, 128)])
+        r1 = _run_steps(NorDion2, p1, dict(lr=0.01, triton_post_ortho=False))
+        p2 = _make_params([(64, 128)])
+        r2 = _run_steps(NorDion2, p2, dict(lr=0.01, triton_post_ortho=True))
+        torch.testing.assert_close(r1[0], r2[0], atol=1e-5, rtol=1e-5)
 
 # ---------------------------------------------------------------------------
 # Dion2
@@ -333,6 +359,14 @@ class TestNumHeads:
     def test_normuon_matches_3d(self):
         from dion import NorMuon
         self._run_parity(NorMuon, dict(lr=0.01))
+
+    def test_nordion2_matches_3d(self):
+        from dion import NorDion2
+        self._run_parity(NorDion2, dict(lr=0.01, fraction=0.5))
+    
+    def test_nordion2_matches_3d_full_fraction(self):
+        from dion import NorDion2
+        self._run_parity(NorDion2, dict(lr=0.01, fraction=1.0))
 
     def test_muon_invalid_num_heads(self):
         from dion import Muon

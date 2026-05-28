@@ -1,4 +1,3 @@
-import math
 import torch
 from collections import defaultdict
 from torch import Tensor
@@ -279,19 +278,20 @@ def nordion2_update_megabatch_async(
     # Update variance neuron buffer for each selected row and normalize orthonormalized update
     # V is stored in param dtype (bf16) but compute is done in fp32
     V_local = to_local(V)
-    V_sel = []
-    for v, indices in zip(V_local, indices_list):
-        selected_v = v.index_select(dim=select_dim, index=indices)
-        V_sel.append(selected_v)
     U_stacked = torch.stack(U_ortho)
-    V_sel_stacked = torch.stack(V_sel).float()  # upcast to fp32 for normalization
+    V_stacked = torch.stack(V_local)
+    
+    # Concatenate indices to match Dion2-style gather for selection
+    indices = torch.stack(indices_list, dim=0)
+    indices_expanded = indices.unsqueeze(-1)
+    V_sel_stacked = torch.gather(V_stacked, dim=-2, index=indices_expanded).float() # upcast to fp32 for compute
 
     U_stacked, V_stacked = normuon_normalization_stacked(U_stacked, V_sel_stacked, muon_beta2)
     U_normed = [U_stacked[i] for i in range(N)]
 
-    # Copy back V: truncate fp32 -> bf16 on write-back
-    for i, (v, indices) in enumerate(zip(V_local, indices_list)):
-        v.index_copy_(dim=select_dim, index=indices, source=V_stacked[i].to(v.dtype))
+    for v, idx, v_sel in zip(V_local, indices_list, V_stacked):
+        idx_exp = idx.unsqueeze(-1)
+        v.scatter_(dim=-2, index=idx_exp, src=v_sel.to(v.dtype))
 
     # Compute scaled learning rate
     # Do this before to_local(X) because we use the full tensor shape, not the shard shape
