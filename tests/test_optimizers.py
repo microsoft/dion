@@ -9,12 +9,14 @@ Tests cover:
 - Step timing: optimizer step takes measurable wall-clock time
 """
 
+import os
 import pytest
 import time
 import torch
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CUDA_AVAILABLE = torch.cuda.is_available()
+CUDA_DEVICE_COUNT = torch.cuda.device_count() if CUDA_AVAILABLE else 0
 
 # Bump torch.compile cache size to avoid recompilation failures
 # when the same compiled function sees different input shapes across tests.
@@ -623,3 +625,103 @@ class TestTiming:
         t1 = time.perf_counter()
         # Should register nonzero time
         assert t1 > t0
+
+
+# ---------------------------------------------------------------------------
+# Empty FSDP2 local shards (Dion2 / NorDion2)
+# ---------------------------------------------------------------------------
+# FSDP2 contiguous chunking leaves some ranks with an empty (size-0) local
+# shard along the sharded dim when the param's sharded dim is smaller than
+# world_size (or doesn't divide evenly to fill all ranks). dion2_pre_orthogonalize
+# computes topk(k>=1) over that dim, which raised "k not in range for dimension"
+# under torch.compile's fake-tensor pass and deadlocked the remaining ranks at
+# the NCCL all-to-all. These tests pin the empty-shard short-circuit.
+
+def test_dion2_pre_orthogonalize_empty_row_shard():
+    from dion.dion2 import dion2_pre_orthogonalize
+    cols, n = 16, 4
+    M = [torch.zeros(0, cols) for _ in range(n)]
+    G = [torch.randn(0, cols) for _ in range(n)]
+    U, indices = dion2_pre_orthogonalize(
+        G=G, M=M, fraction=0.5, ef_decay=torch.tensor(0.95), select_dim=-2
+    )
+    assert len(U) == n and len(indices) == n
+    for u, idx in zip(U, indices):
+        assert tuple(u.shape) == (0, cols)
+        assert u.dtype == torch.bfloat16
+        assert tuple(idx.shape) == (0,)
+        assert idx.dtype == torch.long
+
+
+def test_dion2_pre_orthogonalize_empty_col_shard():
+    from dion.dion2 import dion2_pre_orthogonalize
+    rows, n = 16, 4
+    M = [torch.zeros(rows, 0) for _ in range(n)]
+    G = [torch.randn(rows, 0) for _ in range(n)]
+    U, indices = dion2_pre_orthogonalize(
+        G=G, M=M, fraction=0.5, ef_decay=torch.tensor(0.95), select_dim=-1
+    )
+    assert len(U) == n and len(indices) == n
+    for u, idx in zip(U, indices):
+        assert tuple(u.shape) == (rows, 0)
+        assert u.dtype == torch.bfloat16
+        assert tuple(idx.shape) == (0,)
+        assert idx.dtype == torch.long
+
+
+def _dion2_empty_shard_step_worker(rank, world_size, opt_name, global_rows, cols, port):
+    import torch.distributed as dist
+    from torch.distributed.tensor import distribute_tensor, Shard, init_device_mesh
+    from dion import Dion2, NorDion2
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    torch.cuda.set_device(rank)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    mesh = init_device_mesh("cuda", (world_size,))
+    device = torch.device(f"cuda:{rank}")
+    cls = {"Dion2": Dion2, "NorDion2": NorDion2}[opt_name]
+
+    torch.manual_seed(0)
+    full = torch.randn(global_rows, cols, device=device)
+    # Row-sharded over world_size: ranks beyond ceil(global_rows / world_size)
+    # contiguous chunks hold an empty (0, cols) local shard.
+    param = torch.nn.Parameter(distribute_tensor(full, mesh, [Shard(0)]))
+    before = param.to_local().clone()
+
+    opt = cls([param], distributed_mesh=mesh, lr=0.01)
+    for step in range(3):
+        torch.manual_seed(step + 1)
+        g = torch.randn(global_rows, cols, device=device)
+        param.grad = distribute_tensor(g, mesh, [Shard(0)])
+        opt.step()
+
+    local_after = param.to_local()
+    if local_after.shape[0] > 0:
+        assert not torch.equal(local_after, before), f"rank {rank}: weights did not update"
+    else:
+        assert torch.equal(local_after, before), f"rank {rank}: empty shard mutated"
+    dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("opt_name", ["Dion2", "NorDion2"])
+@pytest.mark.parametrize(
+    "world_size, global_rows",
+    [
+        (2, 1),  # rank 1 holds an empty (0, cols) shard
+        (4, 2),  # ranks 2 and 3 empty
+        (4, 5),  # chunk sizes (2, 2, 1, 0): rank 3 empty (mirrors sparse-3b (18, D)/8)
+    ],
+)
+def test_dion2_optimizer_step_with_empty_shard(opt_name, world_size, global_rows):
+    import torch.multiprocessing as mp
+
+    if CUDA_DEVICE_COUNT < world_size:
+        pytest.skip(f"needs >= {world_size} CUDA devices for NCCL alltoall")
+    port = 29800 + world_size * 10 + global_rows
+    mp.spawn(
+        _dion2_empty_shard_step_worker,
+        args=(world_size, opt_name, global_rows, 16, port),
+        nprocs=world_size,
+        join=True,
+    )
