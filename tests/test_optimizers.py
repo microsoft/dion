@@ -574,7 +574,7 @@ def test_dion2_pre_orthogonalize_empty_col_shard():
         assert idx.dtype == torch.long
 
 
-def _dion2_empty_shard_step_worker(rank, world_size, global_rows, cols, port):
+def _dion2_empty_shard_step_worker(rank, world_size, global_rows, cols, port, triton_post_ortho):
     import torch.distributed as dist
     from torch.distributed.tensor import distribute_tensor, Shard, init_device_mesh
     from dion import Dion2
@@ -593,7 +593,7 @@ def _dion2_empty_shard_step_worker(rank, world_size, global_rows, cols, port):
     param = torch.nn.Parameter(distribute_tensor(full, mesh, [Shard(0)]))
     before = param.to_local().clone()
 
-    opt = Dion2([param], distributed_mesh=mesh, lr=0.01)
+    opt = Dion2([param], distributed_mesh=mesh, lr=0.01, triton_post_ortho=triton_post_ortho)
     for step in range(3):
         torch.manual_seed(step + 1)
         g = torch.randn(global_rows, cols, device=device)
@@ -608,6 +608,10 @@ def _dion2_empty_shard_step_worker(rank, world_size, global_rows, cols, port):
     dist.destroy_process_group()
 
 
+# triton_post_ortho=True exercises dion2_post_orthogonalize_triton, whose
+# B = x.numel() // (M * N) divides by zero on the empty (0, cols) shard unless
+# the empty rank is skipped; the default (False) path no-ops via scatter_add_.
+@pytest.mark.parametrize("triton_post_ortho", [False, True])
 @pytest.mark.parametrize(
     "world_size, global_rows",
     [
@@ -616,15 +620,20 @@ def _dion2_empty_shard_step_worker(rank, world_size, global_rows, cols, port):
         (4, 5),  # chunk sizes (2, 2, 1, 0): rank 3 empty (mirrors sparse-3b (18, D)/8)
     ],
 )
-def test_dion2_optimizer_step_with_empty_shard(world_size, global_rows):
+def test_dion2_optimizer_step_with_empty_shard(world_size, global_rows, triton_post_ortho):
     import torch.multiprocessing as mp
 
     if CUDA_DEVICE_COUNT < world_size:
         pytest.skip(f"needs >= {world_size} CUDA devices for NCCL alltoall")
-    port = 29800 + world_size * 10 + global_rows
+    if triton_post_ortho:
+        try:
+            import triton  # noqa: F401
+        except ImportError:
+            pytest.skip("triton not installed")
+    port = 29800 + world_size * 10 + global_rows + (1000 if triton_post_ortho else 0)
     mp.spawn(
         _dion2_empty_shard_step_worker,
-        args=(world_size, global_rows, 16, port),
+        args=(world_size, global_rows, 16, port, triton_post_ortho),
         nprocs=world_size,
         join=True,
     )
