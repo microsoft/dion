@@ -349,6 +349,21 @@ def dion2_pre_orthogonalize(
     G = [g.to(dtype=dtype) for g in G]
     torch._foreach_add_(M, G)
 
+    # Empty local shard along select_dim: FSDP2 contiguous chunking leaves this
+    # rank with a size-0 shard when the param's sharded dim is smaller than
+    # world_size (or doesn't divide evenly to fill all ranks). There is nothing
+    # to select here, and topk(k>=1) over a size-0 dimension raises "k not in
+    # range for dimension". Short-circuit with empty submatrices (downstream
+    # megabatch_orthogonalize_async pads these to padded_local_size; the real
+    # orthogonalization runs on the gathered global tensor) and empty index
+    # tensors (post-orthogonalize scatter_add over an empty index is a no-op on
+    # this rank). num_select is a static int at trace time, so this branch is
+    # torch.compile-safe.
+    if num_select == 0:
+        U_selected = [m.to(dtype=torch.bfloat16) for m in M]
+        indices_list = [torch.empty(0, dtype=torch.long, device=M[0].device) for _ in M]
+        return U_selected, indices_list
+
     M_stacked = torch.stack(M, dim=0)
 
     # Compute L1 norm along norm_dim (sum of absolute values)
