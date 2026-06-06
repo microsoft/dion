@@ -178,13 +178,20 @@ def dion2_post_orthogonalize_triton(
         import os as _os
         _full = x.shape[-2] if SELECT_ROWS else x.shape[-1]
         _uk = u.shape[-2] if SELECT_ROWS else u.shape[-1]
-        print(
-            f"[POSTORTHO r{_os.environ.get('RANK','?')}] x={tuple(x.shape)} u={tuple(u.shape)} "
-            f"idx={tuple(idx.shape)} idxmax={int(idx.max()) if idx.numel() else 'NA'} "
+        _line = (
+            f"sd={select_dim} x={tuple(x.shape)} u={tuple(u.shape)} idx={tuple(idx.shape)} "
+            f"idxmin={int(idx.min()) if idx.numel() else 'NA'} idxmax={int(idx.max()) if idx.numel() else 'NA'} "
             f"full_dim={_full} u_k={_uk} uContig={u.is_contiguous()} idxContig={idx.is_contiguous()} "
-            f"OOB_idx={(idx.numel()>0 and int(idx.max())>=_full)} OOB_k={(idx.shape[-1]>_uk)}",
-            flush=True,
+            f"OOB_idx={(idx.numel()>0 and int(idx.max())>=_full)} OOB_k={(idx.shape[-1]>_uk)}\n"
         )
+        try:
+            _f = _os.path.join(_os.environ.get("OUTPUT_ROOT", "/tmp"), f"postortho_r{_os.environ.get('RANK','x')}.log")
+            with open(_f, "a") as _h:
+                _h.write(_line)
+                _h.flush()
+                _os.fsync(_h.fileno())
+        except Exception:
+            pass
         if not x.is_contiguous():
             raise ValueError("dion2_post_orthogonalize_triton requires contiguous X tensors")
         orig_shape = x.shape
