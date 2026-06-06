@@ -1,5 +1,6 @@
 import torch
 from torch import Tensor
+from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 from typing import List
 
 try:
@@ -162,12 +163,16 @@ def dion2_post_orthogonalize_triton(
         raise ValueError(f"select_dim must be -2 or -1, got {select_dim}")
 
     # The kernel writes X in-place through a raw data pointer, which is only valid
-    # for plain dense tensors. Tensor subclasses (e.g. the quantized-weight
-    # wrappers used by MXFP8 training) do not expose a dense buffer in the logical
-    # dtype/layout at data_ptr(), so a raw write corrupts memory and triggers an
-    # illegal memory access. Fall back to the eager implementation, which routes
-    # through __torch_dispatch__ and handles subclasses correctly.
-    if any(type(x) is not torch.Tensor for x in X):
+    # for tensors backed by a dense buffer in their logical dtype/layout. Traceable
+    # wrapper subclasses (e.g. the quantized-weight wrappers used by MXFP8 training,
+    # or DTensor) hold their data in wrapped inner tensors and do not expose such a
+    # buffer at data_ptr(), so a raw write corrupts memory and triggers an illegal
+    # memory access. Fall back to the eager implementation, which routes through
+    # __torch_dispatch__ and updates the wrapped weight correctly. Plain dense
+    # subclasses such as nn.Parameter are not wrapper subclasses and stay on the
+    # kernel, so the single-GPU/DDP path (where params are not converted by
+    # to_local) keeps the fast path.
+    if any(is_traceable_wrapper_subclass(x) for x in X):
         from .dion2 import dion2_post_orthogonalize
 
         dion2_post_orthogonalize(
