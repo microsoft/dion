@@ -87,6 +87,38 @@ def _build_selected_mask(indices, select_dim, shape):
     return full_mask.reshape(shape)
 
 
+class _MockWrapperTensor(torch.Tensor):
+    # Minimal tensor subclass standing in for a quantized-weight wrapper such as
+    # MXFP8 training's MXFP8TrainingWeightWrapperTensor. type(x) is not Tensor,
+    # so the raw Triton kernel must not write through its data_ptr().
+    pass
+
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA required")
+@pytest.mark.parametrize("select_dim", [-2, -1])
+def test_post_ortho_triton_falls_back_for_tensor_subclass(select_dim):
+    M, N, k = 64, 128, 16
+    X, U, indices = _make_test_data((M, N), k, select_dim)
+    base_lr = torch.tensor(0.1, device=DEVICE)
+    adjusted_lr = torch.tensor(0.05, device=DEVICE)
+    weight_decay = torch.tensor(0.01, device=DEVICE)
+
+    x_ref = X.clone()
+    dion2_post_orthogonalize(
+        [x_ref], [U], [indices], base_lr, adjusted_lr, weight_decay, select_dim
+    )
+
+    x_sub = X.clone().as_subclass(_MockWrapperTensor)
+    dion2_post_orthogonalize_triton(
+        [x_sub], [U], [indices], base_lr, adjusted_lr, weight_decay, select_dim
+    )
+
+    assert type(x_sub) is _MockWrapperTensor
+    torch.testing.assert_close(
+        x_sub.as_subclass(torch.Tensor), x_ref, rtol=1e-5, atol=1e-6
+    )
+
+
 # ---------------------------------------------------------------------------
 # Function-level tests
 # ---------------------------------------------------------------------------
