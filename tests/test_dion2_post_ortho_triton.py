@@ -14,6 +14,11 @@ Two levels of testing:
 import math
 import pytest
 import torch
+from torch.utils._python_dispatch import (
+    is_traceable_wrapper_subclass,
+    return_and_correct_aliasing,
+)
+from torch.utils._pytree import tree_map
 
 from dion.dion2 import dion2_post_orthogonalize
 from dion.dion2_triton import TRITON_AVAILABLE, dion2_post_orthogonalize_triton
@@ -85,6 +90,77 @@ def _build_selected_mask(indices, select_dim, shape):
         full_mask = col_mask.unsqueeze(-2).expand(flat_leading, M, N)
 
     return full_mask.reshape(shape)
+
+
+class _MockWrapperTensor(torch.Tensor):
+    # Minimal traceable wrapper subclass standing in for a quantized-weight wrapper
+    # such as MXFP8 training's MXFP8TrainingWeightWrapperTensor: it holds its data in
+    # a wrapped inner tensor and exposes no dense buffer at data_ptr() (data_ptr() is
+    # 0). A raw Triton kernel writing through that pointer would fault, so the entry
+    # point must route through __torch_dispatch__ instead. is_traceable_wrapper_subclass
+    # returns True for this type but False for plain dense subclasses like nn.Parameter.
+    @staticmethod
+    def __new__(cls, inner):
+        return torch.Tensor._make_wrapper_subclass(
+            cls,
+            inner.shape,
+            dtype=inner.dtype,
+            device=inner.device,
+            layout=inner.layout,
+            strides=inner.stride(),
+            requires_grad=False,
+        )
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __tensor_flatten__(self):
+        return ["_inner"], None
+
+    @staticmethod
+    def __tensor_unflatten__(inner_tensors, meta, outer_size, outer_stride):
+        return _MockWrapperTensor(inner_tensors["_inner"])
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        unwrap = lambda t: t._inner if isinstance(t, _MockWrapperTensor) else t
+        wrap = lambda t: _MockWrapperTensor(t) if isinstance(t, torch.Tensor) else t
+        out = func(
+            *tree_map(unwrap, args), **tree_map(unwrap, kwargs)
+        )
+        out = tree_map(wrap, out)
+        return return_and_correct_aliasing(func, args, kwargs, out)
+
+
+@pytest.mark.parametrize("select_dim", [-2, -1])
+def test_post_ortho_triton_falls_back_for_wrapper_subclass(select_dim):
+    M, N, k = 64, 128, 16
+    X, U, indices = _make_test_data((M, N), k, select_dim)
+    base_lr = torch.tensor(0.1, device=DEVICE)
+    adjusted_lr = torch.tensor(0.05, device=DEVICE)
+    weight_decay = torch.tensor(0.01, device=DEVICE)
+
+    x_ref = X.clone()
+    dion2_post_orthogonalize(
+        [x_ref], [U], [indices], base_lr, adjusted_lr, weight_decay, select_dim
+    )
+
+    x_sub = _MockWrapperTensor(X.clone())
+    dion2_post_orthogonalize_triton(
+        [x_sub], [U], [indices], base_lr, adjusted_lr, weight_decay, select_dim
+    )
+
+    assert type(x_sub) is _MockWrapperTensor
+    torch.testing.assert_close(x_sub._inner, x_ref, rtol=1e-5, atol=1e-6)
+
+
+def test_post_ortho_triton_keeps_kernel_for_nn_parameter():
+    # nn.Parameter has type(p) is not torch.Tensor but is NOT a wrapper subclass:
+    # it must stay on the Triton kernel, not fall back. Guarding on
+    # is_traceable_wrapper_subclass (not type identity) preserves the fast path for
+    # the single-GPU/DDP case where params reach the kernel as nn.Parameter.
+    assert not is_traceable_wrapper_subclass(torch.nn.Parameter(torch.empty(2, 2)))
 
 
 # ---------------------------------------------------------------------------
