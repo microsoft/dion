@@ -188,6 +188,12 @@ def dion2_post_orthogonalize_triton(
     SELECT_ROWS = select_dim == -2
 
     for x, u, idx in zip(X, U, indices):
+        # Empty FSDP2 local shard (sharded dim < world_size or uneven chunking):
+        # nothing to write back on this rank. The non-triton path no-ops naturally
+        # via scatter_add_ over an empty index; here we must skip explicitly because
+        # B = x.numel() // (M * N) divides by zero when M or N is 0.
+        if x.numel() == 0:
+            continue
         if not x.is_contiguous():
             raise ValueError("dion2_post_orthogonalize_triton requires contiguous X tensors")
         orig_shape = x.shape
