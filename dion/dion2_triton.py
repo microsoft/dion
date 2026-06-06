@@ -175,6 +175,16 @@ def dion2_post_orthogonalize_triton(
         # no-ops here via scatter_add_ over an empty index.
         if x.numel() == 0:
             continue
+        import os as _os
+        _full = x.shape[-2] if SELECT_ROWS else x.shape[-1]
+        _uk = u.shape[-2] if SELECT_ROWS else u.shape[-1]
+        print(
+            f"[POSTORTHO r{_os.environ.get('RANK','?')}] x={tuple(x.shape)} u={tuple(u.shape)} "
+            f"idx={tuple(idx.shape)} idxmax={int(idx.max()) if idx.numel() else 'NA'} "
+            f"full_dim={_full} u_k={_uk} uContig={u.is_contiguous()} idxContig={idx.is_contiguous()} "
+            f"OOB_idx={(idx.numel()>0 and int(idx.max())>=_full)} OOB_k={(idx.shape[-1]>_uk)}",
+            flush=True,
+        )
         if not x.is_contiguous():
             raise ValueError("dion2_post_orthogonalize_triton requires contiguous X tensors")
         orig_shape = x.shape
