@@ -178,11 +178,19 @@ def dion2_post_orthogonalize_triton(
         import os as _os
         _full = x.shape[-2] if SELECT_ROWS else x.shape[-1]
         _uk = u.shape[-2] if SELECT_ROWS else u.shape[-1]
+        def _meta(t):
+            try:
+                st = t.untyped_storage().nbytes() // t.element_size()
+            except Exception:
+                st = "?"
+            return f"{type(t).__name__}/{t.dtype}/numel={t.numel()}/store={st}/off={t.storage_offset()}/stride={tuple(t.stride())}"
         _line = (
-            f"sd={select_dim} x={tuple(x.shape)} u={tuple(u.shape)} idx={tuple(idx.shape)} "
-            f"idxmin={int(idx.min()) if idx.numel() else 'NA'} idxmax={int(idx.max()) if idx.numel() else 'NA'} "
-            f"full_dim={_full} u_k={_uk} uContig={u.is_contiguous()} idxContig={idx.is_contiguous()} "
-            f"OOB_idx={(idx.numel()>0 and int(idx.max())>=_full)} OOB_k={(idx.shape[-1]>_uk)}\n"
+            f"sd={select_dim} nX={len(X)} nU={len(U)} nI={len(indices)} "
+            f"x[{_meta(x)}] u[{_meta(u)}] idx[{_meta(idx)}] "
+            f"full_dim={_full} u_k={_uk} idxmax={int(idx.max()) if idx.numel() else 'NA'} "
+            f"OOB_idx={(idx.numel()>0 and int(idx.max())>=_full)} OOB_k={(idx.shape[-1]>_uk)} "
+            f"xStoreLT={ (lambda s: isinstance(s,int) and s < x.numel())(x.untyped_storage().nbytes()//x.element_size() if x.untyped_storage() else 0) } "
+            f"uStoreLT={ (lambda s: isinstance(s,int) and s < u.numel())(u.untyped_storage().nbytes()//u.element_size() if u.untyped_storage() else 0) }\n"
         )
         try:
             _f = _os.path.join(_os.environ.get("OUTPUT_ROOT", "/tmp"), f"postortho_r{_os.environ.get('RANK','x')}.log")
