@@ -248,8 +248,14 @@ class TestNorDion2:
         for i in range(n):
             v_ref[i].scatter_(dim=-2, index=idx[i], src=v_sel_new[i].to(v_ref.dtype))
 
-        torch.testing.assert_close(u_fused, u_ref, atol=0, rtol=0)
-        torch.testing.assert_close(v_fused, v_ref, atol=0, rtol=0)
+        # The fused helper and the reference run through different inductor
+        # fusion groupings (gather/normalize/scatter fused into one graph vs
+        # eager gather/scatter around a separately compiled normalization), so
+        # they are not guaranteed bit-identical: inductor may reorder the fp32
+        # reductions/divisions, leaving last-ULP differences. Compare at the
+        # same fp tolerance as the sibling parity tests.
+        torch.testing.assert_close(u_fused, u_ref, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(v_fused, v_ref, atol=1e-5, rtol=1e-5)
 
 # ---------------------------------------------------------------------------
 # Dion2
