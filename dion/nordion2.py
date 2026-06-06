@@ -275,23 +275,22 @@ def nordion2_update_megabatch_async(
         global_comm_dim_size=global_comm_dim_size,
     )
 
-    # Update variance neuron buffer for each selected row and normalize orthonormalized update
-    # V is stored in param dtype (bf16) but compute is done in fp32
+    # Update variance neuron buffer for the selected rows and normalize the
+    # orthonormalized update. The gather of the selected variance rows, the
+    # NorMuon normalization (fp32 compute, V stored bf16), and the scatter of
+    # the updated rows back into the full buffer are fused into one compiled
+    # graph so the per-param Python scatter loop and the eager gather/normalize
+    # graph boundary collapse into a single launch per shape group.
     V_local = to_local(V)
     U_stacked = torch.stack(U_ortho)
     V_stacked = torch.stack(V_local)
-    
-    # Concatenate indices to match Dion2-style gather for selection
     indices = torch.stack(indices_list, dim=0)
-    indices_expanded = indices.unsqueeze(-1)
-    V_sel_stacked = torch.gather(V_stacked, dim=-2, index=indices_expanded).float() # upcast to fp32 for compute
 
-    U_stacked, V_stacked = normuon_normalization_stacked(U_stacked, V_sel_stacked, muon_beta2)
+    U_stacked, V_stacked = nordion2_normalize_selected_stacked(
+        U_stacked, V_stacked, indices, muon_beta2
+    )
     U_normed = [U_stacked[i] for i in range(N)]
-
-    for v, idx, v_sel in zip(V_local, indices_list, V_stacked):
-        idx_exp = idx.unsqueeze(-1)
-        v.scatter_(dim=-2, index=idx_exp, src=v_sel.to(v.dtype))
+    torch._foreach_copy_(V_local, list(V_stacked.unbind(0)))
 
     # Compute scaled learning rate
     # Do this before to_local(X) because we use the full tensor shape, not the shard shape
@@ -330,3 +329,24 @@ def nordion2_update_megabatch_async(
             weight_decay=weight_decay,
             select_dim=select_dim,
         )
+
+
+@torch.compile(fullgraph=True)
+def nordion2_normalize_selected_stacked(
+    U: Tensor,  # [N, k, cols]  orthogonalized selected rows
+    V_full: Tensor,  # [N, rows, 1]  full per-neuron variance buffer (param dtype)
+    indices: Tensor,  # [N, k]  selected row indices
+    muon_beta2: Tensor,
+) -> Tuple[Tensor, Tensor]:
+    """
+    Gather the selected variance rows, run NorMuon normalization on them, and
+    scatter the updated rows back into the full variance buffer, all in one
+    compiled graph. Compute is done in fp32 (V stored in param dtype); the
+    returned V_full has the same dtype as the input.
+    Returns (normalized_U, updated_V_full).
+    """
+    idx = indices.unsqueeze(-1)
+    V_sel = torch.gather(V_full, dim=-2, index=idx).float()
+    U_normed, V_sel_new = normuon_normalization_stacked(U, V_sel, muon_beta2)
+    V_full = V_full.scatter(dim=-2, index=idx, src=V_sel_new.to(V_full.dtype))
+    return U_normed, V_full

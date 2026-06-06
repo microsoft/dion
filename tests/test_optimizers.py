@@ -225,6 +225,32 @@ class TestNorDion2:
         r2 = _run_steps(NorDion2, p2, dict(lr=0.01, triton_post_ortho=True))
         torch.testing.assert_close(r1[0], r2[0], atol=1e-5, rtol=1e-5)
 
+    def test_normalize_selected_stacked_matches_unfused(self):
+        from dion.nordion2 import nordion2_normalize_selected_stacked
+        from dion.normuon import normuon_normalization_stacked
+        torch.manual_seed(3)
+        n, rows, cols, k = 4, 16, 32, 8
+        u = torch.randn(n, k, cols, device=DEVICE, dtype=torch.bfloat16)
+        v_full = torch.rand(n, rows, 1, device=DEVICE, dtype=torch.bfloat16)
+        indices = torch.stack(
+            [torch.randperm(rows, device=DEVICE)[:k] for _ in range(n)], dim=0
+        )
+        beta2 = torch.tensor(0.9)
+
+        u_fused, v_fused = nordion2_normalize_selected_stacked(
+            u.clone(), v_full.clone(), indices, beta2
+        )
+
+        idx = indices.unsqueeze(-1)
+        v_sel = torch.gather(v_full, dim=-2, index=idx).float()
+        u_ref, v_sel_new = normuon_normalization_stacked(u.clone(), v_sel, beta2)
+        v_ref = v_full.clone()
+        for i in range(n):
+            v_ref[i].scatter_(dim=-2, index=idx[i], src=v_sel_new[i].to(v_ref.dtype))
+
+        torch.testing.assert_close(u_fused, u_ref, atol=0, rtol=0)
+        torch.testing.assert_close(v_fused, v_ref, atol=0, rtol=0)
+
 # ---------------------------------------------------------------------------
 # Dion2
 # ---------------------------------------------------------------------------
