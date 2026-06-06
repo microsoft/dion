@@ -20,7 +20,7 @@ from torch.utils._python_dispatch import (
 )
 from torch.utils._pytree import tree_map
 
-from dion.dion2 import dion2_post_orthogonalize
+from dion.dion2 import dion2_post_orthogonalize, dion2_post_orthogonalize_fused
 from dion.dion2_triton import TRITON_AVAILABLE, dion2_post_orthogonalize_triton
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -133,16 +133,20 @@ class _MockWrapperTensor(torch.Tensor):
         return return_and_correct_aliasing(func, args, kwargs, out)
 
 
+@pytest.mark.parametrize("shape", [(64, 128), (4, 32, 128)])
 @pytest.mark.parametrize("select_dim", [-2, -1])
-def test_post_ortho_triton_falls_back_for_wrapper_subclass(select_dim):
-    M, N, k = 64, 128, 16
-    X, U, indices = _make_test_data((M, N), k, select_dim)
+@pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16])
+def test_post_ortho_triton_falls_back_for_wrapper_subclass(shape, select_dim, x_dtype):
+    k = 16
+    X, U, indices = _make_test_data(shape, k, select_dim, x_dtype=x_dtype)
     base_lr = torch.tensor(0.1, device=DEVICE)
     adjusted_lr = torch.tensor(0.05, device=DEVICE)
     weight_decay = torch.tensor(0.01, device=DEVICE)
 
+    # A wrapper subclass routes to the single-rounding dion2_post_orthogonalize_fused
+    # (dispatch-safe), not the raw kernel and not the two-rounding eager path.
     x_ref = X.clone()
-    dion2_post_orthogonalize(
+    dion2_post_orthogonalize_fused(
         [x_ref], [U], [indices], base_lr, adjusted_lr, weight_decay, select_dim
     )
 
@@ -152,7 +156,35 @@ def test_post_ortho_triton_falls_back_for_wrapper_subclass(select_dim):
     )
 
     assert type(x_sub) is _MockWrapperTensor
-    torch.testing.assert_close(x_sub._inner, x_ref, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(x_sub._inner, x_ref, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not TRITON_AND_CUDA, reason="CUDA and Triton required")
+@pytest.mark.parametrize("shape", [(64, 128), (4, 32, 128)])
+@pytest.mark.parametrize("select_dim", [-2, -1])
+def test_fused_eager_matches_kernel_single_rounding(shape, select_dim):
+    k = 16
+    X, U, indices = _make_test_data(shape, k, select_dim, x_dtype=torch.bfloat16)
+    base_lr = torch.tensor(0.1, device=DEVICE)
+    adjusted_lr = torch.tensor(0.05, device=DEVICE)
+    weight_decay = torch.tensor(0.01, device=DEVICE)
+    kwargs = dict(indices=[indices], base_lr=base_lr, adjusted_lr=adjusted_lr,
+                  weight_decay=weight_decay, select_dim=select_dim)
+
+    x_kernel = X.clone()
+    dion2_post_orthogonalize_triton(X=[x_kernel], U=[U.clone()], **kwargs)
+    x_fused = X.clone()
+    dion2_post_orthogonalize_fused(X=[x_fused], U=[U.clone()], **kwargs)
+    x_eager = X.clone()
+    dion2_post_orthogonalize(X=[x_eager], U=[U.clone()], **kwargs)
+
+    sel = _build_selected_mask(indices, select_dim, shape)
+    # The dispatch-safe fused path reproduces the kernel's single rounding:
+    # unselected entries are bit-identical, selected match within bf16 rounding.
+    torch.testing.assert_close(x_fused[~sel], x_kernel[~sel], rtol=0, atol=0)
+    torch.testing.assert_close(x_fused, x_kernel, rtol=5e-3, atol=5e-3)
+    # And it differs from the two-rounding eager path on the selected slices.
+    assert not torch.equal(x_fused[sel], x_eager[sel])
 
 
 def test_post_ortho_triton_keeps_kernel_for_nn_parameter():
