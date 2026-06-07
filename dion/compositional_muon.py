@@ -1,0 +1,504 @@
+"""Compositional Muon (CM): partner-whitened steepest descent for QK / OV.
+
+Muon controls the operator norm of *each* weight update. Compositional Muon
+controls the operator norm of the *composed* update the loss actually sees -- the
+QK product ``M = W_Q W_K^T`` and the OV product ``W_O W_V`` -- by whitening each
+factor's gradient with its partner's inverse Gram root before the spectral sign
+and scaling by it again afterward::
+
+    C_K = (W_K^T W_K + lam I)^{1/2}
+    Delta_Q = -(eta/2) msign(G_Q C_K^{-1}) C_K^{-1}
+    Delta_K = -(eta/2) msign(G_K C_Q^{-1}) C_Q^{-1}    # symmetric; OV analogous
+
+``msign(A) = U V^T`` for the thin SVD ``A = U S V^T`` (computed with Newton-Schulz,
+reusing dion's :func:`polar_express`). The ``eta/2`` is the half-split budget so the
+*product* perturbation stays within the operator-norm trust region.
+
+This module ports the recommended configuration of the reference implementation
+(``method="half_split"``, full partner whitening, OV ``hybrid`` granularity, no
+gauge connection) and generalizes it to grouped-query attention and to FSDP2 /
+DDP via per-factor ``full_tensor()`` gather.
+
+Compositional Muon by Tilde Research:
+    https://blog.tilderesearch.com/blog/compositional-muon
+    https://github.com/tilde-research/comp-muon-release
+
+Grouped-query attention generalization (reduces exactly to the MHA reference when
+there is one query head per KV head): a shared K/V head pairs with ``G = H_q/H_kv``
+query heads, so the per-query factor expands the KV-head Gram root over query heads
+(``repeat_interleave``) while the shared factor aggregates the group's Grams (sum)
+and takes ``1/G`` of the step budget (the blog allocates the shared-side budget as
+``eta/(2 * query_heads_per_group)``).
+"""
+
+import math
+import torch
+from torch import Tensor
+from torch.distributed.tensor import DTensor
+from torch.optim.optimizer import Optimizer, ParamsT
+from typing import List, Optional, Tuple
+
+from .polar_express import polar_express
+from .scalar_opts import adamw_update, lion_update
+
+_CM_ALGORITHMS = ("cm_qk", "cm_ov", "muon", "adamw", "lion")
+
+# Coupled Newton-Schulz (CANS, arxiv 2506.10935) schedule for the batched inverse
+# Gram root: 9 tuned (a, b) pairs then classic (1.5, -0.5) padding. Drives
+# Y -> W^{1/2}, Z -> W^{-1/2} with both legs symmetrized each step.
+_CANS_COEFFS: List[Tuple[float, float]] = [
+    (5.182503604966906, -5.178098480082684),
+    (2.586120737395915, -0.6479542005271643),
+    (2.567364126726186, -0.6454968804392178),
+    (2.520560084348265, -0.6393528082067044),
+    (2.410759275435182, -0.6248683598710716),
+    (2.1883348130094173, -0.5952022073798908),
+    (1.8595760874873613, -0.5504490972723968),
+    (1.589020160467417, -0.5126569802066718),
+    (1.5051653981684994, -0.5007377068751799),
+] + [(1.5, -0.5)] * 16
+
+
+# ---------------------------------------------------------------------------
+# Math helpers (all in math / un-transposed convention, fp32)
+# ---------------------------------------------------------------------------
+
+
+def _msign(x: Tensor, eps: float) -> Tensor:
+    """Spectral sign ``U V^T`` via dion's Polar Express Newton-Schulz (batched)."""
+    return polar_express(x, eps).to(torch.float32)
+
+
+def _coupled_inv_sqrt(gram: Tensor, damping: float) -> Tensor:
+    """``(gram + damping I)^{-1/2}`` via the coupled Newton-Schulz iteration.
+
+    Accepts a batched stack of SPD matrices ``(H, n, n)`` (each normalized on its
+    own). No eigendecomposition; runs in fp32.
+    """
+    n = gram.shape[-1]
+    eye = torch.eye(n, device=gram.device, dtype=torch.float32)
+    W = gram.to(torch.float32) + damping * eye
+    scale = (1 - 1e-3) / W.norm(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
+    Y = W * scale
+    Z = eye.expand_as(W).contiguous() if W.ndim == 3 else eye
+    fused = torch.baddbmm if W.ndim == 3 else torch.addmm
+    for a, b in _CANS_COEFFS:
+        M = Z @ Y
+        Y_next = fused(Y, Y, M, beta=a, alpha=b)
+        Z_next = fused(Z, M, Z, beta=a, alpha=b)
+        Y = 0.5 * (Y_next + Y_next.mT)
+        Z = 0.5 * (Z_next + Z_next.mT)
+    return Z * torch.sqrt(scale)
+
+
+def _to_heads_row(W: Tensor, num_heads: int, head_dim: int) -> Tensor:
+    """``(d, num_heads * head_dim) -> (num_heads, d, head_dim)`` (heads on cols)."""
+    d = W.shape[0]
+    return W.view(d, num_heads, head_dim).transpose(0, 1).contiguous()
+
+
+def _from_heads_row(W_h: Tensor, d: int, cols: int) -> Tensor:
+    """Inverse of :func:`_to_heads_row`: ``(num_heads, d, head_dim) -> (d, cols)``."""
+    return W_h.transpose(0, 1).contiguous().view(d, cols)
+
+
+def _partner_roots(
+    gram_per_query: Tensor, gram_shared: Tensor, group_size: int, damping: float
+) -> Tuple[Tensor, Tensor]:
+    """Inverse Gram roots for a GQA factor pair.
+
+    ``gram_per_query`` are the ``H_q`` per-query-head Grams; ``gram_shared`` the
+    ``H_kv`` shared-head Grams. Returns ``(C_shared_inv, C_perquery_inv_expanded)``:
+    the shared-side root is the per-query partner aggregated over each group (sum
+    of the group's Grams), and the per-query-side root is the shared partner's root
+    repeated over the query heads of its group. For MHA (``group_size == 1``) both
+    are plain per-head roots.
+    """
+    H_kv = gram_shared.shape[0]
+    head_dim = gram_shared.shape[-1]
+    gram_grouped = gram_per_query.view(H_kv, group_size, head_dim, head_dim).sum(1)
+    C_shared_inv = _coupled_inv_sqrt(gram_grouped, damping)
+    C_perquery_inv = _coupled_inv_sqrt(gram_shared, damping)
+    C_perquery_inv_expanded = C_perquery_inv.repeat_interleave(group_size, dim=0)
+    return C_shared_inv, C_perquery_inv_expanded
+
+
+def qk_delta(
+    W_Q: Tensor,
+    W_K: Tensor,
+    G_Q: Tensor,
+    G_K: Tensor,
+    head_dim: int,
+    *,
+    damping: float = 1e-2,
+    eps: float = 1e-7,
+) -> Tuple[Tensor, Tensor]:
+    """Half-split, full-whitening QK direction (math convention, fp32).
+
+    ``W_Q, W_K, G_Q, G_K`` are ``(d_model, H * head_dim)`` (Q has ``H_q`` heads, K
+    has ``H_kv``, with ``H_q`` a multiple of ``H_kv`` for GQA). Returns the
+    orthogonalized directions ``(delta_Q, delta_K)`` before any learning-rate /
+    budget / weight-decay wrapping.
+    """
+    d, d_q = W_Q.shape
+    d_k = W_K.shape[1]
+    H_q, H_kv = d_q // head_dim, d_k // head_dim
+    if H_q % H_kv != 0:
+        raise ValueError(
+            f"QK GQA requires query heads ({H_q}) divisible by KV heads ({H_kv})."
+        )
+    group_size = H_q // H_kv
+
+    W_Q_h = _to_heads_row(W_Q, H_q, head_dim)
+    W_K_h = _to_heads_row(W_K, H_kv, head_dim)
+    G_Q_h = _to_heads_row(G_Q, H_q, head_dim)
+    G_K_h = _to_heads_row(G_K, H_kv, head_dim)
+
+    # Partner is the opposite factor: K is whitened by (grouped) Q, Q by expanded K.
+    C_Q_inv, C_K_inv_exp = _partner_roots(
+        W_Q_h.mT @ W_Q_h, W_K_h.mT @ W_K_h, group_size, damping
+    )
+
+    delta_Q_h = _msign(G_Q_h @ C_K_inv_exp, eps) @ C_K_inv_exp
+    delta_K_h = _msign(G_K_h @ C_Q_inv, eps) @ C_Q_inv
+
+    return (
+        _from_heads_row(delta_Q_h, d, d_q),
+        _from_heads_row(delta_K_h, d, d_k),
+    )
+
+
+def ov_delta(
+    W_V: Tensor,
+    W_O: Tensor,
+    G_V: Tensor,
+    G_O: Tensor,
+    head_dim: int,
+    *,
+    damping: float = 1e-2,
+    eps: float = 1e-7,
+) -> Tuple[Tensor, Tensor]:
+    """Half-split, hybrid OV direction (math convention, fp32).
+
+    ``W_V, G_V`` are ``(d_model, H_kv * head_dim)``; ``W_O, G_O`` are
+    ``(H_q * head_dim, d_model)``. V uses a per-head spectral sign, O a single
+    per-matrix sign across all its heads (the ``hybrid`` granularity). Returns
+    the orthogonalized directions ``(delta_V, delta_O)``.
+    """
+    d, d_v = W_V.shape
+    d_o = W_O.shape[0]
+    H_kv, H_q = d_v // head_dim, d_o // head_dim
+    if H_q % H_kv != 0:
+        raise ValueError(
+            f"OV GQA requires O heads ({H_q}) divisible by V heads ({H_kv})."
+        )
+    group_size = H_q // H_kv
+
+    W_V_h = _to_heads_row(W_V, H_kv, head_dim)
+    W_O_h = W_O.view(H_q, head_dim, d)
+    G_V_h = _to_heads_row(G_V, H_kv, head_dim)
+    G_O_h = G_O.view(H_q, head_dim, d)
+
+    # V is whitened by (grouped) O; O by expanded V.
+    C_O_inv, C_V_inv_exp = _partner_roots(
+        W_O_h @ W_O_h.mT, W_V_h.mT @ W_V_h, group_size, damping
+    )
+
+    # V: per-head sign with both-sided partner whitening.
+    delta_V_h = _msign(G_V_h @ C_O_inv, eps) @ C_O_inv
+
+    # O: per-matrix sign across all heads, partner-whitened per head.
+    G_O_w = C_V_inv_exp @ G_O_h
+    M_O = _msign(G_O_w.reshape(d_o, d), eps).view(H_q, head_dim, d)
+    delta_O_h = C_V_inv_exp @ M_O
+
+    return (
+        _from_heads_row(delta_V_h, d, d_v),
+        delta_O_h.reshape(d_o, d),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Distributed factor gather / re-shard
+# ---------------------------------------------------------------------------
+
+
+def _full(x: Tensor) -> Tensor:
+    """Gather a (possibly sharded) tensor to a full replicated local tensor."""
+    return x.full_tensor() if isinstance(x, DTensor) else x
+
+
+def _reshard_like(local: Tensor, ref: Tensor) -> Tensor:
+    """Re-distribute a replicated ``local`` tensor to the sharding of ``ref``."""
+    if not isinstance(ref, DTensor):
+        return local
+    return DTensor.from_local(
+        local, device_mesh=ref.device_mesh, placements=None, run_check=False
+    ).redistribute(placements=ref.placements)
+
+
+# ---------------------------------------------------------------------------
+# Optimizer
+# ---------------------------------------------------------------------------
+
+
+class CompositionalMuon(Optimizer):
+    """Compositional Muon optimizer (FSDP2 / DDP / single-device).
+
+    Parameters are split into groups by an ``algorithm`` tag:
+
+    * ``"cm_qk"`` -- attention QK pairs. ``params`` are listed pairwise
+      ``[W_Q0, W_K0, W_Q1, W_K1, ...]`` (``nn.Linear`` weights, i.e. ``q_proj.weight``
+      of shape ``(H_q * head_dim, d_model)``). The group must set ``head_dim``.
+    * ``"cm_ov"`` -- attention OV pairs, listed pairwise ``[W_V0, W_O0, ...]``
+      (``v_proj.weight`` ``(H_kv * head_dim, d_model)`` then ``o_proj.weight``
+      ``(d_model, H_q * head_dim)``). The group must set ``head_dim``.
+    * ``"muon"`` -- generic 2D matrices, vanilla Muon (per-head if ``num_heads`` set).
+    * ``"adamw"`` / ``"lion"`` -- element-wise fallback for vectors / embeddings.
+
+    Grouped-query attention is supported: ``H_q`` need only be a multiple of
+    ``H_kv``. Distributed weights (FSDP2 ``DTensor`` shards or DDP) are gathered
+    per factor for the coupled CM math and the update is re-sharded before being
+    applied; the math is replicated across ranks (communication-correct), not yet
+    compute-sharded.
+
+    Args:
+        params: Parameters or param groups for the optimizer.
+        lr: Base learning rate (``eta``). CM applies no spectral shape-scale factor;
+            the effective rate is ``lr * budget * mp * (c^2 + lam)^{-1/2}``.
+        mu: Momentum factor (on raw gradients, Muon convention).
+        betas: ``(beta1, beta2)`` for AdamW / Lion fallbacks.
+        weight_decay: Decoupled weight decay.
+        mp: CM learning-rate multiplier.
+        damping: Tikhonov ``lam`` added to the Gram before its inverse root.
+        nesterov: Use Nesterov momentum.
+        epsilon: Small value for AdamW denominator / Newton-Schulz pre-norm floor.
+        adjust_lr: LR adjustment for the ``"muon"`` fallback only
+            (``"spectral_norm"`` / ``"rms_norm"`` / ``None``).
+
+    Compositional Muon by Tilde Research:
+        https://blog.tilderesearch.com/blog/compositional-muon
+    Muon by Keller Jordan: https://kellerjordan.github.io/posts/muon/
+    """
+
+    def __init__(
+        self,
+        params: ParamsT,
+        lr: float = 1e-3,
+        mu: float = 0.95,
+        betas: Tuple[float, float] = (0.9, 0.95),
+        weight_decay: float = 0.0,
+        mp: float = 1.0,
+        damping: float = 1e-2,
+        nesterov: bool = False,
+        epsilon: float = 1e-8,
+        adjust_lr: Optional[str] = "spectral_norm",
+    ):
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if mu < 0.0:
+            raise ValueError(f"Invalid momentum factor (mu): {mu}")
+        if len(betas) != 2 or betas[0] < 0.0 or betas[1] < 0.0:
+            raise ValueError(f"Invalid betas: {betas}")
+        if damping < 0.0:
+            raise ValueError(f"Invalid damping: {damping}")
+        if adjust_lr not in ("spectral_norm", "rms_norm", None):
+            raise ValueError(
+                f"Invalid adjust_lr value: {adjust_lr}. "
+                "Must be 'spectral_norm', 'rms_norm', or None."
+            )
+
+        defaults = dict(
+            lr=lr,
+            mu=mu,
+            beta1=betas[0],
+            beta2=betas[1],
+            weight_decay=weight_decay,
+            mp=mp,
+            damping=damping,
+            nesterov=nesterov,
+            epsilon=epsilon,
+            adjust_lr=adjust_lr,
+            algorithm="muon",
+            head_dim=None,
+            num_heads=None,
+        )
+        super().__init__(params, defaults)
+
+        for group in self.param_groups:
+            algo = group["algorithm"]
+            if algo not in _CM_ALGORITHMS:
+                raise ValueError(
+                    f"Unknown algorithm {algo!r}; choose from {_CM_ALGORITHMS}."
+                )
+            if algo in ("cm_qk", "cm_ov"):
+                if group["head_dim"] is None:
+                    raise ValueError(
+                        f"algorithm={algo!r} requires 'head_dim' on the group."
+                    )
+                if len(group["params"]) % 2 != 0:
+                    raise ValueError(
+                        f"algorithm={algo!r} expects params listed pairwise; "
+                        f"got an odd count ({len(group['params'])})."
+                    )
+                for p in group["params"]:
+                    if p.ndim != 2:
+                        raise ValueError(
+                            f"{algo} requires 2D parameters, got {p.ndim}D."
+                        )
+            elif algo == "muon":
+                for p in group["params"]:
+                    if p.ndim < 2:
+                        raise ValueError("muon requires matrix parameters (ndim >= 2).")
+
+    def _momentum_direction(self, p: Tensor, group: dict) -> Tensor:
+        """SUM-style momentum (Muon convention) on the raw grad; returns bf16 dir."""
+        state = self.state[p]
+        if "momentum" not in state:
+            state["momentum"] = torch.zeros_like(p.grad)
+        m = state["momentum"]
+        m.mul_(group["mu"]).add_(p.grad)
+        u = m.mul(group["mu"]).add_(p.grad) if group["nesterov"] else m
+        return u.to(torch.bfloat16)
+
+    def _apply_update(
+        self,
+        p: Tensor,
+        delta_nn: Tensor,
+        base_lr: float,
+        adjusted_lr: float,
+        weight_decay: float,
+    ) -> None:
+        """Decoupled weight decay + re-sharded CM update on the weight in place."""
+        update = _reshard_like(delta_nn.to(torch.bfloat16), p.data)
+        p.data.mul_(1 - base_lr * weight_decay)
+        p.data.sub_(update * adjusted_lr)
+
+    def _cm_pair_step(self, group: dict, is_qk: bool) -> None:
+        delta_fn = qk_delta if is_qk else ov_delta
+        params = group["params"]
+        head_dim = group["head_dim"]
+        lr = group["lr"]
+        wd = group["weight_decay"]
+        budget = 0.5 * group["mp"]
+
+        for i in range(0, len(params), 2):
+            p_a, p_b = params[i], params[i + 1]  # (Q, K) or (V, O)
+            if p_a.grad is None and p_b.grad is None:
+                continue
+            if p_a.grad is None or p_b.grad is None:
+                raise ValueError(
+                    "Compositional Muon updates QK / OV factors jointly; both "
+                    "weights in a pair must receive gradients."
+                )
+
+            U_a = self._momentum_direction(p_a, group)
+            U_b = self._momentum_direction(p_b, group)
+
+            # Math convention: (out, in) nn.Linear weight -> (in, out).
+            W_a = _full(p_a.data).mT.float()
+            W_b = _full(p_b.data).mT.float()
+            G_a = _full(U_a).mT.float()
+            G_b = _full(U_b).mT.float()
+
+            delta_a, delta_b = delta_fn(
+                W_a, W_b, G_a, G_b, head_dim, damping=group["damping"]
+            )
+
+            # The shared factor (K for QK, V for OV) has the smaller head count and
+            # changes group_size products at once, so it takes 1/group_size budget.
+            shared_heads = (
+                p_b.shape[0] // head_dim if is_qk else p_a.shape[0] // head_dim
+            )
+            perquery_heads = (
+                p_a.shape[0] // head_dim if is_qk else p_b.shape[0] // head_dim
+            )
+            group_size = perquery_heads // shared_heads
+
+            if is_qk:
+                # Q is per-query (full budget), K is shared (1/group_size).
+                self._apply_update(p_a, delta_a.mT, lr, lr * budget, wd)
+                self._apply_update(p_b, delta_b.mT, lr, lr * budget / group_size, wd)
+            else:
+                # V is shared (1/group_size), O is per-query (full budget).
+                self._apply_update(p_a, delta_a.mT, lr, lr * budget / group_size, wd)
+                self._apply_update(p_b, delta_b.mT, lr, lr * budget, wd)
+
+    def _muon_step(self, group: dict) -> None:
+        lr = group["lr"]
+        wd = group["weight_decay"]
+        eps = group["epsilon"]
+        num_heads = group["num_heads"]
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            U = self._momentum_direction(p, group)
+            g_full = _full(U)
+            if g_full.ndim > 2:
+                g_full = g_full.view(g_full.size(0), -1)
+            if num_heads is not None and num_heads > 1:
+                head_dim = g_full.size(0) // num_heads
+                u = _msign(g_full.view(num_heads, head_dim, -1).float(), eps)
+                u = u.reshape(g_full.shape)
+            else:
+                u = _msign(g_full.float(), eps)
+            adjust = group["adjust_lr"]
+            if adjust == "spectral_norm":
+                adjusted_lr = lr * math.sqrt(p.shape[-2] / p.shape[-1])
+            elif adjust == "rms_norm":
+                adjusted_lr = lr * 0.2 * math.sqrt(max(p.shape[-2], p.shape[-1]))
+            else:
+                adjusted_lr = lr
+            self._apply_update(p, u, lr, adjusted_lr, wd)
+
+    def _scalar_step(self, group: dict) -> None:
+        algo = group["algorithm"]
+        lr = torch.tensor(group["lr"])
+        beta1 = torch.tensor(group["beta1"])
+        beta2 = torch.tensor(group["beta2"])
+        wd = torch.tensor(group["weight_decay"])
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            state = self.state[p]
+            if "momentum" not in state:
+                state["momentum"] = torch.zeros_like(p)
+                if algo == "adamw":
+                    state["variance"] = torch.zeros_like(p)
+                state["step"] = 0
+            state["step"] += 1
+            if algo == "adamw":
+                adamw_update(
+                    p.data,
+                    p.grad,
+                    state["momentum"],
+                    state["variance"],
+                    lr,
+                    beta1,
+                    beta2,
+                    wd,
+                    state["step"],
+                    group["epsilon"],
+                )
+            else:
+                lion_update(p.data, p.grad, state["momentum"], lr, beta1, beta2, wd)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            algo = group["algorithm"]
+            if algo == "cm_qk":
+                self._cm_pair_step(group, is_qk=True)
+            elif algo == "cm_ov":
+                self._cm_pair_step(group, is_qk=False)
+            elif algo == "muon":
+                self._muon_step(group)
+            else:
+                self._scalar_step(group)
+
+        return loss
