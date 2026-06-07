@@ -38,10 +38,11 @@ from torch.distributed.tensor import DTensor
 from torch.optim.optimizer import Optimizer, ParamsT
 from typing import List, Optional, Tuple
 
+from .normuon import normuon_normalization_stacked
 from .polar_express import polar_express
 from .scalar_opts import adamw_update, lion_update
 
-_CM_ALGORITHMS = ("cm_qk", "cm_ov", "muon", "adamw", "lion")
+_CM_ALGORITHMS = ("cm_qk", "cm_ov", "muon", "normuon", "adamw", "lion")
 
 # Coupled Newton-Schulz (CANS, arxiv 2506.10935) schedule for the batched inverse
 # Gram root: 9 tuned (a, b) pairs then classic (1.5, -0.5) padding. Drives
@@ -253,7 +254,8 @@ class CompositionalMuon(Optimizer):
     * ``"cm_ov"`` -- attention OV pairs, listed pairwise ``[W_V0, W_O0, ...]``
       (``v_proj.weight`` ``(H_kv * head_dim, d_model)`` then ``o_proj.weight``
       ``(d_model, H_q * head_dim)``). The group must set ``head_dim``.
-    * ``"muon"`` -- generic 2D matrices, vanilla Muon (per-head if ``num_heads`` set).
+    * ``"muon"`` / ``"normuon"`` -- generic 2D matrices, vanilla Muon or NorMuon
+      (per-head when ``num_heads`` is set; NorMuon adds the per-neuron variance EMA).
     * ``"adamw"`` / ``"lion"`` -- element-wise fallback for vectors / embeddings.
 
     Grouped-query attention is supported: ``H_q`` need only be a multiple of
@@ -267,13 +269,14 @@ class CompositionalMuon(Optimizer):
         lr: Base learning rate (``eta``). CM applies no spectral shape-scale factor;
             the effective rate is ``lr * budget * mp * (c^2 + lam)^{-1/2}``.
         mu: Momentum factor (on raw gradients, Muon convention).
+        muon_beta2: Second beta for the ``"normuon"`` fallback's per-neuron variance EMA.
         betas: ``(beta1, beta2)`` for AdamW / Lion fallbacks.
         weight_decay: Decoupled weight decay.
         mp: CM learning-rate multiplier.
         damping: Tikhonov ``lam`` added to the Gram before its inverse root.
         nesterov: Use Nesterov momentum.
         epsilon: Small value for AdamW denominator / Newton-Schulz pre-norm floor.
-        adjust_lr: LR adjustment for the ``"muon"`` fallback only
+        adjust_lr: LR adjustment for the ``"muon"`` / ``"normuon"`` fallback only
             (``"spectral_norm"`` / ``"rms_norm"`` / ``None``).
 
     Compositional Muon by Tilde Research:
@@ -286,6 +289,7 @@ class CompositionalMuon(Optimizer):
         params: ParamsT,
         lr: float = 1e-3,
         mu: float = 0.95,
+        muon_beta2: float = 0.95,
         betas: Tuple[float, float] = (0.9, 0.95),
         weight_decay: float = 0.0,
         mp: float = 1.0,
@@ -298,6 +302,8 @@ class CompositionalMuon(Optimizer):
             raise ValueError(f"Invalid learning rate: {lr}")
         if mu < 0.0:
             raise ValueError(f"Invalid momentum factor (mu): {mu}")
+        if muon_beta2 < 0.0:
+            raise ValueError(f"Invalid muon_beta2: {muon_beta2}")
         if len(betas) != 2 or betas[0] < 0.0 or betas[1] < 0.0:
             raise ValueError(f"Invalid betas: {betas}")
         if damping < 0.0:
@@ -311,6 +317,7 @@ class CompositionalMuon(Optimizer):
         defaults = dict(
             lr=lr,
             mu=mu,
+            muon_beta2=muon_beta2,
             beta1=betas[0],
             beta2=betas[1],
             weight_decay=weight_decay,
@@ -346,10 +353,12 @@ class CompositionalMuon(Optimizer):
                         raise ValueError(
                             f"{algo} requires 2D parameters, got {p.ndim}D."
                         )
-            elif algo == "muon":
+            elif algo in ("muon", "normuon"):
                 for p in group["params"]:
                     if p.ndim < 2:
-                        raise ValueError("muon requires matrix parameters (ndim >= 2).")
+                        raise ValueError(
+                            f"{algo} requires matrix parameters (ndim >= 2)."
+                        )
 
     def _momentum_direction(self, p: Tensor, group: dict) -> Tensor:
         """SUM-style momentum (Muon convention) on the raw grad; returns bf16 dir."""
@@ -427,11 +436,20 @@ class CompositionalMuon(Optimizer):
                 self._apply_update(p_a, delta_a.mT, lr, lr * budget / group_size, wd)
                 self._apply_update(p_b, delta_b.mT, lr, lr * budget, wd)
 
-    def _muon_step(self, group: dict) -> None:
+    def _ortho_fallback_step(self, group: dict, normuon: bool) -> None:
+        """Vanilla Muon (or NorMuon when ``normuon``) fallback for non-CM matrices.
+
+        Gathers each (possibly sharded) weight, orthogonalizes its momentum
+        direction (per-head when ``num_heads`` is set), optionally applies
+        NorMuon's per-neuron variance normalization, then applies the re-sharded
+        update. NorMuon reuses dion's :func:`normuon_normalization_stacked` so the
+        fallback matches the standalone optimizer.
+        """
         lr = group["lr"]
         wd = group["weight_decay"]
         eps = group["epsilon"]
         num_heads = group["num_heads"]
+        muon_beta2 = torch.tensor(group["muon_beta2"]) if normuon else None
         for p in group["params"]:
             if p.grad is None:
                 continue
@@ -445,6 +463,18 @@ class CompositionalMuon(Optimizer):
                 u = u.reshape(g_full.shape)
             else:
                 u = _msign(g_full.float(), eps)
+            if normuon:
+                state = self.state[p]
+                if "variance_neuron" not in state:
+                    state["variance_neuron"] = torch.zeros_like(u[..., 0:1])
+                v = state["variance_neuron"]
+                # Per-row variance is independent of head grouping, so normalize
+                # the full 2D update (one matrix -> singleton stack dim).
+                u_norm, v_new = normuon_normalization_stacked(
+                    u.unsqueeze(0), v.unsqueeze(0), muon_beta2
+                )
+                u = u_norm[0]
+                v.copy_(v_new[0])
             adjust = group["adjust_lr"]
             if adjust == "spectral_norm":
                 adjusted_lr = lr * math.sqrt(p.shape[-2] / p.shape[-1])
@@ -500,7 +530,9 @@ class CompositionalMuon(Optimizer):
             elif algo == "cm_ov":
                 self._cm_pair_step(group, is_qk=False)
             elif algo == "muon":
-                self._muon_step(group)
+                self._ortho_fallback_step(group, normuon=False)
+            elif algo == "normuon":
+                self._ortho_fallback_step(group, normuon=True)
             else:
                 self._scalar_step(group)
 
