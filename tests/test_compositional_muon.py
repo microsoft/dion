@@ -285,6 +285,27 @@ class TestOptimizer:
         opt.step()
         assert torch.isfinite(attn.data).all()
 
+    def test_muon_per_head_lr_matches_standalone(self):
+        from dion import Muon
+
+        H, hd, cols, lr = 8, 4, 16, 0.1
+        g = torch.randn(H * hd, cols)
+        w0 = torch.randn(H * hd, cols)
+        a = torch.nn.Parameter(w0.clone())
+        a.grad = g.clone()
+        CompositionalMuon(
+            [dict(params=[a], algorithm="muon", num_heads=H, weight_decay=0.0)], lr=lr
+        ).step()
+        ref = torch.nn.Parameter(w0.clone())
+        ref.grad = g.clone()
+        Muon(
+            [dict(params=[ref], algorithm="muon", num_heads=H, weight_decay=0.0)], lr=lr
+        ).step()
+        # The per-head spectral-norm LR adjustment must use the per-head matrix
+        # dims (head_dim, cols), not the full param dims, else the fallback step
+        # is sqrt(num_heads) too large relative to standalone Muon.
+        assert torch.allclose((w0 - a.data), (w0 - ref.data), atol=2e-3)
+
     def test_normuon_fallback(self):
         mlp = torch.nn.Parameter(torch.randn(32, 16))
         opt = CompositionalMuon(
@@ -310,6 +331,33 @@ class TestOptimizer:
         attn.grad = torch.randn_like(attn)
         opt.step()
         assert torch.isfinite(attn.data).all()
+
+    def test_normuon_fallback_per_head_matches_standalone(self):
+        from dion import NorMuon
+
+        H, hd, cols, lr = 4, 4, 16, 0.1
+        g = torch.randn(H * hd, cols)
+        w0 = torch.randn(H * hd, cols)
+        a = torch.nn.Parameter(w0.clone())
+        a.grad = g.clone()
+        CompositionalMuon(
+            [dict(params=[a], algorithm="normuon", num_heads=H, weight_decay=0.0)],
+            lr=lr,
+            mu=0.95,
+            muon_beta2=0.95,
+        ).step()
+        ref = torch.nn.Parameter(w0.clone())
+        ref.grad = g.clone()
+        NorMuon(
+            [dict(params=[ref], algorithm="normuon", num_heads=H, weight_decay=0.0)],
+            lr=lr,
+            mu=0.95,
+            muon_beta2=0.95,
+            adjust_lr="spectral_norm",
+        ).step()
+        # NorMuon's Frobenius rescale is per-head; the fallback must stack heads
+        # so it matches standalone NorMuon rather than renorming the whole matrix.
+        assert torch.allclose((w0 - a.data), (w0 - ref.data), atol=3e-3)
 
 
 # ---------------------------------------------------------------------------

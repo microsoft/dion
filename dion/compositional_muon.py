@@ -468,18 +468,39 @@ class CompositionalMuon(Optimizer):
                 if "variance_neuron" not in state:
                     state["variance_neuron"] = torch.zeros_like(u[..., 0:1])
                 v = state["variance_neuron"]
-                # Per-row variance is independent of head grouping, so normalize
-                # the full 2D update (one matrix -> singleton stack dim).
-                u_norm, v_new = normuon_normalization_stacked(
-                    u.unsqueeze(0), v.unsqueeze(0), muon_beta2
-                )
-                u = u_norm[0]
-                v.copy_(v_new[0])
+                # The per-row variance EMA is independent of head grouping, but
+                # NorMuon's Frobenius rescale is per-matrix: standalone NorMuon
+                # treats each head as its own matrix. Stack the heads on the batch
+                # dim so the rescale is per-head, not over the whole 2D update.
+                if num_heads is not None and num_heads > 1:
+                    head_dim = u.size(0) // num_heads
+                    u_norm, v_new = normuon_normalization_stacked(
+                        u.view(num_heads, head_dim, -1),
+                        v.view(num_heads, head_dim, 1),
+                        muon_beta2,
+                    )
+                    u = u_norm.reshape(u.shape)
+                    v.copy_(v_new.reshape(v.shape))
+                else:
+                    u_norm, v_new = normuon_normalization_stacked(
+                        u.unsqueeze(0), v.unsqueeze(0), muon_beta2
+                    )
+                    u = u_norm[0]
+                    v.copy_(v_new[0])
+            # Per-head Muon orthogonalizes each (head_dim, cols) block, so the
+            # spectral-to-RMS LR adjustment must use the per-head matrix dims to
+            # match the standalone optimizer; the full param dims would be off by
+            # sqrt(num_heads). For >2D matrices use the flattened fan-in.
+            if num_heads is not None and num_heads > 1:
+                fan_out = g_full.size(0) // num_heads
+            else:
+                fan_out = g_full.size(0)
+            fan_in = g_full.size(1)
             adjust = group["adjust_lr"]
             if adjust == "spectral_norm":
-                adjusted_lr = lr * math.sqrt(p.shape[-2] / p.shape[-1])
+                adjusted_lr = lr * math.sqrt(fan_out / fan_in)
             elif adjust == "rms_norm":
-                adjusted_lr = lr * 0.2 * math.sqrt(max(p.shape[-2], p.shape[-1]))
+                adjusted_lr = lr * 0.2 * math.sqrt(max(fan_out, fan_in))
             else:
                 adjusted_lr = lr
             self._apply_update(p, u, lr, adjusted_lr, wd)
