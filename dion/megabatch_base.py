@@ -111,6 +111,38 @@ class DistributedOrthoBase(Optimizer):
         else:
             self._newton_schulz_func = zeropower_via_newtonschulz5
 
+        # Eagerly materialize optimizer state for every parameter, including
+        # those that may never receive a gradient (frozen matrices, or MoE
+        # experts that get no tokens on a given rank/step). State is otherwise
+        # created lazily only for params with a gradient, so the set of keys in
+        # state_dict() can differ across ranks (rank-asymmetric gradients) or
+        # between save and resume. Distributed checkpointing (DCP) gathers
+        # optimizer state collectively and assumes a rank-symmetric key set, so
+        # the lazy path can mismatch or hang. Pre-populating keeps state_dict()
+        # complete and identical across ranks. The per-step path reuses the same
+        # (now non-empty) state, so this changes nothing numerically.
+        # Ported from InternLM/xtuner v1/optim/muon.py (the equivalent __init__
+        # loop), generalized here to the whole DistributedOrthoBase family via
+        # the (possibly overridden) _get_or_initialize_state.
+        self._state_prepopulated = False
+        for group in self.param_groups:
+            self._prepopulate_group_state(group)
+        self._state_prepopulated = True
+
+    def _prepopulate_group_state(self, group: dict) -> None:
+        algo = group["algorithm"]
+        for p in group["params"]:
+            self._get_or_initialize_state(p, algo)
+
+    def add_param_group(self, param_group: dict) -> None:
+        super().add_param_group(param_group)
+        # Keep the pre-population invariant for groups added after construction
+        # so state_dict() stays complete and rank-symmetric. The guard skips the
+        # add_param_group calls that Optimizer.__init__ makes before this class
+        # finishes setup; the __init__ loop above pre-populates those groups.
+        if getattr(self, "_state_prepopulated", False):
+            self._prepopulate_group_state(self.param_groups[-1])
+
     @torch.no_grad()
     def step(self, closure=None):
         """Perform a single optimization step."""
