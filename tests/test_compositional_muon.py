@@ -285,6 +285,32 @@ class TestOptimizer:
         opt.step()
         assert torch.isfinite(attn.data).all()
 
+    def test_normuon_fallback(self):
+        mlp = torch.nn.Parameter(torch.randn(32, 16))
+        opt = CompositionalMuon(
+            [dict(params=[mlp], algorithm="normuon", num_heads=None)],
+            lr=0.02,
+            muon_beta2=0.9,
+        )
+        before = mlp.detach().clone()
+        mlp.grad = torch.randn_like(mlp)
+        opt.step()
+        assert not torch.equal(mlp.data, before)
+        assert torch.isfinite(mlp.data).all()
+        # NorMuon keeps a per-neuron variance buffer; vanilla Muon does not.
+        assert "variance_neuron" in opt.state[mlp]
+
+    def test_normuon_fallback_per_head(self):
+        attn = torch.nn.Parameter(torch.randn(8 * 4, 16))
+        opt = CompositionalMuon(
+            [dict(params=[attn], algorithm="normuon", num_heads=8)],
+            lr=0.02,
+            muon_beta2=0.9,
+        )
+        attn.grad = torch.randn_like(attn)
+        opt.step()
+        assert torch.isfinite(attn.data).all()
+
 
 # ---------------------------------------------------------------------------
 # Distributed gather / re-shard path (2-rank gloo, no GPU needed)
