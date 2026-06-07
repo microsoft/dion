@@ -105,14 +105,21 @@ class TestDirectionMath:
         assert rel_err < 0.15
 
     def test_gqa_reduces_to_mha(self):
-        # group_size == 1 (H_q == H_kv) must equal the plain per-head path.
-        d, hd, H = 12, 4, 2
+        # group_size == 1 (H_q == H_kv): the batched MHA path must equal looping
+        # each head through an independent single-head qk_delta (no cross-head
+        # leakage via the grouping/aggregation/expansion machinery).
+        d, hd, H = 12, 4, 3
         torch.manual_seed(4)
         WQ, WK = torch.randn(d, H * hd), torch.randn(d, H * hd)
         GQ, GK = torch.randn(d, H * hd), torch.randn(d, H * hd)
-        dQ1, dK1 = qk_delta(WQ, WK, GQ, GK, hd, damping=1e-2)
-        dQ2, dK2 = qk_delta(WQ, WK, GQ, GK, hd, damping=1e-2)
-        assert torch.equal(dQ1, dQ2) and torch.equal(dK1, dK2)
+        dQ, dK = qk_delta(WQ, WK, GQ, GK, hd, damping=1e-2)
+        for h in range(H):
+            sl = slice(h * hd, (h + 1) * hd)
+            dQ_h, dK_h = qk_delta(
+                WQ[:, sl], WK[:, sl], GQ[:, sl], GK[:, sl], hd, damping=1e-2
+            )
+            assert torch.allclose(dQ[:, sl], dQ_h, atol=1e-3)
+            assert torch.allclose(dK[:, sl], dK_h, atol=1e-3)
 
     def test_gqa_shapes(self):
         d, hd, Hq, Hkv = 16, 4, 6, 2
@@ -155,6 +162,33 @@ class TestOptimizer:
         _set_grads([wq, wk, wv, wo])
         opt.step()
         assert all(torch.isfinite(p.data).all() for p in (wq, wk, wv, wo))
+
+    def test_ov_budget_uses_query_head_count(self):
+        # d_model deliberately != H_q * head_dim so the O head count must be read
+        # from o_proj's in_features (dim 1), not its out_features (= d_model).
+        # The shared V factor takes 1/group_size of the budget; group_size = H_q/H_kv.
+        d_model, hd, Hq, Hkv, lr = 24, 4, 4, 2, 0.02
+        group_size = Hq // Hkv  # == 2
+        _, _, wv, wo = _make_attn(d_model, hd, Hq, Hkv)
+        opt = CompositionalMuon(
+            [dict(params=[wv, wo], algorithm="cm_ov", head_dim=hd)], lr=lr
+        )
+        _set_grads([wv, wo])
+        wv_before, gv = wv.detach().clone(), wv.grad.clone()
+        # Reference V direction via the same dtype path the optimizer uses
+        # (bf16 momentum from zero -> math convention -> ov_delta).
+        Wv = wv_before.mT.float()
+        Wo = wo.detach().mT.float()
+        Gv = gv.to(torch.bfloat16).mT.float()
+        Go = wo.grad.to(torch.bfloat16).mT.float()
+        delta_V, _ = ov_delta(Wv, Wo, Gv, Go, hd, damping=1e-2)
+        update_V = delta_V.mT.to(torch.bfloat16)
+        opt.step()
+        applied = (wv_before - wv.data).float()
+        expected_correct = (update_V * (lr * 0.5 / group_size)).float()
+        expected_buggy = (update_V * (lr * 0.5 / (group_size + 1))).float()
+        assert torch.allclose(applied, expected_correct, atol=1e-6)
+        assert not torch.allclose(applied, expected_buggy, atol=1e-6)
 
     def test_determinism(self):
         def run():

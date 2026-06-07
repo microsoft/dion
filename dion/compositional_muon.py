@@ -407,11 +407,14 @@ class CompositionalMuon(Optimizer):
 
             # The shared factor (K for QK, V for OV) has the smaller head count and
             # changes group_size products at once, so it takes 1/group_size budget.
+            # Head counts come from the head-packed dimension of each nn.Linear
+            # weight: Q/K/V pack heads on dim 0 (out_features), but O packs them on
+            # dim 1 (in_features = H_q * head_dim), so read O from shape[1].
             shared_heads = (
                 p_b.shape[0] // head_dim if is_qk else p_a.shape[0] // head_dim
             )
             perquery_heads = (
-                p_a.shape[0] // head_dim if is_qk else p_b.shape[0] // head_dim
+                p_a.shape[0] // head_dim if is_qk else p_b.shape[1] // head_dim
             )
             group_size = perquery_heads // shared_heads
 
