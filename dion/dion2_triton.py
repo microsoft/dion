@@ -167,15 +167,18 @@ def dion2_post_orthogonalize_triton(
     # wrapper subclasses (e.g. the quantized-weight wrappers used by MXFP8 training,
     # or DTensor) hold their data in wrapped inner tensors and do not expose such a
     # buffer at data_ptr(), so a raw write corrupts memory and triggers an illegal
-    # memory access. Fall back to the eager implementation, which routes through
-    # __torch_dispatch__ and updates the wrapped weight correctly. Plain dense
+    # memory access. Fall back to dion2_post_orthogonalize_fused, which routes
+    # through __torch_dispatch__ and updates the wrapped weight correctly while
+    # preserving the kernel's single-rounding numerics (computes a*x - b*u in
+    # float32 for the selected slices and writes once); the plain eager
+    # dion2_post_orthogonalize would round the selected slices twice. Plain dense
     # subclasses such as nn.Parameter are not wrapper subclasses and stay on the
     # kernel, so the single-GPU/DDP path (where params are not converted by
     # to_local) keeps the fast path.
     if any(is_traceable_wrapper_subclass(x) for x in X):
-        from .dion2 import dion2_post_orthogonalize
+        from .dion2 import dion2_post_orthogonalize_fused
 
-        dion2_post_orthogonalize(
+        dion2_post_orthogonalize_fused(
             X, U, indices, base_lr, adjusted_lr, weight_decay, select_dim
         )
         return

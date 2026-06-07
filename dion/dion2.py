@@ -445,6 +445,49 @@ def dion2_post_orthogonalize(
         x.scatter_add_(dim=select_dim, index=idx_exp, src=u_scaled)
 
 
+@torch.compile(fullgraph=True)
+def dion2_post_orthogonalize_fused(
+    X: List[Tensor],
+    U: List[Tensor],
+    indices: List[Tensor],
+    base_lr: Tensor,
+    adjusted_lr: Tensor,
+    weight_decay: Tensor,
+    select_dim: int,
+):
+    """
+    Single-rounding weight decay + weight update after orthogonalization.
+
+    Computes the new value of the selected rows/columns as
+    ``(1 - base_lr*weight_decay)*x - adjusted_lr*u`` in float32 and writes it
+    once, matching the single-rounding numerics of the fused Triton kernel
+    (dion2_post_orthogonalize_triton). Unselected entries get the weight decay
+    in place, also a single rounding. This differs from dion2_post_orthogonalize,
+    which writes the weight-decayed weight and then accumulates the update in a
+    second pass, rounding the selected slices twice.
+
+    Only the selected slices are gathered into float32, so the extra work over
+    the in-place weight decay is small. Uses only ``__torch_dispatch__``-routed
+    ops (no raw data_ptr writes), so it is safe for traceable wrapper subclasses
+    such as the MXFP8 training weight wrapper, for which the Triton kernel cannot
+    be used. Inputs should be lists of regular Tensor, not DTensor.
+    """
+    a = 1 - base_lr * weight_decay
+    neg_lr = -adjusted_lr
+    for x, u, idx in zip(X, U, indices):
+        if select_dim == -2:
+            idx_exp = idx.unsqueeze(-1).expand_as(u)
+        else:
+            idx_exp = idx.unsqueeze(-2).expand_as(u)
+        # Fused single-rounding value for the selected slices, computed in float32
+        # from the original weight before any in-place modification.
+        x_sel = a * torch.gather(x, select_dim, idx_exp).float() + neg_lr * u.float()
+        # Weight decay for the unselected entries (single rounding); the selected
+        # slices are overwritten with the fused value below.
+        x.mul_(a)
+        x.scatter_(dim=select_dim, index=idx_exp, src=x_sel.to(x.dtype))
+
+
 # A helper function to print selection choice for each matrix
 # It only prints once `verbose` is set True
 _printed_configs: set = set()
