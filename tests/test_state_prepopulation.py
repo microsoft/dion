@@ -68,6 +68,22 @@ def test_state_dict_complete_and_resumable(opt_cls, opt_kwargs, extra_keys):
     assert set(opt2.state.keys()) == {active2, frozen2}
 
 
+@pytest.mark.parametrize("opt_cls,opt_kwargs,extra_keys", _optimizer_cases())
+def test_add_param_group_prepopulates(opt_cls, opt_kwargs, extra_keys):
+    active, _ = _make_params()
+    opt = opt_cls([active], **opt_kwargs)
+
+    # A group added after construction must also get complete state, so the
+    # pre-population invariant (rank-symmetric state_dict) is not silently lost.
+    late = torch.nn.Parameter(torch.randn(64, 128, device=DEVICE))
+    opt.add_param_group({"params": [late]})
+
+    assert late in opt.state
+    expected_keys = {"momentum"} | extra_keys
+    assert set(opt.state[late].keys()) == expected_keys
+    assert set(opt.state_dict()["state"].keys()) == {0, 1}
+
+
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA required for optimizer step")
 @pytest.mark.parametrize("opt_cls,opt_kwargs,extra_keys", _optimizer_cases())
 def test_gradless_param_is_inert(opt_cls, opt_kwargs, extra_keys):
