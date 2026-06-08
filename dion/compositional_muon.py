@@ -32,6 +32,9 @@ and takes ``1/G`` of the step budget (the blog allocates the shared-side budget 
 """
 
 import math
+import os
+import sys
+import traceback as _traceback
 import warnings
 import torch
 from torch import Tensor
@@ -44,6 +47,46 @@ from .polar_express import polar_express
 from .scalar_opts import adamw_update, lion_update
 
 _CM_ALGORITHMS = ("cm_qk", "cm_ov", "muon", "normuon", "adamw", "lion")
+
+# DIAGNOSTIC (temporary): force the no-comm path on quantized weights and dump
+# any uncaught traceback (e.g. from the compiled forward) per rank to OUTPUT_ROOT.
+_FORCE_MXFP8_NOCOMM = os.environ.get("PHITRAIN_CM_NOCOMM_MXFP8") == "1"
+
+
+def _unwrap_subclass(t: Tensor) -> Tensor:
+    if type(t) is Tensor or isinstance(t, DTensor):
+        return t
+    flatten = getattr(t, "__tensor_flatten__", None)
+    if flatten is not None:
+        try:
+            names, _ = flatten()
+        except Exception:
+            names = ()
+        for name in names:
+            inner = getattr(t, name, None)
+            if isinstance(inner, Tensor):
+                return inner
+    inner = getattr(t, "_data", None)
+    return inner if isinstance(inner, Tensor) else t
+
+
+def _install_crash_dumper() -> None:
+    if os.environ.get("PHITRAIN_CM_CRASH_DUMP") != "1" or getattr(_install_crash_dumper, "_done", False):
+        return
+    _install_crash_dumper._done = True
+    out = os.environ.get("OUTPUT_ROOT", ".")
+    rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
+    prev = sys.excepthook
+
+    def hook(exc_type, exc, tb):
+        try:
+            with open(os.path.join(out, f"cm_crash_rank{rank}.txt"), "w") as f:
+                f.write("".join(_traceback.format_exception(exc_type, exc, tb)))
+        except Exception:
+            pass
+        prev(exc_type, exc, tb)
+
+    sys.excepthook = hook
 
 # Coupled Newton-Schulz (CANS, arxiv 2506.10935) schedule for the batched inverse
 # Gram root: 9 tuned (a, b) pairs then classic (1.5, -0.5) padding. Drives
@@ -257,7 +300,11 @@ def _head_local_shard(p: Tensor, head_dim: int) -> Optional[Tensor]:
         return None
     local = p.to_local()
     if type(local) is not Tensor:
-        return None
+        if not _FORCE_MXFP8_NOCOMM:
+            return None
+        local = _unwrap_subclass(local)
+        if type(local) is not Tensor:
+            return None
     if local.shape[0] == 0 or local.shape[0] % head_dim != 0:
         return None
     return local
@@ -358,6 +405,7 @@ class CompositionalMuon(Optimizer):
             num_heads=None,
         )
         super().__init__(params, defaults)
+        _install_crash_dumper()
 
         for group in self.param_groups:
             algo = group["algorithm"]
