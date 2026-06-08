@@ -501,27 +501,32 @@ class CompositionalMuon(Optimizer):
             U_a = self._momentum_direction(p_a, group)
             U_b = self._momentum_direction(p_b, group)
 
-            # No-comm fast path: when both QK factors are plain weights sharded on
-            # heads, each rank holds whole KV-groups, so the per-head CM math runs on
-            # the local shard with no gather. (OV's O factor is sharded on the hidden
-            # axis, not heads, and quantized-subclass weights are excluded, so both
-            # stay on the gather path.) The deltas are computed up front and applied
-            # only if both succeed; any error falls back to the (validated) gather
-            # path so an unexpected sharding can never break the step.
-            if is_qk:
-                deltas = None
-                try:
-                    deltas = self._cm_qk_local_deltas(
-                        p_a, p_b, U_a, U_b, head_dim, group_size, damping
+            # No-comm fast path: when both QK factors are head-aligned shards whose
+            # heads divide evenly across the shard world (every rank holds whole
+            # KV-groups), the per-head CM math runs on the local shard with no gather.
+            # Eligibility is decided from rank-invariant global shapes / placements /
+            # mesh size, so ALL ranks pick the same path -- a per-rank choice (or a
+            # per-rank fallback on error) would let some ranks gather (a collective)
+            # while others do not, deadlocking the step. If eligible, every rank
+            # commits to no-comm; an unexpected failure crashes (uniformly) rather
+            # than desyncing.
+            if is_qk and self._qk_nocomm_eligible(p_a, p_b, head_dim):
+                self._diag(f"cm_qk pair {i}: nocomm compute")
+                deltas = self._cm_qk_local_deltas(
+                    p_a, p_b, U_a, U_b, head_dim, group_size, damping
+                )
+                if deltas is None:  # pragma: no cover - eligibility guarantees not-None
+                    raise RuntimeError(
+                        "CompositionalMuon: no-comm eligibility/compute mismatch."
                     )
-                except Exception as exc:  # pragma: no cover - defensive fallback
-                    self._warn_local_fallback(exc)
-                if deltas is not None:
-                    self._apply_local(p_a, deltas[0], lr, lr_a, wd)
-                    self._apply_local(p_b, deltas[1], lr, lr_b, wd)
-                    continue
+                self._diag(f"cm_qk pair {i}: nocomm apply")
+                self._apply_local(p_a, deltas[0], lr, lr_a, wd)
+                self._apply_local(p_b, deltas[1], lr, lr_b, wd)
+                self._diag(f"cm_qk pair {i}: nocomm done")
+                continue
 
             # Gather full factors (replicated math), reshard the update.
+            self._diag(f"{'cm_qk' if is_qk else 'cm_ov'} pair {i}: gather")
             W_a = _full(p_a.data).mT.float()
             W_b = _full(p_b.data).mT.float()
             G_a = _full(U_a).mT.float()
@@ -529,18 +534,43 @@ class CompositionalMuon(Optimizer):
             delta_a, delta_b = delta_fn(W_a, W_b, G_a, G_b, head_dim, damping=damping)
             self._apply_update(p_a, delta_a.mT, lr, lr_a, wd)
             self._apply_update(p_b, delta_b.mT, lr, lr_b, wd)
+            self._diag(f"{'cm_qk' if is_qk else 'cm_ov'} pair {i}: gather done")
 
-    def _warn_local_fallback(self, exc: Exception) -> None:
-        if not getattr(self, "_local_fallback_warned", False):
-            self._local_fallback_warned = True
-            warnings.warn(
-                "CompositionalMuon: the no-comm per-head QK path raised "
-                f"({type(exc).__name__}: {exc}); falling back to the gather path "
-                "for QK. Training is unaffected but the QK step is not "
-                "communication-optimized.",
-                RuntimeWarning,
-                stacklevel=2,
+    def _diag(self, msg: str) -> None:
+        if _FORCE_MXFP8_NOCOMM:
+            print(
+                f"[CMDIAG r{os.environ.get('RANK', '0')}] {msg}",
+                file=sys.stderr,
+                flush=True,
             )
+
+    def _qk_nocomm_eligible(self, p_a: Tensor, p_b: Tensor, head_dim: int) -> bool:
+        """Whether every rank can run the QK pair on its local shard with no comm.
+
+        Decided purely from rank-invariant facts -- both factors are DTensors with a
+        single dim-0 Shard on the same mesh, plain (non-quantized) local tensors, and
+        head counts divisible by the shard world so each rank holds whole KV-groups.
+        Computed identically on all ranks, so the no-comm / gather choice can never
+        diverge (which would deadlock on the gather collective).
+        """
+        worlds = []
+        for p in (p_a, p_b):
+            d = p.data
+            if not isinstance(d, DTensor):
+                return False
+            shard_dims = [
+                k for k, pl in enumerate(d.placements) if isinstance(pl, Shard)
+            ]
+            if len(shard_dims) != 1 or d.placements[shard_dims[0]].dim != 0:
+                return False
+            if type(d.to_local()) is not Tensor and not _FORCE_MXFP8_NOCOMM:
+                return False
+            world = d.device_mesh.size(shard_dims[0])
+            n_heads = d.shape[0] // head_dim
+            if d.shape[0] % head_dim != 0 or n_heads % world != 0:
+                return False
+            worlds.append(world)
+        return worlds[0] == worlds[1]
 
     def _cm_qk_local_deltas(
         self,
@@ -705,5 +735,9 @@ class CompositionalMuon(Optimizer):
                 self._ortho_fallback_step(group, normuon=True)
             else:
                 self._scalar_step(group)
+            self._diag(f"group '{algo}' done")
 
+        if _FORCE_MXFP8_NOCOMM and torch.cuda.is_available():
+            torch.cuda.synchronize()  # surface async faults at the optimizer, not later
+        self._diag("optimizer.step DONE")
         return loss
