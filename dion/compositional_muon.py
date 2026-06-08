@@ -32,18 +32,19 @@ and takes ``1/G`` of the step budget (the blog allocates the shared-side budget 
 """
 
 import math
-import warnings
 import torch
 from torch import Tensor
 from torch.distributed.tensor import DTensor, Shard
 from torch.optim.optimizer import Optimizer, ParamsT
 from typing import List, Optional, Tuple
 
+from .muon import muon_update_post_orthogonalize
 from .normuon import normuon_normalization_stacked
 from .polar_express import polar_express
 from .scalar_opts import adamw_update, lion_update
 
 _CM_ALGORITHMS = ("cm_qk", "cm_ov", "muon", "normuon", "adamw", "lion")
+
 
 # Coupled Newton-Schulz (CANS, arxiv 2506.10935) schedule for the batched inverse
 # Gram root: 9 tuned (a, b) pairs then classic (1.5, -0.5) padding. Drives
@@ -285,11 +286,12 @@ class CompositionalMuon(Optimizer):
 
     Grouped-query attention is supported: ``H_q`` need only be a multiple of
     ``H_kv``. Distributed weights are handled per factor: when a QK pair is sharded
-    on heads (FSDP2 dim-0 shards along head boundaries, each rank holding whole
-    KV-groups) the per-head CM math runs on the local shard with no communication;
-    otherwise — and for the OV ``O`` factor, which is sharded on the hidden axis
-    rather than heads — the factor is gathered (``full_tensor``), computed
-    replicated, and the update re-sharded.
+    on heads (plain FSDP2 dim-0 shards along head boundaries, each rank holding
+    whole KV-groups) the per-head CM math runs on the local shard with no
+    communication -- the choice is made from rank-invariant global shapes so all
+    ranks agree. Otherwise -- for the OV ``O`` factor (sharded on the hidden axis,
+    not heads) and for quantized-subclass weights -- the factor is gathered
+    (``full_tensor``), computed replicated, and the update re-sharded.
 
     Args:
         params: Parameters or param groups for the optimizer.
@@ -449,25 +451,26 @@ class CompositionalMuon(Optimizer):
             U_a = self._momentum_direction(p_a, group)
             U_b = self._momentum_direction(p_b, group)
 
-            # No-comm fast path: when both QK factors are plain weights sharded on
-            # heads, each rank holds whole KV-groups, so the per-head CM math runs on
-            # the local shard with no gather. (OV's O factor is sharded on the hidden
-            # axis, not heads, and quantized-subclass weights are excluded, so both
-            # stay on the gather path.) The deltas are computed up front and applied
-            # only if both succeed; any error falls back to the (validated) gather
-            # path so an unexpected sharding can never break the step.
-            if is_qk:
-                deltas = None
-                try:
-                    deltas = self._cm_qk_local_deltas(
-                        p_a, p_b, U_a, U_b, head_dim, group_size, damping
+            # No-comm fast path: when both QK factors are head-aligned shards whose
+            # heads divide evenly across the shard world (every rank holds whole
+            # KV-groups), the per-head CM math runs on the local shard with no gather.
+            # Eligibility is decided from rank-invariant global shapes / placements /
+            # mesh size, so ALL ranks pick the same path -- a per-rank choice (or a
+            # per-rank fallback on error) would let some ranks gather (a collective)
+            # while others do not, deadlocking the step. If eligible, every rank
+            # commits to no-comm; an unexpected failure crashes (uniformly) rather
+            # than desyncing.
+            if is_qk and self._qk_nocomm_eligible(p_a, p_b, head_dim):
+                deltas = self._cm_qk_local_deltas(
+                    p_a, p_b, U_a, U_b, head_dim, group_size, damping
+                )
+                if deltas is None:  # pragma: no cover - eligibility guarantees not-None
+                    raise RuntimeError(
+                        "CompositionalMuon: no-comm eligibility/compute mismatch."
                     )
-                except Exception as exc:  # pragma: no cover - defensive fallback
-                    self._warn_local_fallback(exc)
-                if deltas is not None:
-                    self._apply_local(p_a, deltas[0], lr, lr_a, wd)
-                    self._apply_local(p_b, deltas[1], lr, lr_b, wd)
-                    continue
+                self._apply_local(p_a, deltas[0], lr, lr_a, wd)
+                self._apply_local(p_b, deltas[1], lr, lr_b, wd)
+                continue
 
             # Gather full factors (replicated math), reshard the update.
             W_a = _full(p_a.data).mT.float()
@@ -478,17 +481,33 @@ class CompositionalMuon(Optimizer):
             self._apply_update(p_a, delta_a.mT, lr, lr_a, wd)
             self._apply_update(p_b, delta_b.mT, lr, lr_b, wd)
 
-    def _warn_local_fallback(self, exc: Exception) -> None:
-        if not getattr(self, "_local_fallback_warned", False):
-            self._local_fallback_warned = True
-            warnings.warn(
-                "CompositionalMuon: the no-comm per-head QK path raised "
-                f"({type(exc).__name__}: {exc}); falling back to the gather path "
-                "for QK. Training is unaffected but the QK step is not "
-                "communication-optimized.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+    def _qk_nocomm_eligible(self, p_a: Tensor, p_b: Tensor, head_dim: int) -> bool:
+        """Whether every rank can run the QK pair on its local shard with no comm.
+
+        Decided purely from rank-invariant facts -- both factors are DTensors with a
+        single dim-0 Shard on the same mesh, plain (non-quantized) local tensors, and
+        head counts divisible by the shard world so each rank holds whole KV-groups.
+        Computed identically on all ranks, so the no-comm / gather choice can never
+        diverge (which would deadlock on the gather collective).
+        """
+        worlds = []
+        for p in (p_a, p_b):
+            d = p.data
+            if not isinstance(d, DTensor):
+                return False
+            shard_dims = [
+                k for k, pl in enumerate(d.placements) if isinstance(pl, Shard)
+            ]
+            if len(shard_dims) != 1 or d.placements[shard_dims[0]].dim != 0:
+                return False
+            if type(d.to_local()) is not Tensor:
+                return False  # quantized-subclass weights use the gather path
+            world = d.device_mesh.size(shard_dims[0])
+            n_heads = d.shape[0] // head_dim
+            if d.shape[0] % head_dim != 0 or n_heads % world != 0:
+                return False
+            worlds.append(world)
+        return worlds[0] == worlds[1]
 
     def _cm_qk_local_deltas(
         self,
@@ -539,15 +558,20 @@ class CompositionalMuon(Optimizer):
         adjusted_lr: float,
         weight_decay: float,
     ) -> None:
-        """Decoupled weight decay + CM update applied to the plain local shard in
-        place -- the pattern dion's Muon / NorMuon megabatch path uses to write
-        sharded updates -- so no DTensor wrap or communication is needed. Only plain
-        (non-quantized) local shards reach this path; see :func:`_head_local_shard`.
+        """Decoupled weight decay + CM update applied to the local shard via dion's
+        compiled ``muon_update_post_orthogonalize`` -- the exact (torch.compile'd,
+        mxfp8-proven) path Muon / NorMuon use to write sharded updates -- so the
+        in-place mutation is consistent with the compiled forward's view of the
+        param. No DTensor wrap or communication is needed.
         """
         local = p.data.to_local() if isinstance(p.data, DTensor) else p.data
-        update = delta_nn_local.to(local.dtype) * adjusted_lr
-        local.mul_(1 - base_lr * weight_decay)
-        local.sub_(update)
+        muon_update_post_orthogonalize(
+            [local],
+            [delta_nn_local.to(torch.bfloat16)],
+            base_lr=torch.tensor(base_lr),
+            adjusted_lr=torch.tensor(adjusted_lr),
+            weight_decay=torch.tensor(weight_decay),
+        )
 
     def _ortho_fallback_step(self, group: dict, normuon: bool) -> None:
         """Vanilla Muon (or NorMuon when ``normuon``) fallback for non-CM matrices.
@@ -581,39 +605,18 @@ class CompositionalMuon(Optimizer):
                 if "variance_neuron" not in state:
                     state["variance_neuron"] = torch.zeros_like(u[..., 0:1])
                 v = state["variance_neuron"]
-                # The per-row variance EMA is independent of head grouping, but
-                # NorMuon's Frobenius rescale is per-matrix: standalone NorMuon
-                # treats each head as its own matrix. Stack the heads on the batch
-                # dim so the rescale is per-head, not over the whole 2D update.
-                if num_heads is not None and num_heads > 1:
-                    head_dim = u.size(0) // num_heads
-                    u_norm, v_new = normuon_normalization_stacked(
-                        u.view(num_heads, head_dim, -1),
-                        v.view(num_heads, head_dim, 1),
-                        muon_beta2,
-                    )
-                    u = u_norm.reshape(u.shape)
-                    v.copy_(v_new.reshape(v.shape))
-                else:
-                    u_norm, v_new = normuon_normalization_stacked(
-                        u.unsqueeze(0), v.unsqueeze(0), muon_beta2
-                    )
-                    u = u_norm[0]
-                    v.copy_(v_new[0])
-            # Per-head Muon orthogonalizes each (head_dim, cols) block, so the
-            # spectral-to-RMS LR adjustment must use the per-head matrix dims to
-            # match the standalone optimizer; the full param dims would be off by
-            # sqrt(num_heads). For >2D matrices use the flattened fan-in.
-            if num_heads is not None and num_heads > 1:
-                fan_out = g_full.size(0) // num_heads
-            else:
-                fan_out = g_full.size(0)
-            fan_in = g_full.size(1)
+                # Per-row variance is independent of head grouping, so normalize
+                # the full 2D update (one matrix -> singleton stack dim).
+                u_norm, v_new = normuon_normalization_stacked(
+                    u.unsqueeze(0), v.unsqueeze(0), muon_beta2
+                )
+                u = u_norm[0]
+                v.copy_(v_new[0])
             adjust = group["adjust_lr"]
             if adjust == "spectral_norm":
-                adjusted_lr = lr * math.sqrt(fan_out / fan_in)
+                adjusted_lr = lr * math.sqrt(p.shape[-2] / p.shape[-1])
             elif adjust == "rms_norm":
-                adjusted_lr = lr * 0.2 * math.sqrt(max(fan_out, fan_in))
+                adjusted_lr = lr * 0.2 * math.sqrt(max(p.shape[-2], p.shape[-1]))
             else:
                 adjusted_lr = lr
             self._apply_update(p, u, lr, adjusted_lr, wd)
