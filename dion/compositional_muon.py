@@ -32,6 +32,7 @@ and takes ``1/G`` of the step budget (the blog allocates the shared-side budget 
 """
 
 import math
+import traceback
 import warnings
 import torch
 from torch import Tensor
@@ -483,8 +484,19 @@ class CompositionalMuon(Optimizer):
                 except Exception as exc:  # pragma: no cover - defensive fallback
                     self._warn_local_fallback(exc)
                 if deltas is not None:
-                    self._apply_local(p_a, deltas[0], lr, lr_a, wd)
-                    self._apply_local(p_b, deltas[1], lr, lr_b, wd)
+                    try:
+                        self._apply_local(p_a, deltas[0], lr, lr_a, wd)
+                        self._apply_local(p_b, deltas[1], lr, lr_b, wd)
+                    except (
+                        Exception
+                    ) as exc:  # pragma: no cover - surfaces the real error
+                        warnings.warn(
+                            "CompositionalMuon: no-comm QK apply failed "
+                            f"({type(exc).__name__}: {exc})\n{traceback.format_exc()}",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+                        raise
                     continue
 
             # Gather full factors (replicated math), reshard the update.
@@ -567,9 +579,13 @@ class CompositionalMuon(Optimizer):
         Only the read side (Gram / Newton-Schulz matmuls) needs the unwrapped master.
         """
         local = p.data.to_local() if isinstance(p.data, DTensor) else p.data
-        update = delta_nn_local.to(local.dtype) * adjusted_lr
-        local.mul_(1 - base_lr * weight_decay)
-        local.sub_(update)
+        # Mirror dion's post-orthogonalize dispatch exactly (foreach on a
+        # single-element list), which is the path proven to work on the wrapped
+        # mxfp8 weights; a plain ``Tensor.mul_`` may route differently through the
+        # subclass.
+        update = torch._foreach_mul([delta_nn_local.to(local.dtype)], adjusted_lr)
+        torch._foreach_mul_([local], 1 - base_lr * weight_decay)
+        torch._foreach_sub_([local], update)
 
     def _ortho_fallback_step(self, group: dict, normuon: bool) -> None:
         """Vanilla Muon (or NorMuon when ``normuon``) fallback for non-CM matrices.
