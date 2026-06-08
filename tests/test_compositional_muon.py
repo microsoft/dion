@@ -318,6 +318,8 @@ class TestOptimizer:
 
 
 def _dist_worker(rank, world_size, port, return_dict):
+    import dion.compositional_muon as cm_mod
+
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
@@ -327,37 +329,86 @@ def _dist_worker(rank, world_size, port, return_dict):
         d, hd, Hq, Hkv = 16, 4, 4, 2
 
         torch.manual_seed(21)
-        wq_full = torch.randn(Hq * hd, d)
-        wk_full = torch.randn(Hkv * hd, d)
+        wq_full, wk_full = torch.randn(Hq * hd, d), torch.randn(Hkv * hd, d)
+        wv_full, wo_full = torch.randn(Hkv * hd, d), torch.randn(d, Hq * hd)
         torch.manual_seed(22)
-        gq_full = torch.randn(Hq * hd, d)
-        gk_full = torch.randn(Hkv * hd, d)
+        gq_full, gk_full = torch.randn(Hq * hd, d), torch.randn(Hkv * hd, d)
+        gv_full, go_full = torch.randn(Hkv * hd, d), torch.randn(d, Hq * hd)
 
-        # Shard on dim 0 (the heads dim) across ranks.
-        wq = torch.nn.Parameter(distribute_tensor(wq_full, mesh, [Shard(0)]))
-        wk = torch.nn.Parameter(distribute_tensor(wk_full, mesh, [Shard(0)]))
-        wq.grad = distribute_tensor(gq_full, mesh, [Shard(0)])
-        wk.grad = distribute_tensor(gk_full, mesh, [Shard(0)])
+        def shard(t):
+            p = torch.nn.Parameter(distribute_tensor(t, mesh, [Shard(0)]))
+            return p
+
+        wq, wk = shard(wq_full), shard(wk_full)
+        wv, wo = shard(wv_full), shard(
+            wo_full
+        )  # q/k/v shard on heads; o shards on hidden
+        for p, g in ((wq, gq_full), (wk, gk_full), (wv, gv_full), (wo, go_full)):
+            p.grad = distribute_tensor(g, mesh, [Shard(0)])
 
         opt = CompositionalMuon(
-            [dict(params=[wq, wk], algorithm="cm_qk", head_dim=hd)], lr=0.02
+            [
+                dict(params=[wq, wk], algorithm="cm_qk", head_dim=hd),
+                dict(params=[wv, wo], algorithm="cm_ov", head_dim=hd),
+            ],
+            lr=0.02,
         )
-        opt.step()
 
-        got_q = wq.data.full_tensor()
-        got_k = wk.data.full_tensor()
+        # Count gathers: the head-sharded QK pair must take the no-comm local path
+        # (zero _full calls for q/k); only the hidden-sharded O factor gathers.
+        orig_full = cm_mod._full
+        calls = {"n": 0}
+
+        def counting_full(x):
+            calls["n"] += 1
+            return orig_full(x)
+
+        cm_mod._full = counting_full
+        try:
+            opt.step()
+        finally:
+            cm_mod._full = orig_full
+
+        got = {
+            n: p.data.full_tensor()
+            for n, p in (("q", wq), ("k", wk), ("v", wv), ("o", wo))
+        }
 
         if rank == 0:
-            # Single-device reference with identical inputs.
-            rwq = torch.nn.Parameter(wq_full.clone())
-            rwk = torch.nn.Parameter(wk_full.clone())
-            rwq.grad, rwk.grad = gq_full.clone(), gk_full.clone()
+            ref_p = {
+                n: torch.nn.Parameter(t.clone())
+                for n, t in (
+                    ("q", wq_full),
+                    ("k", wk_full),
+                    ("v", wv_full),
+                    ("o", wo_full),
+                )
+            }
+            for n, g in (
+                ("q", gq_full),
+                ("k", gk_full),
+                ("v", gv_full),
+                ("o", go_full),
+            ):
+                ref_p[n].grad = g.clone()
             ref = CompositionalMuon(
-                [dict(params=[rwq, rwk], algorithm="cm_qk", head_dim=hd)], lr=0.02
+                [
+                    dict(
+                        params=[ref_p["q"], ref_p["k"]], algorithm="cm_qk", head_dim=hd
+                    ),
+                    dict(
+                        params=[ref_p["v"], ref_p["o"]], algorithm="cm_ov", head_dim=hd
+                    ),
+                ],
+                lr=0.02,
             )
             ref.step()
-            return_dict["q_close"] = torch.allclose(got_q, rwq.data, atol=1e-5)
-            return_dict["k_close"] = torch.allclose(got_k, rwk.data, atol=1e-5)
+            for n in ("q", "k", "v", "o"):
+                return_dict[f"{n}_close"] = torch.allclose(
+                    got[n], ref_p[n].data, atol=1e-5
+                )
+            # QK (4 factors over 2 pairs) gathered nothing; OV gathered V and O.
+            return_dict["qk_full_calls"] = calls["n"]
     finally:
         dist.destroy_process_group()
 
@@ -372,9 +423,13 @@ def test_distributed_matches_single_device():
         nprocs=world_size,
         join=True,
     )
-    assert return_dict.get(
-        "q_close"
-    ), "distributed Q update diverged from single-device"
-    assert return_dict.get(
-        "k_close"
-    ), "distributed K update diverged from single-device"
+    for n in ("q", "k", "v", "o"):
+        assert return_dict.get(
+            f"{n}_close"
+        ), f"distributed {n} update diverged from single-device"
+    # The head-sharded QK pair takes the no-comm local path (0 gathers); only the
+    # OV pair gathers (its 2 weights + 2 momentum buffers = 4 _full calls).
+    assert return_dict.get("qk_full_calls") == 4, (
+        f"expected only OV to gather (4 _full calls), got {return_dict.get('qk_full_calls')} "
+        "- the QK no-comm local path may not have been taken"
+    )
