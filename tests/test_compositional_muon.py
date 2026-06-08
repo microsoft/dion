@@ -203,6 +203,19 @@ class TestOptimizer:
         for a, b in zip(r1, r2):
             assert torch.equal(a, b)
 
+    def test_epsilon_threaded_to_cm_path(self):
+        # The constructor's epsilon is the msign Newton-Schulz pre-norm floor for the
+        # CM pair path, not just the AdamW denominator; a large floor must change the
+        # QK / OV update (otherwise the knob is a silent no-op for cm_qk / cm_ov).
+        def run(eps):
+            wq, wk, wv, wo = _make_attn(8, 4, 2, 2, seed=7)
+            opt = CompositionalMuon(_groups(wq, wk, wv, wo, 4), lr=0.02, epsilon=eps)
+            _set_grads([wq, wk, wv, wo], seed=9)
+            opt.step()
+            return torch.cat([p.detach().flatten() for p in (wq, wk, wv, wo)])
+
+        assert not torch.allclose(run(1e-8), run(1e2), atol=1e-6)
+
     def test_zero_grad_is_noop_without_weight_decay(self):
         wq, wk, wv, wo = _make_attn(8, 4, 2, 2)
         opt = CompositionalMuon(_groups(wq, wk, wv, wo, 4), lr=0.02, weight_decay=0.0)

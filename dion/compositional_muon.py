@@ -420,6 +420,7 @@ class CompositionalMuon(Optimizer):
         wd = group["weight_decay"]
         budget = 0.5 * group["mp"]
         damping = group["damping"]
+        eps = group["epsilon"]
 
         for i in range(0, len(params), 2):
             p_a, p_b = params[i], params[i + 1]  # (Q, K) or (V, O)
@@ -462,7 +463,7 @@ class CompositionalMuon(Optimizer):
             # than desyncing.
             if is_qk and self._qk_nocomm_eligible(p_a, p_b, head_dim):
                 deltas = self._cm_qk_local_deltas(
-                    p_a, p_b, U_a, U_b, head_dim, group_size, damping
+                    p_a, p_b, U_a, U_b, head_dim, group_size, damping, eps
                 )
                 if deltas is None:  # pragma: no cover - eligibility guarantees not-None
                     raise RuntimeError(
@@ -477,7 +478,9 @@ class CompositionalMuon(Optimizer):
             W_b = _full(p_b.data).mT.float()
             G_a = _full(U_a).mT.float()
             G_b = _full(U_b).mT.float()
-            delta_a, delta_b = delta_fn(W_a, W_b, G_a, G_b, head_dim, damping=damping)
+            delta_a, delta_b = delta_fn(
+                W_a, W_b, G_a, G_b, head_dim, damping=damping, eps=eps
+            )
             self._apply_update(p_a, delta_a.mT, lr, lr_a, wd)
             self._apply_update(p_b, delta_b.mT, lr, lr_b, wd)
 
@@ -518,6 +521,7 @@ class CompositionalMuon(Optimizer):
         head_dim: int,
         group_size: int,
         damping: float,
+        eps: float,
     ) -> Optional[Tuple[Tensor, Tensor]]:
         """Per-head QK directions computed on the local shard, no communication.
 
@@ -547,6 +551,7 @@ class CompositionalMuon(Optimizer):
             Ub.mT.float(),
             head_dim,
             damping=damping,
+            eps=eps,
         )
         return delta_q.mT, delta_k.mT
 
