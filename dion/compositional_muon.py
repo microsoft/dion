@@ -32,7 +32,6 @@ and takes ``1/G`` of the step budget (the blog allocates the shared-side budget 
 """
 
 import math
-import traceback
 import warnings
 import torch
 from torch import Tensor
@@ -240,44 +239,25 @@ def _reshard_like(local: Tensor, ref: Tensor) -> Tensor:
     ).redistribute(placements=ref.placements)
 
 
-def _unwrap_subclass(t: Tensor) -> Tensor:
-    """Unwrap a training-weight tensor subclass (e.g. torchao's MXFP8 wrapper) to
-    its plain high-precision master tensor, mirroring what ``full_tensor()`` yields
-    on the gather path. The master is the subclass's first ``__tensor_flatten__``
-    inner tensor (a ``._data`` attribute in practice); plain tensors pass through.
-    Newton-Schulz / Gram matmuls reject the wrapper, so the local path must unwrap.
-    """
-    if type(t) is Tensor or isinstance(t, DTensor):
-        return t
-    flatten = getattr(t, "__tensor_flatten__", None)
-    if flatten is not None:
-        try:
-            names, _ = flatten()
-        except Exception:
-            names = ()
-        for name in names:
-            inner = getattr(t, name, None)
-            if isinstance(inner, Tensor):
-                return inner
-    inner = getattr(t, "_data", None)
-    return inner if isinstance(inner, Tensor) else t
-
-
 def _head_local_shard(p: Tensor, head_dim: int) -> Optional[Tensor]:
-    """Return the (unwrapped) local shard if ``p`` is a DTensor sharded on dim 0
-    along head boundaries (and not otherwise), so per-head work needs no comm.
+    """Return the local shard if ``p`` is a plain DTensor sharded on dim 0 along
+    head boundaries (and not otherwise), so per-head work needs no communication.
 
     Returns ``None`` (caller falls back to the gather path) when ``p`` is not a
     DTensor, is sharded on a dim other than 0, is sharded on more than one mesh
-    dim, or its local row count is not a positive multiple of ``head_dim`` (an
-    uneven / non-head-aligned shard).
+    dim, its local row count is not a positive multiple of ``head_dim`` (an
+    uneven / non-head-aligned shard), or its local tensor is a quantized-training
+    subclass (e.g. mxfp8): the in-place per-head update is not yet supported on
+    wrapped weights, so those use the gather path.
     """
     if not isinstance(p, DTensor):
         return None
     shards = [pl for pl in p.placements if isinstance(pl, Shard)]
     if len(shards) != 1 or shards[0].dim != 0:
         return None
-    local = _unwrap_subclass(p.to_local())
+    local = p.to_local()
+    if type(local) is not Tensor:
+        return None
     if local.shape[0] == 0 or local.shape[0] % head_dim != 0:
         return None
     return local
@@ -469,12 +449,13 @@ class CompositionalMuon(Optimizer):
             U_a = self._momentum_direction(p_a, group)
             U_b = self._momentum_direction(p_b, group)
 
-            # No-comm fast path: when both QK factors are sharded on heads, each rank
-            # holds whole KV-groups, so the per-head CM math runs on the local shard
-            # with no gather. (OV's O factor is sharded on the hidden axis, not heads,
-            # so it stays on the gather path.) The deltas are computed up front and
-            # applied only if both succeed; any error falls back to the (validated)
-            # gather path so an unexpected sharding can never break the step.
+            # No-comm fast path: when both QK factors are plain weights sharded on
+            # heads, each rank holds whole KV-groups, so the per-head CM math runs on
+            # the local shard with no gather. (OV's O factor is sharded on the hidden
+            # axis, not heads, and quantized-subclass weights are excluded, so both
+            # stay on the gather path.) The deltas are computed up front and applied
+            # only if both succeed; any error falls back to the (validated) gather
+            # path so an unexpected sharding can never break the step.
             if is_qk:
                 deltas = None
                 try:
@@ -484,19 +465,8 @@ class CompositionalMuon(Optimizer):
                 except Exception as exc:  # pragma: no cover - defensive fallback
                     self._warn_local_fallback(exc)
                 if deltas is not None:
-                    try:
-                        self._apply_local(p_a, deltas[0], lr, lr_a, wd)
-                        self._apply_local(p_b, deltas[1], lr, lr_b, wd)
-                    except (
-                        Exception
-                    ) as exc:  # pragma: no cover - surfaces the real error
-                        warnings.warn(
-                            "CompositionalMuon: no-comm QK apply failed "
-                            f"({type(exc).__name__}: {exc})\n{traceback.format_exc()}",
-                            RuntimeWarning,
-                            stacklevel=2,
-                        )
-                        raise
+                    self._apply_local(p_a, deltas[0], lr, lr_a, wd)
+                    self._apply_local(p_b, deltas[1], lr, lr_b, wd)
                     continue
 
             # Gather full factors (replicated math), reshard the update.
@@ -549,8 +519,8 @@ class CompositionalMuon(Optimizer):
             or local_q // local_kv != group_size
         ):
             return None
-        Ua = _unwrap_subclass(U_a.to_local() if isinstance(U_a, DTensor) else U_a)
-        Ub = _unwrap_subclass(U_b.to_local() if isinstance(U_b, DTensor) else U_b)
+        Ua = U_a.to_local() if isinstance(U_a, DTensor) else U_a
+        Ub = U_b.to_local() if isinstance(U_b, DTensor) else U_b
         delta_q, delta_k = qk_delta(
             la.mT.float(),
             lb.mT.float(),
@@ -569,23 +539,15 @@ class CompositionalMuon(Optimizer):
         adjusted_lr: float,
         weight_decay: float,
     ) -> None:
-        """Decoupled weight decay + CM update applied to the local shard in place.
-
-        Mutates the parameter's local tensor in place -- the pattern dion's Muon /
-        NorMuon megabatch path uses to write sharded updates -- so no DTensor wrap
-        or communication is needed. The update is applied to the (possibly
-        quantized-wrapper) local tensor directly, exactly as dion's post-ortho does;
-        the wrapper supports in-place ``mul_`` / ``sub_`` and re-quantizes itself.
-        Only the read side (Gram / Newton-Schulz matmuls) needs the unwrapped master.
+        """Decoupled weight decay + CM update applied to the plain local shard in
+        place -- the pattern dion's Muon / NorMuon megabatch path uses to write
+        sharded updates -- so no DTensor wrap or communication is needed. Only plain
+        (non-quantized) local shards reach this path; see :func:`_head_local_shard`.
         """
         local = p.data.to_local() if isinstance(p.data, DTensor) else p.data
-        # Mirror dion's post-orthogonalize dispatch exactly (foreach on a
-        # single-element list), which is the path proven to work on the wrapped
-        # mxfp8 weights; a plain ``Tensor.mul_`` may route differently through the
-        # subclass.
-        update = torch._foreach_mul([delta_nn_local.to(local.dtype)], adjusted_lr)
-        torch._foreach_mul_([local], 1 - base_lr * weight_decay)
-        torch._foreach_sub_([local], update)
+        update = delta_nn_local.to(local.dtype) * adjusted_lr
+        local.mul_(1 - base_lr * weight_decay)
+        local.sub_(update)
 
     def _ortho_fallback_step(self, group: dict, normuon: bool) -> None:
         """Vanilla Muon (or NorMuon when ``normuon``) fallback for non-CM matrices.
