@@ -559,14 +559,14 @@ class CompositionalMuon(Optimizer):
     ) -> None:
         """Decoupled weight decay + CM update applied to the local shard in place.
 
-        Mutates the parameter's local tensor directly (the pattern dion's Muon /
-        NorMuon megabatch path uses to write sharded updates), so no DTensor wrap
-        or communication is needed. The master tensor behind a quantized weight
-        wrapper is unwrapped so the in-place update lands on the high-precision
-        weights (the wrapper recomputes its quantized copy each forward).
+        Mutates the parameter's local tensor in place -- the pattern dion's Muon /
+        NorMuon megabatch path uses to write sharded updates -- so no DTensor wrap
+        or communication is needed. The update is applied to the (possibly
+        quantized-wrapper) local tensor directly, exactly as dion's post-ortho does;
+        the wrapper supports in-place ``mul_`` / ``sub_`` and re-quantizes itself.
+        Only the read side (Gram / Newton-Schulz matmuls) needs the unwrapped master.
         """
         local = p.data.to_local() if isinstance(p.data, DTensor) else p.data
-        local = _unwrap_subclass(local)
         update = delta_nn_local.to(local.dtype) * adjusted_lr
         local.mul_(1 - base_lr * weight_decay)
         local.sub_(update)
