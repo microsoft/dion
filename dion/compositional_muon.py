@@ -42,6 +42,7 @@ from torch.distributed.tensor import DTensor, Shard
 from torch.optim.optimizer import Optimizer, ParamsT
 from typing import List, Optional, Tuple
 
+from .muon import muon_update_post_orthogonalize
 from .normuon import normuon_normalization_stacked
 from .polar_express import polar_express
 from .scalar_opts import adamw_update, lion_update
@@ -71,7 +72,9 @@ def _unwrap_subclass(t: Tensor) -> Tensor:
 
 
 def _install_crash_dumper() -> None:
-    if os.environ.get("PHITRAIN_CM_CRASH_DUMP") != "1" or getattr(_install_crash_dumper, "_done", False):
+    if os.environ.get("PHITRAIN_CM_CRASH_DUMP") != "1" or getattr(
+        _install_crash_dumper, "_done", False
+    ):
         return
     _install_crash_dumper._done = True
     out = os.environ.get("OUTPUT_ROOT", ".")
@@ -87,6 +90,7 @@ def _install_crash_dumper() -> None:
         prev(exc_type, exc, tb)
 
     sys.excepthook = hook
+
 
 # Coupled Newton-Schulz (CANS, arxiv 2506.10935) schedule for the batched inverse
 # Gram root: 9 tuned (a, b) pairs then classic (1.5, -0.5) padding. Drives
@@ -587,15 +591,20 @@ class CompositionalMuon(Optimizer):
         adjusted_lr: float,
         weight_decay: float,
     ) -> None:
-        """Decoupled weight decay + CM update applied to the plain local shard in
-        place -- the pattern dion's Muon / NorMuon megabatch path uses to write
-        sharded updates -- so no DTensor wrap or communication is needed. Only plain
-        (non-quantized) local shards reach this path; see :func:`_head_local_shard`.
+        """Decoupled weight decay + CM update applied to the local shard via dion's
+        compiled ``muon_update_post_orthogonalize`` -- the exact (torch.compile'd,
+        mxfp8-proven) path Muon / NorMuon use to write sharded updates -- so the
+        in-place mutation is consistent with the compiled forward's view of the
+        param. No DTensor wrap or communication is needed.
         """
         local = p.data.to_local() if isinstance(p.data, DTensor) else p.data
-        update = delta_nn_local.to(local.dtype) * adjusted_lr
-        local.mul_(1 - base_lr * weight_decay)
-        local.sub_(update)
+        muon_update_post_orthogonalize(
+            [local],
+            [delta_nn_local.to(torch.bfloat16)],
+            base_lr=torch.tensor(base_lr),
+            adjusted_lr=torch.tensor(adjusted_lr),
+            weight_decay=torch.tensor(weight_decay),
+        )
 
     def _ortho_fallback_step(self, group: dict, normuon: bool) -> None:
         """Vanilla Muon (or NorMuon when ``normuon``) fallback for non-CM matrices.
