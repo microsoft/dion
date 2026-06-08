@@ -32,6 +32,7 @@ and takes ``1/G`` of the step budget (the blog allocates the shared-side budget 
 """
 
 import math
+import warnings
 import torch
 from torch import Tensor
 from torch.distributed.tensor import DTensor, Shard
@@ -258,14 +259,6 @@ def _head_local_shard(p: Tensor, head_dim: int) -> Optional[Tensor]:
     return local
 
 
-def _wrap_local_like(local: Tensor, ref: DTensor) -> DTensor:
-    """Wrap a per-rank ``local`` tensor as a DTensor with ``ref``'s placements,
-    without communication (the local shard is already in place)."""
-    return DTensor.from_local(
-        local, device_mesh=ref.device_mesh, placements=ref.placements, run_check=False
-    )
-
-
 # ---------------------------------------------------------------------------
 # Optimizer
 # ---------------------------------------------------------------------------
@@ -455,11 +448,21 @@ class CompositionalMuon(Optimizer):
             # No-comm fast path: when both QK factors are sharded on heads, each rank
             # holds whole KV-groups, so the per-head CM math runs on the local shard
             # with no gather. (OV's O factor is sharded on the hidden axis, not heads,
-            # so it stays on the gather path.)
-            if is_qk and self._cm_qk_local(
-                p_a, p_b, U_a, U_b, head_dim, group_size, lr, lr_a, lr_b, wd, damping
-            ):
-                continue
+            # so it stays on the gather path.) The deltas are computed up front and
+            # applied only if both succeed; any error falls back to the (validated)
+            # gather path so an unexpected sharding can never break the step.
+            if is_qk:
+                deltas = None
+                try:
+                    deltas = self._cm_qk_local_deltas(
+                        p_a, p_b, U_a, U_b, head_dim, group_size, damping
+                    )
+                except Exception as exc:  # pragma: no cover - defensive fallback
+                    self._warn_local_fallback(exc)
+                if deltas is not None:
+                    self._apply_local(p_a, deltas[0], lr, lr_a, wd)
+                    self._apply_local(p_b, deltas[1], lr, lr_b, wd)
+                    continue
 
             # Gather full factors (replicated math), reshard the update.
             W_a = _full(p_a.data).mT.float()
@@ -470,7 +473,19 @@ class CompositionalMuon(Optimizer):
             self._apply_update(p_a, delta_a.mT, lr, lr_a, wd)
             self._apply_update(p_b, delta_b.mT, lr, lr_b, wd)
 
-    def _cm_qk_local(
+    def _warn_local_fallback(self, exc: Exception) -> None:
+        if not getattr(self, "_local_fallback_warned", False):
+            self._local_fallback_warned = True
+            warnings.warn(
+                "CompositionalMuon: the no-comm per-head QK path raised "
+                f"({type(exc).__name__}: {exc}); falling back to the gather path "
+                "for QK. Training is unaffected but the QK step is not "
+                "communication-optimized.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+    def _cm_qk_local_deltas(
         self,
         p_a: Tensor,
         p_b: Tensor,
@@ -478,30 +493,27 @@ class CompositionalMuon(Optimizer):
         U_b: Tensor,
         head_dim: int,
         group_size: int,
-        lr: float,
-        lr_a: float,
-        lr_b: float,
-        wd: float,
         damping: float,
-    ) -> bool:
-        """No-communication per-head QK update on the local shard.
+    ) -> Optional[Tuple[Tensor, Tensor]]:
+        """Per-head QK directions computed on the local shard, no communication.
 
-        Returns ``True`` if both factors are head-aligned shards whose local heads
-        form whole KV-groups (so :func:`qk_delta` on the local heads is bit-identical
-        to the gathered computation, since the QK math is per-head independent and
-        group aggregation stays within the rank). Returns ``False`` to fall back.
+        Returns the local ``(delta_Q, delta_K)`` in nn.Linear convention when both
+        factors are head-aligned shards whose local heads form whole KV-groups (so
+        :func:`qk_delta` on the local heads is bit-identical to the gathered
+        computation -- the QK math is per-head independent and group aggregation
+        stays within the rank). Returns ``None`` (caller falls back) otherwise.
         """
         la = _head_local_shard(p_a.data, head_dim)
         lb = _head_local_shard(p_b.data, head_dim)
         if la is None or lb is None:
-            return False
+            return None
         local_q, local_kv = la.shape[0] // head_dim, lb.shape[0] // head_dim
         if (
             local_kv == 0
             or local_q % local_kv != 0
             or local_q // local_kv != group_size
         ):
-            return False
+            return None
         Ua = U_a.to_local() if isinstance(U_a, DTensor) else U_a
         Ub = U_b.to_local() if isinstance(U_b, DTensor) else U_b
         delta_q, delta_k = qk_delta(
@@ -512,9 +524,7 @@ class CompositionalMuon(Optimizer):
             head_dim,
             damping=damping,
         )
-        self._apply_local(p_a, delta_q.mT, lr, lr_a, wd)
-        self._apply_local(p_b, delta_k.mT, lr, lr_b, wd)
-        return True
+        return delta_q.mT, delta_k.mT
 
     def _apply_local(
         self,
@@ -524,12 +534,16 @@ class CompositionalMuon(Optimizer):
         adjusted_lr: float,
         weight_decay: float,
     ) -> None:
-        """Decoupled weight decay + per-shard CM update, applied in place with no comm."""
-        update = _wrap_local_like(
-            delta_nn_local.to(torch.bfloat16).contiguous(), p.data
-        )
-        p.data.mul_(1 - base_lr * weight_decay)
-        p.data.sub_(update * adjusted_lr)
+        """Decoupled weight decay + CM update applied to the local shard in place.
+
+        Mutates the parameter's local tensor directly (the pattern dion's Muon /
+        NorMuon megabatch path uses to write sharded updates), so no DTensor wrap
+        or communication is needed.
+        """
+        local = p.data.to_local() if isinstance(p.data, DTensor) else p.data
+        update = delta_nn_local.to(local.dtype) * adjusted_lr
+        local.mul_(1 - base_lr * weight_decay)
+        local.sub_(update)
 
     def _ortho_fallback_step(self, group: dict, normuon: bool) -> None:
         """Vanilla Muon (or NorMuon when ``normuon``) fallback for non-CM matrices.
