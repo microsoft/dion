@@ -32,10 +32,6 @@ and takes ``1/G`` of the step budget (the blog allocates the shared-side budget 
 """
 
 import math
-import os
-import sys
-import traceback as _traceback
-import warnings
 import torch
 from torch import Tensor
 from torch.distributed.tensor import DTensor, Shard
@@ -48,48 +44,6 @@ from .polar_express import polar_express
 from .scalar_opts import adamw_update, lion_update
 
 _CM_ALGORITHMS = ("cm_qk", "cm_ov", "muon", "normuon", "adamw", "lion")
-
-# DIAGNOSTIC (temporary): force the no-comm path on quantized weights and dump
-# any uncaught traceback (e.g. from the compiled forward) per rank to OUTPUT_ROOT.
-_FORCE_MXFP8_NOCOMM = os.environ.get("PHITRAIN_CM_NOCOMM_MXFP8") == "1"
-
-
-def _unwrap_subclass(t: Tensor) -> Tensor:
-    if type(t) is Tensor or isinstance(t, DTensor):
-        return t
-    flatten = getattr(t, "__tensor_flatten__", None)
-    if flatten is not None:
-        try:
-            names, _ = flatten()
-        except Exception:
-            names = ()
-        for name in names:
-            inner = getattr(t, name, None)
-            if isinstance(inner, Tensor):
-                return inner
-    inner = getattr(t, "_data", None)
-    return inner if isinstance(inner, Tensor) else t
-
-
-def _install_crash_dumper() -> None:
-    if os.environ.get("PHITRAIN_CM_CRASH_DUMP") != "1" or getattr(
-        _install_crash_dumper, "_done", False
-    ):
-        return
-    _install_crash_dumper._done = True
-    out = os.environ.get("OUTPUT_ROOT", ".")
-    rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
-    prev = sys.excepthook
-
-    def hook(exc_type, exc, tb):
-        try:
-            with open(os.path.join(out, f"cm_crash_rank{rank}.txt"), "w") as f:
-                f.write("".join(_traceback.format_exception(exc_type, exc, tb)))
-        except Exception:
-            pass
-        prev(exc_type, exc, tb)
-
-    sys.excepthook = hook
 
 
 # Coupled Newton-Schulz (CANS, arxiv 2506.10935) schedule for the batched inverse
@@ -304,11 +258,7 @@ def _head_local_shard(p: Tensor, head_dim: int) -> Optional[Tensor]:
         return None
     local = p.to_local()
     if type(local) is not Tensor:
-        if not _FORCE_MXFP8_NOCOMM:
-            return None
-        local = _unwrap_subclass(local)
-        if type(local) is not Tensor:
-            return None
+        return None
     if local.shape[0] == 0 or local.shape[0] % head_dim != 0:
         return None
     return local
@@ -336,11 +286,12 @@ class CompositionalMuon(Optimizer):
 
     Grouped-query attention is supported: ``H_q`` need only be a multiple of
     ``H_kv``. Distributed weights are handled per factor: when a QK pair is sharded
-    on heads (FSDP2 dim-0 shards along head boundaries, each rank holding whole
-    KV-groups) the per-head CM math runs on the local shard with no communication;
-    otherwise — and for the OV ``O`` factor, which is sharded on the hidden axis
-    rather than heads — the factor is gathered (``full_tensor``), computed
-    replicated, and the update re-sharded.
+    on heads (plain FSDP2 dim-0 shards along head boundaries, each rank holding
+    whole KV-groups) the per-head CM math runs on the local shard with no
+    communication -- the choice is made from rank-invariant global shapes so all
+    ranks agree. Otherwise -- for the OV ``O`` factor (sharded on the hidden axis,
+    not heads) and for quantized-subclass weights -- the factor is gathered
+    (``full_tensor``), computed replicated, and the update re-sharded.
 
     Args:
         params: Parameters or param groups for the optimizer.
@@ -409,7 +360,6 @@ class CompositionalMuon(Optimizer):
             num_heads=None,
         )
         super().__init__(params, defaults)
-        _install_crash_dumper()
 
         for group in self.param_groups:
             algo = group["algorithm"]
@@ -511,7 +461,6 @@ class CompositionalMuon(Optimizer):
             # commits to no-comm; an unexpected failure crashes (uniformly) rather
             # than desyncing.
             if is_qk and self._qk_nocomm_eligible(p_a, p_b, head_dim):
-                self._diag(f"cm_qk pair {i}: nocomm compute")
                 deltas = self._cm_qk_local_deltas(
                     p_a, p_b, U_a, U_b, head_dim, group_size, damping
                 )
@@ -519,14 +468,11 @@ class CompositionalMuon(Optimizer):
                     raise RuntimeError(
                         "CompositionalMuon: no-comm eligibility/compute mismatch."
                     )
-                self._diag(f"cm_qk pair {i}: nocomm apply")
                 self._apply_local(p_a, deltas[0], lr, lr_a, wd)
                 self._apply_local(p_b, deltas[1], lr, lr_b, wd)
-                self._diag(f"cm_qk pair {i}: nocomm done")
                 continue
 
             # Gather full factors (replicated math), reshard the update.
-            self._diag(f"{'cm_qk' if is_qk else 'cm_ov'} pair {i}: gather")
             W_a = _full(p_a.data).mT.float()
             W_b = _full(p_b.data).mT.float()
             G_a = _full(U_a).mT.float()
@@ -534,15 +480,6 @@ class CompositionalMuon(Optimizer):
             delta_a, delta_b = delta_fn(W_a, W_b, G_a, G_b, head_dim, damping=damping)
             self._apply_update(p_a, delta_a.mT, lr, lr_a, wd)
             self._apply_update(p_b, delta_b.mT, lr, lr_b, wd)
-            self._diag(f"{'cm_qk' if is_qk else 'cm_ov'} pair {i}: gather done")
-
-    def _diag(self, msg: str) -> None:
-        if _FORCE_MXFP8_NOCOMM:
-            print(
-                f"[CMDIAG r{os.environ.get('RANK', '0')}] {msg}",
-                file=sys.stderr,
-                flush=True,
-            )
 
     def _qk_nocomm_eligible(self, p_a: Tensor, p_b: Tensor, head_dim: int) -> bool:
         """Whether every rank can run the QK pair on its local shard with no comm.
@@ -563,8 +500,8 @@ class CompositionalMuon(Optimizer):
             ]
             if len(shard_dims) != 1 or d.placements[shard_dims[0]].dim != 0:
                 return False
-            if type(d.to_local()) is not Tensor and not _FORCE_MXFP8_NOCOMM:
-                return False
+            if type(d.to_local()) is not Tensor:
+                return False  # quantized-subclass weights use the gather path
             world = d.device_mesh.size(shard_dims[0])
             n_heads = d.shape[0] // head_dim
             if d.shape[0] % head_dim != 0 or n_heads % world != 0:
@@ -735,9 +672,5 @@ class CompositionalMuon(Optimizer):
                 self._ortho_fallback_step(group, normuon=True)
             else:
                 self._scalar_step(group)
-            self._diag(f"group '{algo}' done")
 
-        if _FORCE_MXFP8_NOCOMM and torch.cuda.is_available():
-            torch.cuda.synchronize()  # surface async faults at the optimizer, not later
-        self._diag("optimizer.step DONE")
         return loss
