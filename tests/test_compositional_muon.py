@@ -121,6 +121,42 @@ class TestDirectionMath:
             assert torch.allclose(dQ[:, sl], dQ_h, atol=1e-3)
             assert torch.allclose(dK[:, sl], dK_h, atol=1e-3)
 
+    def test_ov_orthogonality_invariant(self):
+        # OV hybrid: delta_V = msign(G_V C_O^-1) C_O^-1 => delta_V C_O ~ orthogonal
+        # (per head); O whitens per head before a single per-matrix sign, so
+        # C_V delta_O ~ orthogonal across the stacked heads.
+        d, hd, H = 32, 8, 4
+        torch.manual_seed(6)
+        WV, WO = torch.randn(d, H * hd), torch.randn(H * hd, d)
+        GV, GO = torch.randn(d, H * hd), torch.randn(H * hd, d)
+        dV, dO = ov_delta(WV, WO, GV, GO, hd, damping=1e-2)
+        WV_h = _to_heads_row(WV, H, hd)
+        WO_h = WO.view(H, hd, d)
+        C_O = torch.linalg.inv(_coupled_inv_sqrt(WO_h @ WO_h.mT, 1e-2))
+        C_V = torch.linalg.inv(_coupled_inv_sqrt(WV_h.mT @ WV_h, 1e-2))
+        sv_V = torch.linalg.svdvals((_to_heads_row(dV, H, hd) @ C_O).float())
+        sv_O = torch.linalg.svdvals((C_V @ dO.view(H, hd, d)).reshape(H * hd, d).float())
+        # 5-step Polar Express in bf16 lands singular values near 1.
+        assert sv_V.min() > 0.8 and sv_V.max() < 1.2
+        assert sv_O.min() > 0.8 and sv_O.max() < 1.2
+
+    def test_ov_gqa_groups_are_isolated(self):
+        # Under GQA the V update of one KV group must not depend on another group's
+        # O grad/weight: each shared V head pairs only with the G query heads (hence
+        # the O heads) of its own group. Perturbing group 1's O leaves group 0's V
+        # bit-identical; group 1's V changes.
+        d, hd, Hq, Hkv = 24, 4, 4, 2  # group_size == 2
+        torch.manual_seed(7)
+        WV, WO = torch.randn(d, Hkv * hd), torch.randn(Hq * hd, d)
+        GV, GO = torch.randn(d, Hkv * hd), torch.randn(Hq * hd, d)
+        dV0, _ = ov_delta(WV, WO, GV, GO, hd)
+        WO_pert = WO.clone()
+        WO_pert[2 * hd :, :] += 5.0  # O heads of query group 1 (kv head 1)
+        dV1, _ = ov_delta(WV, WO_pert, GV, GO, hd)
+        dV0_h, dV1_h = _to_heads_row(dV0, Hkv, hd), _to_heads_row(dV1, Hkv, hd)
+        assert torch.equal(dV0_h[0], dV1_h[0])
+        assert not torch.equal(dV0_h[1], dV1_h[1])
+
     def test_gqa_shapes(self):
         d, hd, Hq, Hkv = 16, 4, 6, 2
         torch.manual_seed(5)
