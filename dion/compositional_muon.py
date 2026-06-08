@@ -239,9 +239,32 @@ def _reshard_like(local: Tensor, ref: Tensor) -> Tensor:
     ).redistribute(placements=ref.placements)
 
 
+def _unwrap_subclass(t: Tensor) -> Tensor:
+    """Unwrap a training-weight tensor subclass (e.g. torchao's MXFP8 wrapper) to
+    its plain high-precision master tensor, mirroring what ``full_tensor()`` yields
+    on the gather path. The master is the subclass's first ``__tensor_flatten__``
+    inner tensor (a ``._data`` attribute in practice); plain tensors pass through.
+    Newton-Schulz / Gram matmuls reject the wrapper, so the local path must unwrap.
+    """
+    if type(t) is Tensor or isinstance(t, DTensor):
+        return t
+    flatten = getattr(t, "__tensor_flatten__", None)
+    if flatten is not None:
+        try:
+            names, _ = flatten()
+        except Exception:
+            names = ()
+        for name in names:
+            inner = getattr(t, name, None)
+            if isinstance(inner, Tensor):
+                return inner
+    inner = getattr(t, "_data", None)
+    return inner if isinstance(inner, Tensor) else t
+
+
 def _head_local_shard(p: Tensor, head_dim: int) -> Optional[Tensor]:
-    """Return the local shard if ``p`` is a DTensor sharded on dim 0 along head
-    boundaries (and not otherwise), so per-head work needs no communication.
+    """Return the (unwrapped) local shard if ``p`` is a DTensor sharded on dim 0
+    along head boundaries (and not otherwise), so per-head work needs no comm.
 
     Returns ``None`` (caller falls back to the gather path) when ``p`` is not a
     DTensor, is sharded on a dim other than 0, is sharded on more than one mesh
@@ -253,7 +276,7 @@ def _head_local_shard(p: Tensor, head_dim: int) -> Optional[Tensor]:
     shards = [pl for pl in p.placements if isinstance(pl, Shard)]
     if len(shards) != 1 or shards[0].dim != 0:
         return None
-    local = p.to_local()
+    local = _unwrap_subclass(p.to_local())
     if local.shape[0] == 0 or local.shape[0] % head_dim != 0:
         return None
     return local
@@ -514,8 +537,8 @@ class CompositionalMuon(Optimizer):
             or local_q // local_kv != group_size
         ):
             return None
-        Ua = U_a.to_local() if isinstance(U_a, DTensor) else U_a
-        Ub = U_b.to_local() if isinstance(U_b, DTensor) else U_b
+        Ua = _unwrap_subclass(U_a.to_local() if isinstance(U_a, DTensor) else U_a)
+        Ub = _unwrap_subclass(U_b.to_local() if isinstance(U_b, DTensor) else U_b)
         delta_q, delta_k = qk_delta(
             la.mT.float(),
             lb.mT.float(),
@@ -538,9 +561,12 @@ class CompositionalMuon(Optimizer):
 
         Mutates the parameter's local tensor directly (the pattern dion's Muon /
         NorMuon megabatch path uses to write sharded updates), so no DTensor wrap
-        or communication is needed.
+        or communication is needed. The master tensor behind a quantized weight
+        wrapper is unwrapped so the in-place update lands on the high-precision
+        weights (the wrapper recomputes its quantized copy each forward).
         """
         local = p.data.to_local() if isinstance(p.data, DTensor) else p.data
+        local = _unwrap_subclass(local)
         update = delta_nn_local.to(local.dtype) * adjusted_lr
         local.mul_(1 - base_lr * weight_decay)
         local.sub_(update)

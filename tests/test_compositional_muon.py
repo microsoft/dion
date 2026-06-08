@@ -24,6 +24,7 @@ from dion.compositional_muon import (
     ov_delta,
     _coupled_inv_sqrt,
     _to_heads_row,
+    _unwrap_subclass,
 )
 
 DEVICE = "cpu"
@@ -138,6 +139,21 @@ class TestDirectionMath:
         WQ, WK = torch.randn(d, 5 * hd), torch.randn(d, 2 * hd)  # 5 not divisible by 2
         with pytest.raises(ValueError, match="divisible"):
             qk_delta(WQ, WK, torch.randn_like(WQ), torch.randn_like(WK), hd)
+
+    def test_unwrap_subclass(self):
+        # Plain tensors pass through; a wrapper subclass unwraps to its master.
+        plain = torch.randn(4, 4)
+        assert _unwrap_subclass(plain) is plain
+
+        class _FakeWeightWrapper:
+            def __init__(self, data):
+                self._data = data
+
+            def __tensor_flatten__(self):
+                return ["_data"], None
+
+        master = torch.randn(4, 4)
+        assert _unwrap_subclass(_FakeWeightWrapper(master)) is master
 
 
 # ---------------------------------------------------------------------------
