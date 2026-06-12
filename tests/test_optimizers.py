@@ -39,18 +39,223 @@ def _run_steps(optimizer_cls, params, opt_kwargs, n_steps=3):
 
 
 # ---------------------------------------------------------------------------
+# MUON2-F factorized preconditioner
+# ---------------------------------------------------------------------------
+
+
+def test_muon2f_factorized_preconditioner_matches_adafactor_formula():
+    from dion.muon2f import muon2f_update_moments, muon2f_precondition_momentum
+
+    g = torch.tensor([[1.0, -2.0, 0.5], [3.0, 4.0, -1.0]], dtype=torch.float32)
+    m = torch.zeros_like(g)
+    v_row = torch.zeros(2, 1)
+    v_col = torch.zeros(1, 3)
+    beta2 = torch.tensor(0.5)
+    eps = torch.tensor(1e-8)
+
+    muon2f_update_moments(
+        G=[g],
+        M=[m],
+        V_row=[v_row],
+        V_col=[v_col],
+        momentum=torch.tensor(0.0),
+        beta2=beta2,
+        flatten=False,
+    )
+
+    expected_row = (1 - beta2) * (g * g).sum(dim=-1, keepdim=True)
+    expected_col = (1 - beta2) * (g * g).sum(dim=-2, keepdim=True)
+    torch.testing.assert_close(v_row, expected_row)
+    torch.testing.assert_close(v_col, expected_col)
+
+    u = muon2f_precondition_momentum(
+        G=[g],
+        M=[m],
+        V_row=[v_row],
+        V_col=[v_col],
+        momentum=torch.tensor(0.0),
+        epsilon=eps,
+        nesterov=False,
+        flatten=False,
+    )[0]
+    expected_v = expected_row * expected_col / expected_row.sum(dim=-2, keepdim=True)
+    expected_u = g / (expected_v.sqrt() + eps)
+    torch.testing.assert_close(
+        u.float(), expected_u.to(torch.bfloat16).float(), rtol=0, atol=0
+    )
+
+
+def test_muon2f_zero_second_moment_is_finite():
+    from dion.muon2f import muon2f_update_moments, muon2f_precondition_momentum
+
+    g = torch.zeros(2, 3)
+    m = torch.zeros_like(g)
+    v_row = torch.zeros(2, 1)
+    v_col = torch.zeros(1, 3)
+
+    muon2f_update_moments(
+        G=[g],
+        M=[m],
+        V_row=[v_row],
+        V_col=[v_col],
+        momentum=torch.tensor(0.0),
+        beta2=torch.tensor(0.95),
+        flatten=False,
+    )
+    u = muon2f_precondition_momentum(
+        G=[g],
+        M=[m],
+        V_row=[v_row],
+        V_col=[v_col],
+        momentum=torch.tensor(0.0),
+        epsilon=torch.tensor(1e-8),
+        nesterov=False,
+        flatten=False,
+    )[0]
+
+    assert torch.isfinite(u).all()
+
+
+def test_muon2f_column_ema_is_applied_after_reduction():
+    from dion.muon2f import muon2f_update_moments, muon2f_apply_col_moment_updates
+
+    beta2 = torch.tensor(0.9)
+    g0 = torch.tensor([[1.0, 2.0, 3.0]])
+    g1 = torch.tensor([[4.0, 5.0, 6.0]])
+    m0 = torch.zeros_like(g0)
+    m1 = torch.zeros_like(g1)
+    v_row0 = torch.zeros(1, 1)
+    v_row1 = torch.zeros(1, 1)
+    v_col = torch.ones(1, 3)
+
+    col_update0 = muon2f_update_moments(
+        G=[g0],
+        M=[m0],
+        V_row=[v_row0],
+        V_col=[v_col],
+        momentum=torch.tensor(0.0),
+        beta2=beta2,
+        flatten=False,
+        update_col=False,
+    )[0]
+    col_update1 = muon2f_update_moments(
+        G=[g1],
+        M=[m1],
+        V_row=[v_row1],
+        V_col=[v_col],
+        momentum=torch.tensor(0.0),
+        beta2=beta2,
+        flatten=False,
+        update_col=False,
+    )[0]
+
+    muon2f_apply_col_moment_updates(
+        V_col=[v_col],
+        col_updates=[col_update0 + col_update1],
+        beta2=beta2,
+    )
+
+    expected = beta2 * torch.ones(1, 3) + (1 - beta2) * (
+        (g0 * g0).sum(dim=-2, keepdim=True) + (g1 * g1).sum(dim=-2, keepdim=True)
+    )
+    torch.testing.assert_close(v_col, expected)
+
+
+def test_muon2f_cpu_step_with_identity_orthogonalization():
+    from dion import Muon2F
+
+    def identity_ortho(x, epsilon):
+        return x
+
+    params = _make_params([(4, 8)], device="cpu")
+    opt = Muon2F(
+        params,
+        lr=0.01,
+        weight_decay=0.0,
+        adjust_lr=None,
+        newton_schulz_func=identity_ortho,
+    )
+    before = params[0].data.clone()
+    params[0].grad = torch.randn_like(params[0])
+    opt.step()
+
+    state = opt.state[params[0]]
+    assert "variance_row" in state
+    assert "variance_col" in state
+    assert state["variance_row"].shape == (4, 1)
+    assert state["variance_col"].shape == (1, 8)
+    assert not torch.equal(params[0].data, before)
+
+
+def test_muon2f_step_matches_explicit_reference():
+    from dion import Muon2F
+
+    def identity_ortho(x, epsilon):
+        return x
+
+    def ref_step(x, m, v_row, v_col, g):
+        mu = 0.7
+        beta2 = 0.8
+        eps = 1e-8
+        m = mu * m + g
+        grad_sq = g * g
+        v_row = beta2 * v_row + (1 - beta2) * grad_sq.sum(dim=-1, keepdim=True)
+        v_col = beta2 * v_col + (1 - beta2) * grad_sq.sum(dim=-2, keepdim=True)
+        u = mu * m + g
+        v_hat = v_row * v_col / v_col.sum(dim=-1, keepdim=True).clamp_min(eps)
+        u = (u / (v_hat.sqrt() + eps)).to(torch.bfloat16).float()
+        x = x - 0.03 * u
+        return x, m, v_row, v_col
+
+    torch.manual_seed(123)
+    p = torch.nn.Parameter(torch.randn(4, 7))
+    opt = Muon2F(
+        [p],
+        lr=0.03,
+        mu=0.7,
+        muon_beta2=0.8,
+        weight_decay=0.0,
+        adjust_lr=None,
+        nesterov=True,
+        newton_schulz_func=identity_ortho,
+    )
+    x_ref = p.detach().clone()
+    m_ref = torch.zeros_like(x_ref)
+    v_row_ref = torch.zeros(4, 1)
+    v_col_ref = torch.zeros(1, 7)
+
+    for step in range(3):
+        torch.manual_seed(1000 + step)
+        g = torch.randn_like(p)
+        p.grad = g.clone()
+        opt.step()
+        x_ref, m_ref, v_row_ref, v_col_ref = ref_step(
+            x_ref, m_ref, v_row_ref, v_col_ref, g
+        )
+
+    state = opt.state[p]
+    torch.testing.assert_close(p.data, x_ref, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(state["momentum"], m_ref, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(state["variance_row"], v_row_ref, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(state["variance_col"], v_col_ref, rtol=1e-6, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
 # Muon
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA required")
 class TestMuon:
     def test_basic(self):
         from dion import Muon
+
         params = _make_params([(64, 128), (128, 64)])
         _run_steps(Muon, params, dict(lr=0.01))
 
     def test_determinism(self):
         from dion import Muon
+
         p1 = _make_params([(64, 128)])
         r1 = _run_steps(Muon, p1, dict(lr=0.01))
         p2 = _make_params([(64, 128)])
@@ -59,6 +264,7 @@ class TestMuon:
 
     def test_params_change(self):
         from dion import Muon
+
         params = _make_params([(64, 128)])
         before = params[0].data.clone()
         _run_steps(Muon, params, dict(lr=0.01), n_steps=1)
@@ -66,16 +272,19 @@ class TestMuon:
 
     def test_nesterov(self):
         from dion import Muon
+
         params = _make_params([(64, 128)])
         _run_steps(Muon, params, dict(lr=0.01, nesterov=True))
 
     def test_cautious_wd(self):
         from dion import Muon
+
         params = _make_params([(64, 128)])
         _run_steps(Muon, params, dict(lr=0.01, cautious_wd=True))
 
     def test_adjust_lr_options(self):
         from dion import Muon
+
         for adjust_lr in ["spectral_norm", "rms_norm", None]:
             params = _make_params([(64, 128)])
             _run_steps(Muon, params, dict(lr=0.01, adjust_lr=adjust_lr))
@@ -83,12 +292,14 @@ class TestMuon:
     def test_megabatch_same_shape(self):
         """Multiple same-shape params should be megabatched."""
         from dion import Muon
+
         params = _make_params([(64, 128)] * 5)
         _run_steps(Muon, params, dict(lr=0.01))
 
     def test_mixed_shapes(self):
         """Different shapes go to different shape groups."""
         from dion import Muon
+
         params = _make_params([(64, 128), (128, 64), (32, 32)])
         _run_steps(Muon, params, dict(lr=0.01))
 
@@ -97,15 +308,18 @@ class TestMuon:
 # NorMuon
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA required")
 class TestNorMuon:
     def test_basic(self):
         from dion import NorMuon
+
         params = _make_params([(64, 128), (128, 64)])
         _run_steps(NorMuon, params, dict(lr=0.01))
 
     def test_determinism(self):
         from dion import NorMuon
+
         p1 = _make_params([(64, 128)])
         r1 = _run_steps(NorMuon, p1, dict(lr=0.01))
         p2 = _make_params([(64, 128)])
@@ -114,6 +328,7 @@ class TestNorMuon:
 
     def test_params_change(self):
         from dion import NorMuon
+
         params = _make_params([(64, 128)])
         before = params[0].data.clone()
         _run_steps(NorMuon, params, dict(lr=0.01), n_steps=1)
@@ -122,6 +337,7 @@ class TestNorMuon:
     def test_variance_neuron_state(self):
         """NorMuon should create and update variance_neuron state."""
         from dion import NorMuon
+
         params = _make_params([(64, 128)])
         opt = NorMuon(params, lr=0.01)
         params[0].grad = torch.randn_like(params[0])
@@ -132,23 +348,83 @@ class TestNorMuon:
 
     def test_megabatch_same_shape(self):
         from dion import NorMuon
+
         params = _make_params([(64, 128)] * 5)
         _run_steps(NorMuon, params, dict(lr=0.01))
+
+
+# ---------------------------------------------------------------------------
+# Muon2F
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA required")
+class TestMuon2F:
+    def test_basic(self):
+        from dion import Muon2F
+
+        params = _make_params([(64, 128), (128, 64)])
+        _run_steps(Muon2F, params, dict(lr=0.01))
+
+    def test_determinism(self):
+        from dion import Muon2F
+
+        p1 = _make_params([(64, 128)])
+        r1 = _run_steps(Muon2F, p1, dict(lr=0.01))
+        p2 = _make_params([(64, 128)])
+        r2 = _run_steps(Muon2F, p2, dict(lr=0.01))
+        assert torch.equal(r1[0], r2[0])
+
+    def test_params_change(self):
+        from dion import Muon2F
+
+        params = _make_params([(64, 128)])
+        before = params[0].data.clone()
+        _run_steps(Muon2F, params, dict(lr=0.01), n_steps=1)
+        assert not torch.equal(params[0].data, before)
+
+    def test_factorized_variance_state(self):
+        from dion import Muon2F
+
+        params = _make_params([(64, 128)])
+        opt = Muon2F(params, lr=0.01)
+        params[0].grad = torch.randn_like(params[0])
+        opt.step()
+        state = opt.state[params[0]]
+        assert "variance_row" in state
+        assert "variance_col" in state
+        assert state["variance_row"].shape == (64, 1)
+        assert state["variance_col"].shape == (1, 128)
+
+    def test_nesterov(self):
+        from dion import Muon2F
+
+        params = _make_params([(64, 128)])
+        _run_steps(Muon2F, params, dict(lr=0.01, nesterov=True))
+
+    def test_megabatch_same_shape(self):
+        from dion import Muon2F
+
+        params = _make_params([(64, 128)] * 5)
+        _run_steps(Muon2F, params, dict(lr=0.01))
 
 
 # ---------------------------------------------------------------------------
 # Dion2
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA required")
 class TestDion2:
     def test_basic(self):
         from dion import Dion2
+
         params = _make_params([(64, 128), (128, 64)])
         _run_steps(Dion2, params, dict(lr=0.01))
 
     def test_determinism(self):
         from dion import Dion2
+
         p1 = _make_params([(64, 128)])
         r1 = _run_steps(Dion2, p1, dict(lr=0.01))
         p2 = _make_params([(64, 128)])
@@ -157,6 +433,7 @@ class TestDion2:
 
     def test_params_change(self):
         from dion import Dion2
+
         params = _make_params([(64, 128)])
         before = params[0].data.clone()
         _run_steps(Dion2, params, dict(lr=0.01), n_steps=1)
@@ -165,24 +442,28 @@ class TestDion2:
     def test_fraction(self):
         """Different fraction values should work, including int (issue #39)."""
         from dion import Dion2
+
         for fraction in [0.1, 0.25, 0.5, 1.0, 1]:
             params = _make_params([(64, 128)])
             _run_steps(Dion2, params, dict(lr=0.01, fraction=fraction))
 
     def test_ef_decay(self):
         from dion import Dion2
+
         for ef_decay in [0.0, 0.5, 0.95, 1.0]:
             params = _make_params([(64, 128)])
             _run_steps(Dion2, params, dict(lr=0.01, ef_decay=ef_decay))
 
     def test_megabatch_same_shape(self):
         from dion import Dion2
+
         params = _make_params([(64, 128)] * 5)
         _run_steps(Dion2, params, dict(lr=0.01))
 
     def test_select_dim_rows_vs_cols(self):
         """Tall matrices select columns, wide select rows."""
         from dion import Dion2
+
         # Wide: rows < cols → select rows
         params = _make_params([(32, 128)])
         _run_steps(Dion2, params, dict(lr=0.01, verbose=True))
@@ -193,6 +474,7 @@ class TestDion2:
     def test_3d_params_wide(self):
         """3D params (batch of wide matrices) should work with select_dim=-2."""
         from dion import Dion2
+
         params = _make_params([(4, 32, 128)])
         before = params[0].data.clone()
         _run_steps(Dion2, params, dict(lr=0.01, fraction=0.5), n_steps=3)
@@ -201,6 +483,7 @@ class TestDion2:
     def test_3d_params_tall(self):
         """3D params (batch of tall matrices) should work with select_dim=-1."""
         from dion import Dion2
+
         params = _make_params([(4, 128, 32)])
         before = params[0].data.clone()
         _run_steps(Dion2, params, dict(lr=0.01, fraction=0.25), n_steps=3)
@@ -209,12 +492,14 @@ class TestDion2:
     def test_3d_params_flatten(self):
         """3D params with flatten=True should flatten to 2D for ortho."""
         from dion import Dion2
+
         params = _make_params([(4, 32, 128)])
         _run_steps(Dion2, params, dict(lr=0.01, flatten=True), n_steps=3)
 
     def test_3d_megabatch(self):
         """Multiple 3D params with same shape should be megabatched."""
         from dion import Dion2
+
         params = _make_params([(4, 32, 64)] * 3)
         _run_steps(Dion2, params, dict(lr=0.01), n_steps=3)
 
@@ -223,20 +508,27 @@ class TestDion2:
 # num_heads per-group option (per-head Newton-Schulz on 2D weights)
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA required")
 class TestNumHeads:
     """The ``num_heads`` param-group option lets a 2D weight be treated as a
     batch of ``num_heads`` matrices for Newton-Schulz, matching the behavior of
     an equivalent 3D-stored weight without changing the model layout."""
 
-    def _run_parity(self, optimizer_cls, opt_kwargs, num_heads=4, head_dim=8, in_features=16, n_steps=3):
+    def _run_parity(
+        self,
+        optimizer_cls,
+        opt_kwargs,
+        num_heads=4,
+        head_dim=8,
+        in_features=16,
+        n_steps=3,
+    ):
         torch.manual_seed(0)
         init = torch.randn(num_heads * head_dim, in_features, device=DEVICE)
 
         w2d = torch.nn.Parameter(init.clone())
-        opt2d = optimizer_cls(
-            [{"params": [w2d], "num_heads": num_heads}], **opt_kwargs
-        )
+        opt2d = optimizer_cls([{"params": [w2d], "num_heads": num_heads}], **opt_kwargs)
 
         w3d = torch.nn.Parameter(init.clone().view(num_heads, head_dim, in_features))
         opt3d = optimizer_cls([w3d], **opt_kwargs)
@@ -255,26 +547,37 @@ class TestNumHeads:
 
     def test_muon_matches_3d(self):
         from dion import Muon
+
         self._run_parity(Muon, dict(lr=0.01))
 
     def test_muon_matches_3d_nesterov(self):
         from dion import Muon
+
         self._run_parity(Muon, dict(lr=0.01, nesterov=True))
 
     def test_dion2_matches_3d(self):
         from dion import Dion2
+
         self._run_parity(Dion2, dict(lr=0.01, fraction=0.5))
 
     def test_dion2_matches_3d_full_fraction(self):
         from dion import Dion2
+
         self._run_parity(Dion2, dict(lr=0.01, fraction=1.0))
 
     def test_normuon_matches_3d(self):
         from dion import NorMuon
+
         self._run_parity(NorMuon, dict(lr=0.01))
+
+    def test_muon2f_matches_3d(self):
+        from dion import Muon2F
+
+        self._run_parity(Muon2F, dict(lr=0.01))
 
     def test_muon_invalid_num_heads(self):
         from dion import Muon
+
         w = torch.nn.Parameter(torch.randn(30, 16, device=DEVICE))
         w.grad = torch.randn_like(w)
         # 30 not divisible by 4
@@ -284,6 +587,7 @@ class TestNumHeads:
 
     def test_muon_num_heads_rejects_1d(self):
         from dion import Muon
+
         # 1D params never reach _prepare_head_split (Muon asserts ndim >= 2),
         # but a 3D param with num_heads>1 should raise since the reshape assumes 2D.
         w = torch.nn.Parameter(torch.randn(4, 8, 16, device=DEVICE))
@@ -295,6 +599,7 @@ class TestNumHeads:
     def test_megabatch(self):
         """Multiple 2D params with same shape + num_heads should be megabatched."""
         from dion import Muon
+
         num_heads, head_dim, in_features = 4, 8, 16
         params = _make_params([(num_heads * head_dim, in_features)] * 3)
         opt = Muon([{"params": params, "num_heads": num_heads}], lr=0.01)
@@ -307,6 +612,7 @@ class TestNumHeads:
     @pytest.mark.parametrize("bad", [0, -1, 2.0, "4", True])
     def test_invalid_num_heads_raises(self, bad):
         from dion import Muon
+
         w = torch.nn.Parameter(torch.randn(32, 16, device=DEVICE))
         w.grad = torch.randn_like(w)
         opt = Muon([{"params": [w], "num_heads": bad}], lr=0.01)
@@ -317,6 +623,7 @@ class TestNumHeads:
         # num_heads=1 is semantically equivalent to the default path; verify
         # it runs without error and doesn't accidentally hit the head-split code.
         from dion import Muon
+
         w = torch.nn.Parameter(torch.randn(32, 16, device=DEVICE))
         w_ref = torch.nn.Parameter(w.data.clone())
         g = torch.randn_like(w)
@@ -333,14 +640,13 @@ class TestNumHeads:
         # flatten=True would collapse the per-head 3D view back to 2D, giving
         # the wrong update silently. It must raise.
         from dion import Muon
+
         num_heads, head_dim, in_features = 4, 8, 16
         w = torch.nn.Parameter(
             torch.randn(num_heads * head_dim, in_features, device=DEVICE)
         )
         w.grad = torch.randn_like(w)
-        opt = Muon(
-            [{"params": [w], "num_heads": num_heads}], lr=0.01, flatten=True
-        )
+        opt = Muon([{"params": [w], "num_heads": num_heads}], lr=0.01, flatten=True)
         with pytest.raises(ValueError, match="flatten"):
             opt.step()
 
@@ -348,6 +654,7 @@ class TestNumHeads:
 # ---------------------------------------------------------------------------
 # Mixed param groups (matrix + scalar)
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA required")
 class TestMixedParamGroups:
@@ -366,11 +673,15 @@ class TestMixedParamGroups:
 
     def test_muon_with_adamw_scalars(self):
         from dion import Muon
+
         weights, biases = self._make_model_params()
-        opt = Muon([
-            {"params": weights},
-            {"params": biases, "algorithm": "adamw"},
-        ], lr=0.01)
+        opt = Muon(
+            [
+                {"params": weights},
+                {"params": biases, "algorithm": "adamw"},
+            ],
+            lr=0.01,
+        )
         for step in range(3):
             for p in weights + biases:
                 p.grad = torch.randn_like(p)
@@ -378,11 +689,31 @@ class TestMixedParamGroups:
 
     def test_normuon_with_lion_scalars(self):
         from dion import NorMuon
+
         weights, biases = self._make_model_params()
-        opt = NorMuon([
-            {"params": weights},
-            {"params": biases, "algorithm": "lion"},
-        ], lr=0.01)
+        opt = NorMuon(
+            [
+                {"params": weights},
+                {"params": biases, "algorithm": "lion"},
+            ],
+            lr=0.01,
+        )
+        for step in range(3):
+            for p in weights + biases:
+                p.grad = torch.randn_like(p)
+            opt.step()
+
+    def test_muon2f_with_adamw_scalars(self):
+        from dion import Muon2F
+
+        weights, biases = self._make_model_params()
+        opt = Muon2F(
+            [
+                {"params": weights},
+                {"params": biases, "algorithm": "adamw"},
+            ],
+            lr=0.01,
+        )
         for step in range(3):
             for p in weights + biases:
                 p.grad = torch.randn_like(p)
@@ -390,11 +721,15 @@ class TestMixedParamGroups:
 
     def test_dion2_with_adamw_scalars(self):
         from dion import Dion2
+
         weights, biases = self._make_model_params()
-        opt = Dion2([
-            {"params": weights},
-            {"params": biases, "algorithm": "adamw"},
-        ], lr=0.01)
+        opt = Dion2(
+            [
+                {"params": weights},
+                {"params": biases, "algorithm": "adamw"},
+            ],
+            lr=0.01,
+        )
         for step in range(3):
             for p in weights + biases:
                 p.grad = torch.randn_like(p)
@@ -405,20 +740,24 @@ class TestMixedParamGroups:
 # Hyperparameter validation
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA required")
 class TestValidation:
     def test_muon_invalid_lr(self):
         from dion import Muon
+
         with pytest.raises(ValueError):
             Muon(_make_params([(32, 64)]), lr=-0.01)
 
     def test_normuon_invalid_mu(self):
         from dion import NorMuon
+
         with pytest.raises(ValueError):
             NorMuon(_make_params([(32, 64)]), mu=-1.0)
 
     def test_dion2_invalid_fraction(self):
         from dion import Dion2
+
         with pytest.raises(ValueError):
             Dion2(_make_params([(32, 64)]), fraction=0.0)
         with pytest.raises(ValueError):
@@ -426,12 +765,14 @@ class TestValidation:
 
     def test_invalid_adjust_lr(self):
         from dion import Muon
+
         with pytest.raises(ValueError):
             Muon(_make_params([(32, 64)]), adjust_lr="invalid")
 
     def test_1d_param_rejected(self):
         """Ortho optimizers should reject 1D parameters."""
         from dion import Muon
+
         params = [torch.nn.Parameter(torch.randn(64, device=DEVICE))]
         opt = Muon([{"params": params}], lr=0.01)
         params[0].grad = torch.randn_like(params[0])
@@ -443,11 +784,13 @@ class TestValidation:
 # No-grad params (some params have no gradient)
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA required")
 class TestSparseGradients:
     def test_some_params_no_grad(self):
         """Optimizer should handle params with no gradient gracefully."""
         from dion import Muon
+
         params = _make_params([(64, 128), (64, 128), (64, 128)])
         opt = Muon(params, lr=0.01)
         # Only give gradients to first and third params
@@ -458,6 +801,7 @@ class TestSparseGradients:
     def test_no_grads_at_all(self):
         """Step with zero gradients should be a no-op."""
         from dion import Muon
+
         params = _make_params([(64, 128)])
         before = params[0].data.clone()
         opt = Muon(params, lr=0.01)
@@ -469,11 +813,13 @@ class TestSparseGradients:
 # Step timing
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA required")
 class TestTiming:
     def test_optimizer_step_takes_time(self):
         """Optimizer step should take measurable wall-clock time."""
         from dion import Muon
+
         params = _make_params([(256, 512)] * 10)
         opt = Muon(params, lr=0.01)
         for p in params:
@@ -497,6 +843,7 @@ class TestTiming:
     def test_timer_accumulates_across_steps(self):
         """Simulated training timer should accumulate monotonically."""
         from dion import NorMuon
+
         params = _make_params([(64, 128)] * 3)
         opt = NorMuon(params, lr=0.01)
 

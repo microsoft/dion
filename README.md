@@ -146,12 +146,12 @@ The practical effectiveness of orthonormal optimizers was first demonstrated by 
 
 Our current implementations support the following parallelization techniques:
 
-| Parallelization    | Dion | Dion2 | Muon | NorMuon |
-|--------------------|------|-------|------|---------| 
-| Single device      | Yes  |  Yes  | Yes  |   Yes   |
-| PyTorch DDP        | Yes  |  Yes  | Yes  |   Yes   |
-| PyTorch FSDP2      | Yes  |  Yes  | Yes  |   Yes   |
-| PyTorch FSDP2 + TP | Yes  |  No   | No   |   No    |
+| Parallelization    | Dion | Dion2 | Muon | Muon2F | NorMuon |
+|--------------------|------|-------|------|--------|---------| 
+| Single device      | Yes  |  Yes  | Yes  |  Yes   |   Yes   |
+| PyTorch DDP        | Yes  |  Yes  | Yes  |  Yes   |   Yes   |
+| PyTorch FSDP2      | Yes  |  Yes  | Yes  |  Yes   |   Yes   |
+| PyTorch FSDP2 + TP | Yes  |  No   | No   |  No    |   No    |
 
 For faster performance, these optimizers will process parameters in batches and interleave multiple batches to overlap compute with communication.
 
@@ -159,6 +159,7 @@ We include optimizer implementations in the `dion/` directory of this repo.
  
 * `dion.py`: High-performance version of Dion. Depending on how each batch of matrices is sharded, we select the best communication patterns to compute Dion's orthonormal update. All-reduce operations may be split into reduce-scatter and all-gather across the batch dimension to more efficiently distribute work and avoid redundant computation.
 * `muon.py`: High-performance version of Muon. For sharded matrices, all-to-all communication is used to simultaneously unshard and distribute a batch of matrices. For replicated matrices, Muon will distribute work across all devices and all-gather final results.
+* `muon2f.py`: MUON2-F adds a factorized Adafactor-style second-moment preconditioner before Muon's Newton-Schulz orthogonalization. For FSDP2 row-sharded matrices, column statistics are synchronized before preconditioning; last-dimension matrix sharding is not supported.
 * **`dion2.py`**: High-performance implementation of Dion2, using a similar all-to-all communication pattern for distributed orthonormalization. Only an α-fraction of the momentum matrix is communicated and orthonormalized, significantly reducing both communication overhead and computation cost.
 * `normuon.py`: A variant of the Muon optimizer that introduces neuron-wise normalization to improve stability and convergence efficiency, modified to take similar arguments as `muon.py`. See [the paper](https://arxiv.org/abs/2510.05491) for more details.
 

@@ -26,6 +26,7 @@ from dion import Dion, DionMixedPrecisionConfig
 from dion import DionReference
 from dion import DionSimple
 from dion import Muon
+from dion import Muon2F
 from dion import MuonReference
 from dion import Dion2
 from dion import NorMuon
@@ -73,6 +74,7 @@ class Hyperparameters:
     replicate_mesh_grad_sync: bool = False
     mixed_precision: bool = False
     adjust_lr: str = "spectral_norm"  # for Muon only
+    muon_beta2: float = 0.95
 
     # For printing out selection choice in Dion2
     verbose: bool = True
@@ -136,12 +138,22 @@ def parse_cli_args():
         "--mixed_precision", action="store_true", help="Use mixed precision for Dion"
     )
     parser.add_argument(
-        "--ortho_fraction", type=float, default=None, help="Fraction to orthogonalize for Dion/Dion2"
+        "--ortho_fraction",
+        type=float,
+        default=None,
+        help="Fraction to orthogonalize for Dion/Dion2",
     )
     parser.add_argument("--mu", type=float, default=None, help="Momentum coefficient")
+    parser.add_argument(
+        "--muon_beta2",
+        type=float,
+        default=None,
+        help="Second-moment decay for Muon-family adaptive variants",
+    )
     parser.add_argument("--weight_decay", type=float, default=None, help="Weight decay")
     parser.add_argument(
-        "--time_optimizer", action="store_true",
+        "--time_optimizer",
+        action="store_true",
         help="Time fwd/bwd and optimizer step separately (adds cuda.synchronize between them)",
     )
 
@@ -204,10 +216,14 @@ def parse_cli_args():
         "--no_triton", action="store_true", help="Disable Triton kernels"
     )
     parser.add_argument(
-        "--use_polar_express", action="store_true", help="Use Polar Express for orthogonalization"
+        "--use_polar_express",
+        action="store_true",
+        help="Use Polar Express for orthogonalization",
     )
     parser.add_argument(
-        "--use_gram_newton_schulz", action="store_true", help="Use Gram Newton-Schulz for orthogonalization"
+        "--use_gram_newton_schulz",
+        action="store_true",
+        help="Use Gram Newton-Schulz for orthogonalization",
     )
 
     cli_args = parser.parse_args()
@@ -441,6 +457,35 @@ def init_optimizer(
             use_triton=(not cli_args.no_triton),
             use_polar_express=cli_args.use_polar_express,
         )
+    elif hp.optimizer == "muon2f":
+        if device_mesh is not None:
+            # Ensure that we have a supported device mesh configuration for Muon2F
+            if inner_shard_mesh is not None and inner_shard_mesh.size() > 1:
+                raise ValueError("Tensor parallel is not supported by Muon2F.")
+            distributed_mesh = (
+                outer_shard_mesh if outer_shard_mesh.size() > 1 else replicate_mesh
+            )
+            comm_method = "all-to-all" if outer_shard_mesh.size() > 1 else "all-gather"
+        else:
+            assert ddp_model is not None
+            distributed_mesh = ddp_model.process_group  # using ProcessGroup for DDP
+            comm_method = "all-gather"
+        print0(f"Muon2F LR adjust method: {hp.adjust_lr}")
+        print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
+        print0(f"Distributed Muon2F using: {comm_method}")
+        opt = Muon2F(
+            param_groups,
+            distributed_mesh=distributed_mesh,
+            lr=hp.lr,
+            mu=hp.mu,
+            muon_beta2=hp.muon_beta2,
+            weight_decay=hp.weight_decay,
+            nesterov=True,
+            adjust_lr=hp.adjust_lr,
+            use_gram_newton_schulz=cli_args.use_gram_newton_schulz,
+            use_triton=(not cli_args.no_triton),
+            use_polar_express=cli_args.use_polar_express,
+        )
     elif hp.optimizer == "dion2":
         if device_mesh is not None:
             # Ensure that we have a supported device mesh configuration for Dion2
@@ -492,7 +537,7 @@ def init_optimizer(
             distributed_mesh=distributed_mesh,
             lr=hp.lr,
             mu=hp.mu,
-            muon_beta2=0.95,
+            muon_beta2=hp.muon_beta2,
             weight_decay=hp.weight_decay,
             nesterov=True,
             adjust_lr=hp.adjust_lr,
