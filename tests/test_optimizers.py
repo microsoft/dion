@@ -475,6 +475,161 @@ class TestNumHeads:
 
 
 # ---------------------------------------------------------------------------
+# split_sizes per-group option (per-row-block Newton-Schulz on fused weights)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA required")
+class TestSplitSizes:
+    """The ``split_sizes`` param-group option orthogonalizes row blocks of a
+    fused 2D weight independently (e.g. a fused QKV projection with unequal
+    Q/K/V blocks under GQA), matching the update that separate per-block
+    parameters would receive."""
+
+    def _run_parity(
+        self,
+        optimizer_cls,
+        opt_kwargs,
+        split_sizes=(32, 16, 16),
+        in_features=32,
+        n_steps=3,
+    ):
+        torch.manual_seed(0)
+        rows = sum(split_sizes)
+        init = torch.randn(rows, in_features, device=DEVICE)
+
+        fused = torch.nn.Parameter(init.clone())
+        opt_fused = optimizer_cls(
+            [{"params": [fused], "split_sizes": split_sizes}], **opt_kwargs
+        )
+
+        separate = [
+            torch.nn.Parameter(block.clone())
+            for block in init.split(list(split_sizes), dim=0)
+        ]
+        opt_separate = optimizer_cls(separate, **opt_kwargs)
+
+        for step in range(n_steps):
+            torch.manual_seed(100 + step)
+            g = torch.randn(rows, in_features, device=DEVICE)
+            fused.grad = g.clone()
+            for p, gb in zip(separate, g.split(list(split_sizes), dim=0)):
+                p.grad = gb.clone()
+            opt_fused.step()
+            opt_separate.step()
+
+        # Newton-Schulz runs in bf16 and the per-block lr rescale rounds
+        # differently than the separate-param adjusted lr, so allow bf16-level
+        # tolerance rather than exact equality.
+        torch.testing.assert_close(
+            fused.data,
+            torch.cat([p.data for p in separate], dim=0),
+            rtol=1e-2,
+            atol=1e-3,
+        )
+
+    def test_muon_matches_separate(self):
+        from dion import Muon
+        self._run_parity(Muon, dict(lr=0.01))
+
+    def test_muon_matches_separate_rms_norm(self):
+        from dion import Muon
+        self._run_parity(Muon, dict(lr=0.01, adjust_lr="rms_norm"))
+
+    def test_muon_matches_separate_no_adjust(self):
+        from dion import Muon
+        self._run_parity(Muon, dict(lr=0.01, adjust_lr=None))
+
+    def test_muon_matches_separate_nesterov(self):
+        from dion import Muon
+        self._run_parity(Muon, dict(lr=0.01, nesterov=True))
+
+    def test_muon_equal_blocks(self):
+        from dion import Muon
+        self._run_parity(Muon, dict(lr=0.01), split_sizes=(16, 16, 16, 16))
+
+    def test_normuon_matches_separate(self):
+        from dion import NorMuon
+        self._run_parity(NorMuon, dict(lr=0.01))
+
+    def test_normuon_matches_separate_rms_norm(self):
+        from dion import NorMuon
+        self._run_parity(NorMuon, dict(lr=0.01, adjust_lr="rms_norm"))
+
+    def test_momentum_state_stays_fused(self):
+        from dion import Muon
+        w = torch.nn.Parameter(torch.randn(64, 32, device=DEVICE))
+        w.grad = torch.randn_like(w)
+        opt = Muon([{"params": [w], "split_sizes": (32, 16, 16)}], lr=0.01)
+        opt.step()
+        assert opt.state[w]["momentum"].shape == w.shape
+
+    def test_megabatch(self):
+        """Multiple same-shape params in one split_sizes group are megabatched."""
+        from dion import Muon
+        params = _make_params([(64, 32)] * 3)
+        opt = Muon([{"params": params, "split_sizes": (32, 16, 16)}], lr=0.01)
+        for step in range(3):
+            torch.manual_seed(100 + step)
+            for p in params:
+                p.grad = torch.randn_like(p)
+            opt.step()
+
+    def test_sum_mismatch_raises(self):
+        from dion import Muon
+        w = torch.nn.Parameter(torch.randn(60, 32, device=DEVICE))
+        w.grad = torch.randn_like(w)
+        opt = Muon([{"params": [w], "split_sizes": (32, 16, 16)}], lr=0.01)
+        with pytest.raises(ValueError, match="split_sizes"):
+            opt.step()
+
+    def test_rejects_3d_param(self):
+        from dion import Muon
+        w = torch.nn.Parameter(torch.randn(4, 16, 32, device=DEVICE))
+        w.grad = torch.randn_like(w)
+        opt = Muon([{"params": [w], "split_sizes": (2, 2)}], lr=0.01)
+        with pytest.raises(ValueError, match="2D"):
+            opt.step()
+
+    def test_incompatible_with_num_heads(self):
+        from dion import Muon
+        w = torch.nn.Parameter(torch.randn(64, 32, device=DEVICE))
+        w.grad = torch.randn_like(w)
+        opt = Muon(
+            [{"params": [w], "split_sizes": (32, 16, 16), "num_heads": 4}],
+            lr=0.01,
+        )
+        with pytest.raises(ValueError, match="num_heads"):
+            opt.step()
+
+    def test_incompatible_with_flatten(self):
+        from dion import Muon
+        w = torch.nn.Parameter(torch.randn(64, 32, device=DEVICE))
+        w.grad = torch.randn_like(w)
+        opt = Muon(
+            [{"params": [w], "split_sizes": (32, 16, 16)}], lr=0.01, flatten=True
+        )
+        with pytest.raises(ValueError, match="flatten"):
+            opt.step()
+
+    @pytest.mark.parametrize("bad", [3, (32,), (32, 0), (32, -1), (32, 2.0), (32, "16"), (32, True)])
+    def test_invalid_split_sizes_raises(self, bad):
+        from dion import Muon
+        w = torch.nn.Parameter(torch.randn(64, 32, device=DEVICE))
+        w.grad = torch.randn_like(w)
+        opt = Muon([{"params": [w], "split_sizes": bad}], lr=0.01)
+        with pytest.raises(ValueError, match="split_sizes"):
+            opt.step()
+
+    def test_dion2_not_supported(self):
+        from dion import Dion2
+        w = torch.nn.Parameter(torch.randn(64, 32, device=DEVICE))
+        w.grad = torch.randn_like(w)
+        opt = Dion2([{"params": [w], "split_sizes": (32, 16, 16)}], lr=0.01)
+        with pytest.raises(NotImplementedError, match="split_sizes"):
+            opt.step()
+
+
+# ---------------------------------------------------------------------------
 # Mixed param groups (matrix + scalar)
 # ---------------------------------------------------------------------------
 

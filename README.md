@@ -260,6 +260,22 @@ When `num_heads > 1`, the optimizer views each 2D weight as a batch of `num_head
 
 Requirements: the parameter must be 2D, `num_heads` must divide dim 0, and when using FSDP it must also divide the world size. Place Q / K / V / gate projections in one group (axis-0 heads); O-projection heads are on axis 1 and are not covered by this option.
 
+### Per-Block Newton-Schulz for Fused QKV Projections
+
+A fused QKV weight of shape `(q_dim + kv_dim + kv_dim, in_features)` keeps the model on a single wide GEMM, but orthogonalizing it as one matrix blends the Q, K, and V projections — and unlike per-head splitting, the blocks may have unequal sizes under grouped-query attention. Muon and NorMuon can run Newton-Schulz independently per row block by setting `split_sizes` on the parameter group:
+
+```python
+param_groups = [
+    dict(params=fused_qkv_params, split_sizes=(q_dim, kv_dim, kv_dim)),
+    dict(params=other_matrix_params),
+    ...
+]
+```
+
+Each block receives the same update it would as a separate parameter: Newton-Schulz, the learning-rate adjustment (`spectral_norm` / `rms_norm`), and NorMuon's norm-preserving rescale are all computed per block. Blocks of equal size (e.g. K and V) are batched into one Newton-Schulz call. The split happens on the fully assembled matrices after the FSDP all-to-all, so the communication pattern is unchanged from the fused parameter.
+
+Requirements: the parameter must be 2D, `split_sizes` must sum to dim 0, and with FSDP dim 0 must be divisible by the world size (so the assembled matrices contain no padding rows). `split_sizes` is mutually exclusive with `num_heads`. With FSDP, NorMuon's norm-preserving rescale operates on local shards (the existing distributed behavior) rather than per block.
+
 ## Distributed Training Configuration
 
 For our efficient distributed optimizers to work correctly, they need information about the model's parallelization scheme. This is provided by passing `DeviceMesh` objects during optimizer construction.

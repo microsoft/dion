@@ -149,6 +149,10 @@ class Dion2(DistributedOrthoBase):
                 shape_groups[(p.shape, sharding, p.dtype)].append(p)
 
             num_heads = self._resolve_num_heads(group)
+            if group.get("split_sizes") is not None:
+                raise NotImplementedError(
+                    "split_sizes is currently supported only by Muon and NorMuon."
+                )
 
             for (_shape, _sharding, _dtype), params in shape_groups.items():
                 gradients = [p.grad for p in params]
