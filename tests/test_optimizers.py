@@ -241,6 +241,142 @@ def test_muon2f_step_matches_explicit_reference():
 
 
 # ---------------------------------------------------------------------------
+# MUON2 full (unfactorized) preconditioner
+# ---------------------------------------------------------------------------
+
+
+def test_muon2_full_preconditioner_matches_adam_formula():
+    from dion.muon2 import muon2_update_moments, muon2_precondition_momentum
+
+    g = torch.tensor([[1.0, -2.0, 0.5], [3.0, 4.0, -1.0]], dtype=torch.float32)
+    m = torch.zeros_like(g)
+    v = torch.zeros_like(g)
+    beta2 = torch.tensor(0.5)
+    eps = torch.tensor(1e-8)
+
+    muon2_update_moments(
+        G=[g],
+        M=[m],
+        V=[v],
+        momentum=torch.tensor(0.0),
+        beta2=beta2,
+    )
+
+    expected_v = (1 - beta2) * (g * g)
+    torch.testing.assert_close(v, expected_v)
+
+    u = muon2_precondition_momentum(
+        G=[g],
+        M=[m],
+        V=[v],
+        momentum=torch.tensor(0.0),
+        epsilon=eps,
+        nesterov=False,
+    )[0]
+    expected_u = g / (expected_v.sqrt() + eps)
+    torch.testing.assert_close(
+        u.float(), expected_u.to(torch.bfloat16).float(), rtol=0, atol=0
+    )
+
+
+def test_muon2_zero_second_moment_is_finite():
+    from dion.muon2 import muon2_update_moments, muon2_precondition_momentum
+
+    g = torch.zeros(2, 3)
+    m = torch.zeros_like(g)
+    v = torch.zeros_like(g)
+
+    muon2_update_moments(
+        G=[g],
+        M=[m],
+        V=[v],
+        momentum=torch.tensor(0.0),
+        beta2=torch.tensor(0.95),
+    )
+    u = muon2_precondition_momentum(
+        G=[g],
+        M=[m],
+        V=[v],
+        momentum=torch.tensor(0.0),
+        epsilon=torch.tensor(1e-8),
+        nesterov=False,
+    )[0]
+
+    assert torch.isfinite(u).all()
+
+
+def test_muon2_cpu_step_with_identity_orthogonalization():
+    from dion import Muon2
+
+    def identity_ortho(x, epsilon):
+        return x
+
+    params = _make_params([(4, 8)], device="cpu")
+    opt = Muon2(
+        params,
+        lr=0.01,
+        weight_decay=0.0,
+        adjust_lr=None,
+        newton_schulz_func=identity_ortho,
+    )
+    before = params[0].data.clone()
+    params[0].grad = torch.randn_like(params[0])
+    opt.step()
+
+    state = opt.state[params[0]]
+    assert "variance" in state
+    assert state["variance"].shape == (4, 8)
+    assert not torch.equal(params[0].data, before)
+
+
+def test_muon2_step_matches_explicit_reference():
+    from dion import Muon2
+
+    def identity_ortho(x, epsilon):
+        return x
+
+    def ref_step(x, m, v, g):
+        mu = 0.7
+        beta2 = 0.8
+        eps = 1e-8
+        m = mu * m + g
+        grad_sq = g * g
+        v = beta2 * v + (1 - beta2) * grad_sq
+        u = mu * m + g
+        u = (u / (v.sqrt() + eps)).to(torch.bfloat16).float()
+        x = x - 0.03 * u
+        return x, m, v
+
+    torch.manual_seed(123)
+    p = torch.nn.Parameter(torch.randn(4, 7))
+    opt = Muon2(
+        [p],
+        lr=0.03,
+        mu=0.7,
+        muon_beta2=0.8,
+        weight_decay=0.0,
+        adjust_lr=None,
+        nesterov=True,
+        newton_schulz_func=identity_ortho,
+    )
+    x_ref = p.detach().clone()
+    m_ref = torch.zeros_like(x_ref)
+    v_ref = torch.zeros_like(x_ref)
+
+    for step in range(3):
+        torch.manual_seed(1000 + step)
+        g = torch.randn_like(p)
+        p.grad = g.clone()
+        opt.step()
+        x_ref, m_ref, v_ref = ref_step(x_ref, m_ref, v_ref, g)
+
+    state = opt.state[p]
+    torch.testing.assert_close(p.data, x_ref, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(state["momentum"], m_ref, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(state["variance"], v_ref, rtol=1e-6, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
 # Muon
 # ---------------------------------------------------------------------------
 
@@ -410,6 +546,60 @@ class TestMuon2F:
 
 
 # ---------------------------------------------------------------------------
+# Muon2
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA required")
+class TestMuon2:
+    def test_basic(self):
+        from dion import Muon2
+
+        params = _make_params([(64, 128), (128, 64)])
+        _run_steps(Muon2, params, dict(lr=0.01))
+
+    def test_determinism(self):
+        from dion import Muon2
+
+        p1 = _make_params([(64, 128)])
+        r1 = _run_steps(Muon2, p1, dict(lr=0.01))
+        p2 = _make_params([(64, 128)])
+        r2 = _run_steps(Muon2, p2, dict(lr=0.01))
+        assert torch.equal(r1[0], r2[0])
+
+    def test_params_change(self):
+        from dion import Muon2
+
+        params = _make_params([(64, 128)])
+        before = params[0].data.clone()
+        _run_steps(Muon2, params, dict(lr=0.01), n_steps=1)
+        assert not torch.equal(params[0].data, before)
+
+    def test_full_variance_state(self):
+        from dion import Muon2
+
+        params = _make_params([(64, 128)])
+        opt = Muon2(params, lr=0.01)
+        params[0].grad = torch.randn_like(params[0])
+        opt.step()
+        state = opt.state[params[0]]
+        assert "variance" in state
+        assert state["variance"].shape == (64, 128)
+
+    def test_nesterov(self):
+        from dion import Muon2
+
+        params = _make_params([(64, 128)])
+        _run_steps(Muon2, params, dict(lr=0.01, nesterov=True))
+
+    def test_megabatch_same_shape(self):
+        from dion import Muon2
+
+        params = _make_params([(64, 128)] * 5)
+        _run_steps(Muon2, params, dict(lr=0.01))
+
+
+# ---------------------------------------------------------------------------
 # Dion2
 # ---------------------------------------------------------------------------
 
@@ -575,6 +765,11 @@ class TestNumHeads:
 
         self._run_parity(Muon2F, dict(lr=0.01))
 
+    def test_muon2_matches_3d(self):
+        from dion import Muon2
+
+        self._run_parity(Muon2, dict(lr=0.01))
+
     def test_muon_invalid_num_heads(self):
         from dion import Muon
 
@@ -708,6 +903,22 @@ class TestMixedParamGroups:
 
         weights, biases = self._make_model_params()
         opt = Muon2F(
+            [
+                {"params": weights},
+                {"params": biases, "algorithm": "adamw"},
+            ],
+            lr=0.01,
+        )
+        for step in range(3):
+            for p in weights + biases:
+                p.grad = torch.randn_like(p)
+            opt.step()
+
+    def test_muon2_with_adamw_scalars(self):
+        from dion import Muon2
+
+        weights, biases = self._make_model_params()
+        opt = Muon2(
             [
                 {"params": weights},
                 {"params": biases, "algorithm": "adamw"},
