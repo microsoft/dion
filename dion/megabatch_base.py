@@ -555,10 +555,13 @@ def megabatch_orthogonalize_async(
             pad_spec = [0, 0] * (-comm_dim - 1) + [0, padded_local_size - original_local_size]
             U_work = [torch.nn.functional.pad(u, pad_spec) for u in U_work]
 
-        input_chunks = [
-            torch.stack(U_work[r * per_rank : (r + 1) * per_rank])
-            for r in range(world_size)
-        ]
+        # Pack all per-rank segments with a single stack + view instead of
+        # world_size separate torch.stack calls (each dispatched per_rank
+        # aten::select). The unbind views are contiguous slices of the stacked
+        # buffer, so they are safe to hand to all_to_all.
+        input_chunks = list(
+            torch.stack(U_work).unflatten(0, (world_size, per_rank)).unbind(0)
+        )
 
         output_chunks = [torch.empty_like(c) for c in input_chunks]
         work = dist.all_to_all(
@@ -590,13 +593,19 @@ def megabatch_orthogonalize_async(
         yield
         work.wait()
 
-        # Narrow each per-rank result back to the rank's original local size.
-        # On padding-only ranks original_local_size == 0 and the slice is empty.
-        result = [
-            recv_chunks[r][i].narrow(comm_dim, 0, original_local_size).contiguous()
-            for r in range(world_size)
-            for i in range(per_rank)
-        ]
+        # Narrow each per-rank result back to the rank's original local size and
+        # flatten the (rank, per_rank) axes in one shot, instead of a
+        # world_size x per_rank Python loop of select + narrow + contiguous.
+        # comm_dim is negative so it still indexes the matrix dim of the stacked
+        # tensor; flatten(0, 1) preserves the rank-major, per_rank-minor order of
+        # the original comprehension. On padding-only ranks original_local_size
+        # == 0 and the narrowed slices are empty.
+        recv_stacked = (
+            torch.stack(recv_chunks)
+            .narrow(comm_dim, 0, original_local_size)
+            .contiguous()
+        )
+        result = list(recv_stacked.flatten(0, 1).unbind(0))
         return result[:N]
 
     elif N > 1 and process_group is not None:
@@ -619,7 +628,8 @@ def megabatch_orthogonalize_async(
         yield
         work.wait()
 
-        result = [all_chunks[r][i] for r in range(world_size) for i in range(per_rank)]
+        # Flatten (rank, per_rank) in one op instead of a nested select loop.
+        result = list(torch.stack(all_chunks).flatten(0, 1).unbind(0))
         return result[:N]
 
     elif N == 1:
@@ -645,7 +655,7 @@ def megabatch_orthogonalize_async(
             split_sizes=split_sizes,
             split_scales=split_scales,
         )
-        return [stacked[i] for i in range(N)]
+        return list(stacked.unbind(0))
 
 
 def muon_update_newton_schulz(

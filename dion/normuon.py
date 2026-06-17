@@ -305,9 +305,13 @@ def normuon_update_megabatch_async(
     U_stacked, V_stacked = normuon_normalization_stacked(
         U_stacked, V_stacked, muon_beta2, split_sizes=norm_split_sizes
     )
-    for i in range(N):
-        V_local[i].copy_(V_stacked[i])
-    U = [U_stacked[i] for i in range(N)]
+    # Write the updated variance buffers back into the persistent per-param
+    # state in a single multi-tensor kernel instead of N separate copy_
+    # launches, and unbind U in one dispatch instead of N selects. Both are
+    # numerically identical to the per-element loops; this is purely a
+    # host-dispatch reduction (the V writeback alone was ~20% of step CPU time).
+    torch._foreach_copy_(V_local, V_stacked.unbind(0))
+    U = list(U_stacked.unbind(0))
 
     # Compute scaled learning rate
     if adjust_lr is None:
