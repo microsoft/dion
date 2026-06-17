@@ -44,7 +44,7 @@ class Dion2(DistributedOrthoBase):
             Signature is ``func(input: Tensor, epsilon: float) -> Tensor``.
         softening: Soft-Muon blend factor in [0, 1]. 0 (default) is standard
             orthogonalization (Schatten-inf). Values >0 blend toward the
-            spectrally-normalized momentum, producing a heavier-tailed, finite
+            Frobenius-normalized momentum, producing a heavier-tailed, finite
             Schatten-p style update that retains spectral decay.
         verbose: Whether to print debug information during updates. If True, it prints whether rows or columns are selected for the submatrix selection process.
 

@@ -62,7 +62,41 @@ def test_softening_preserves_singular_vectors():
     assert torch.allclose(torch.abs(Vhx @ Vho.T), torch.eye(4, dtype=X.dtype), atol=1e-6)
 
 
-@pytest.mark.parametrize("bad", [-0.1, 1.5])
+def test_softening_with_real_newton_schulz_backend():
+    # The other tests use exact SVD orthogonalization (_polar). This one drives
+    # the wrapper through a real finite-step Newton-Schulz backend (polar_express,
+    # which also returns bf16) to catch dtype/shape/finiteness regressions the
+    # exact-polar tests cannot, and to confirm the blend and the monotone tail
+    # reweighting survive a backend whose singular values are only approximately 1.
+    from dion.polar_express import polar_express
+
+    torch.manual_seed(5)
+    X = torch.randn(64, 32)
+    eps = torch.tensor(1e-7)
+
+    # The wrapper is exactly the documented blend on the real backend output.
+    s = 0.5
+    ortho = polar_express(X, epsilon=eps)
+    expected = torch.lerp(ortho, (X / X.norm()).to(ortho.dtype), s)
+    out = _soften_newton_schulz(polar_express, s)(X, epsilon=eps)
+    assert out.dtype == ortho.dtype
+    assert out.shape == X.shape
+    assert torch.equal(out, expected)
+
+    # Output stays finite across the full range, and the update is heavier-tailed
+    # at s=1 (full spectral decay) than at s=0 (orthogonalized). Strict per-step
+    # monotonicity is only guaranteed for an exact polar factor (tested above with
+    # _polar); a finite-step NS map adds its own ~1.3x spread at s=0, so we assert
+    # the robust endpoint relation rather than monotonicity over intermediate s.
+    spreads = {}
+    for s in [0.0, 0.3, 0.6, 1.0]:
+        sv = torch.linalg.svdvals(_soften_newton_schulz(polar_express, s)(X, epsilon=eps).float())
+        assert torch.isfinite(sv).all()
+        spreads[s] = (sv.max() / sv.min()).item()
+    assert spreads[1.0] > spreads[0.0]
+
+
+@pytest.mark.parametrize("bad", [-0.1, 1.5, float("nan")])
 def test_invalid_softening_raises(bad):
     p = [torch.zeros(4, 4, requires_grad=True)]
     with pytest.raises(ValueError, match="softening"):

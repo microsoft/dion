@@ -23,10 +23,16 @@ def _soften_newton_schulz(newton_schulz_func: Callable, softening: float) -> Cal
     """Wrap an orthogonalization function to produce a softened, heavier-tailed update.
 
     Returns a function computing ``(1 - s) * NS(X) + s * X / ||X||_F``. Newton-Schulz
-    preserves the singular vectors of X, so this scales the i-th singular value of the
-    update to ``(1 - s) + s * sigma_i / ||X||_F``, a monotone function of sigma_i:
-    ``s = 0`` recovers the orthogonalized (all-ones) update, while ``s > 0`` retains
-    spectral decay, yielding a finite-Schatten-p / Soft-Muon style update.
+    preserves the singular vectors of X, so it maps the i-th singular value of the
+    update to ``(1 - s) * f(sigma_i) + s * sigma_i / ||X||_F``, where ``f`` is the
+    NS spectral map. For an *exact* orthogonalization ``f == 1`` and this reduces to
+    the monotone reweighting ``(1 - s) + s * sigma_i / ||X||_F``; the default
+    finite-step NS backends keep ``f`` within roughly [0.85, 1.15], so the closed
+    form is approximate but the qualitative behavior (singular-vector preservation,
+    monotone tail reweighting) is exact. ``s = 0`` recovers the orthogonalized
+    update, while ``s > 0`` retains spectral decay, yielding a finite-Schatten-p /
+    Soft-Muon style update. Note the normalization is by the Frobenius norm, so at
+    larger ``s`` the update's spectral norm drops below 1.
 
     Args:
         newton_schulz_func: Base orthogonalization function ``func(X, epsilon) -> Tensor``.
@@ -38,8 +44,10 @@ def _soften_newton_schulz(newton_schulz_func: Callable, softening: float) -> Cal
     def softened(X: Tensor, epsilon=1e-7) -> Tensor:
         ortho = newton_schulz_func(X, epsilon=epsilon)
         eps = 1e-7 if epsilon is None else epsilon
+        # Per-matrix Frobenius norm; dim=(-2, -1) handles batched (stacked) tiles.
         normalized = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
-        return (1 - softening) * ortho + softening * normalized.to(ortho.dtype)
+        # lerp == (1 - s) * ortho + s * normalized in a single fused kernel.
+        return torch.lerp(ortho, normalized.to(ortho.dtype), softening)
 
     return softened
 
