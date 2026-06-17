@@ -44,6 +44,10 @@ class NorDion2(DistributedOrthoBase):
         use_triton: Whether to use Triton kernel for Newton-Schulz. Ignored if custom function is provided.
         newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
             Signature is ``func(input: Tensor, epsilon: float) -> Tensor``.
+        softening: Soft-Muon blend factor in [0, 1]. 0 (default) is standard
+            orthogonalization (Schatten-inf). Values >0 blend toward the
+            spectrally-normalized momentum, producing a heavier-tailed, finite
+            Schatten-p style update that retains spectral decay.
 
     NorDion2 optimizer applying Dion2 update to NorMuon
     """
@@ -65,6 +69,7 @@ class NorDion2(DistributedOrthoBase):
         use_polar_express: bool = True,
         use_gram_newton_schulz: bool = False,
         newton_schulz_func: Optional[Callable] = None,
+        softening: float = 0.0,
         triton_post_ortho: bool = False,
     ):
         # Validate hyperparameters
@@ -103,6 +108,7 @@ class NorDion2(DistributedOrthoBase):
             use_triton=use_triton,
             use_polar_express=use_polar_express,
             newton_schulz_func=newton_schulz_func,
+            softening=softening,
         )
         if triton_post_ortho:
             from .dion2_triton import TRITON_AVAILABLE

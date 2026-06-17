@@ -19,6 +19,31 @@ from .opt_utils import AsyncRuntime, AsyncTask, to_local
 from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
 
 
+def _soften_newton_schulz(newton_schulz_func: Callable, softening: float) -> Callable:
+    """Wrap an orthogonalization function to produce a softened, heavier-tailed update.
+
+    Returns a function computing ``(1 - s) * NS(X) + s * X / ||X||_F``. Newton-Schulz
+    preserves the singular vectors of X, so this scales the i-th singular value of the
+    update to ``(1 - s) + s * sigma_i / ||X||_F``, a monotone function of sigma_i:
+    ``s = 0`` recovers the orthogonalized (all-ones) update, while ``s > 0`` retains
+    spectral decay, yielding a finite-Schatten-p / Soft-Muon style update.
+
+    Args:
+        newton_schulz_func: Base orthogonalization function ``func(X, epsilon) -> Tensor``.
+        softening: Blend factor s in [0, 1].
+
+    Returns:
+        A function with the same ``func(X, epsilon) -> Tensor`` signature.
+    """
+    def softened(X: Tensor, epsilon=1e-7) -> Tensor:
+        ortho = newton_schulz_func(X, epsilon=epsilon)
+        eps = 1e-7 if epsilon is None else epsilon
+        normalized = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
+        return (1 - softening) * ortho + softening * normalized.to(ortho.dtype)
+
+    return softened
+
+
 class DistributedOrthoBase(Optimizer):
     """
     Shared base class for distributed orthogonalization optimizers (NorMuon, Dion2).
@@ -38,9 +63,12 @@ class DistributedOrthoBase(Optimizer):
         use_triton: bool = False,
         use_polar_express: bool = True,
         newton_schulz_func: Optional[Callable] = None,
+        softening: float = 0.0,
     ):
         super().__init__(params, defaults)
         self._algo_name = algo_name
+        if not 0.0 <= softening <= 1.0:
+            raise ValueError(f"`softening={softening}` must be in [0, 1].")
 
         # Distributed configuration
         if isinstance(distributed_mesh, DeviceMesh):
@@ -110,6 +138,12 @@ class DistributedOrthoBase(Optimizer):
             self._newton_schulz_func = newton_schulz_triton
         else:
             self._newton_schulz_func = zeropower_via_newtonschulz5
+
+        self._softening = softening
+        if softening > 0.0:
+            self._newton_schulz_func = _soften_newton_schulz(
+                self._newton_schulz_func, softening
+            )
 
         # Eagerly materialize optimizer state for every parameter, including
         # those that may never receive a gradient (frozen matrices, or MoE

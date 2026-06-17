@@ -44,6 +44,10 @@ class NorMuon(DistributedOrthoBase):
         use_triton: Whether to use Triton kernel for Newton-Schulz. Ignored if custom function is provided.
         newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
             Signature is ``func(input: Tensor, epsilon: float) -> Tensor``.
+        softening: Soft-Muon blend factor in [0, 1]. 0 (default) is standard
+            orthogonalization (Schatten-inf). Values >0 blend toward the
+            spectrally-normalized momentum, producing a heavier-tailed, finite
+            Schatten-p style update that retains spectral decay.
 
     Muon optimizer algorithm by Keller Jordan: https://kellerjordan.github.io/posts/muon/
     FSDP2 Muon uses all-to-all communications: https://www.essential.ai/blog/infra
@@ -68,6 +72,7 @@ class NorMuon(DistributedOrthoBase):
         use_triton: bool = False,
         use_polar_express: bool = True,
         newton_schulz_func: Optional[Callable] = None,
+        softening: float = 0.0,
     ):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -103,6 +108,7 @@ class NorMuon(DistributedOrthoBase):
             use_triton=use_triton,
             use_polar_express=use_polar_express,
             newton_schulz_func=newton_schulz_func,
+            softening=softening,
         )
 
     def _get_or_initialize_state(self, param: Tensor, algo: str) -> dict:

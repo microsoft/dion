@@ -42,6 +42,10 @@ class Dion2(DistributedOrthoBase):
         use_triton: Whether to use Triton kernel for Newton-Schulz. Ignored if custom function is provided.
         newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
             Signature is ``func(input: Tensor, epsilon: float) -> Tensor``.
+        softening: Soft-Muon blend factor in [0, 1]. 0 (default) is standard
+            orthogonalization (Schatten-inf). Values >0 blend toward the
+            spectrally-normalized momentum, producing a heavier-tailed, finite
+            Schatten-p style update that retains spectral decay.
         verbose: Whether to print debug information during updates. If True, it prints whether rows or columns are selected for the submatrix selection process.
 
     Dion2 optimizer by Ahn et al.: TBD
@@ -63,6 +67,7 @@ class Dion2(DistributedOrthoBase):
         use_polar_express: bool = True,
         use_gram_newton_schulz: bool = False,
         newton_schulz_func: Optional[Callable] = None,
+        softening: float = 0.0,
         verbose: bool = False,
         triton_post_ortho: bool = False,
     ):
@@ -99,6 +104,7 @@ class Dion2(DistributedOrthoBase):
             use_triton=use_triton,
             use_polar_express=use_polar_express,
             newton_schulz_func=newton_schulz_func,
+            softening=softening,
         )
         self.verbose = verbose
         if triton_post_ortho:
