@@ -458,7 +458,8 @@ def megabatch_orthogonalize_async(
     global_comm_dim_size: Optional[int],
     split_sizes: Optional[Tuple[int, ...]] = None,
     split_scales: Optional[Tuple[float, ...]] = None,
-) -> Generator[None, None, List[Tensor]]:
+    return_stacked: bool = False,
+) -> Generator[None, None, Union[List[Tensor], Tensor]]:
     """
     Shared megabatch communication + Newton-Schulz orthogonalization.
 
@@ -490,8 +491,20 @@ def megabatch_orthogonalize_async(
         split_scales: Optional per-block rescaling applied after Newton-Schulz,
             used to convert the caller's whole-matrix learning-rate adjustment
             into the per-block adjustment.
+        return_stacked: If True, return the orthogonalized result as a single
+            stacked ``[N, *shape]`` tensor instead of a list of N tensors.
+            Callers that immediately re-stack the result (NorMuon, NorDion2 for
+            their normalization step) use this to skip an unbind-then-restack
+            round-trip. Default False preserves the list contract for callers
+            that consume per-parameter tensors directly (Muon, Dion2).
     """
     N = len(U)
+
+    def _finalize(flat: Tensor) -> Union[List[Tensor], Tensor]:
+        # flat: stacked ``[M, *shape]`` (M >= N) in the caller's parameter
+        # order. Return the first N either stacked or as a list of views.
+        flat = flat[:N]
+        return flat if return_stacked else list(flat.unbind(0))
 
     # Pad to divisible by world_size (needed by both distributed paths)
     if process_group is not None and (N > 1 or comm_dim is not None):
@@ -605,8 +618,7 @@ def megabatch_orthogonalize_async(
             .narrow(comm_dim, 0, original_local_size)
             .contiguous()
         )
-        result = list(recv_stacked.flatten(0, 1).unbind(0))
-        return result[:N]
+        return _finalize(recv_stacked.flatten(0, 1))
 
     elif N > 1 and process_group is not None:
         # --- Mega-batched non-sharded path ---
@@ -629,20 +641,18 @@ def megabatch_orthogonalize_async(
         work.wait()
 
         # Flatten (rank, per_rank) in one op instead of a nested select loop.
-        result = list(torch.stack(all_chunks).flatten(0, 1).unbind(0))
-        return result[:N]
+        return _finalize(torch.stack(all_chunks).flatten(0, 1))
 
     elif N == 1:
-        return [
-            muon_update_newton_schulz(
-                U[0],
-                newton_schulz_func=newton_schulz_func,
-                flatten=flatten,
-                epsilon=epsilon,
-                split_sizes=split_sizes,
-                split_scales=split_scales,
-            )
-        ]
+        out = muon_update_newton_schulz(
+            U[0],
+            newton_schulz_func=newton_schulz_func,
+            flatten=flatten,
+            epsilon=epsilon,
+            split_sizes=split_sizes,
+            split_scales=split_scales,
+        )
+        return _finalize(out.unsqueeze(0))
 
     else:
         # N > 1, no process_group (single GPU or batch-sharded 3D)
@@ -655,7 +665,7 @@ def megabatch_orthogonalize_async(
             split_sizes=split_sizes,
             split_scales=split_scales,
         )
-        return list(stacked.unbind(0))
+        return _finalize(stacked)
 
 
 def muon_update_newton_schulz(

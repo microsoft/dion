@@ -276,7 +276,12 @@ def normuon_update_megabatch_async(
     # commute through the normalization below: a uniform per-block scale
     # propagates self-consistently into the variance buffer and the per-block
     # Frobenius rescale, so the normalized update is scaled by the same factor.
-    U = yield from megabatch_orthogonalize_async(
+    # Request the stacked [N, *shape] result directly: the normalization below
+    # immediately re-stacks the orthogonalized update, so taking the list and
+    # re-stacking it would be an unbind-then-restack round-trip (N selects + a
+    # stacking copy per shape group). return_stacked hands back the tensor the
+    # megabatch already has assembled.
+    U_stacked = yield from megabatch_orthogonalize_async(
         U,
         comm_dim=comm_dim,
         device_rank=device_rank,
@@ -288,6 +293,7 @@ def normuon_update_megabatch_async(
         global_comm_dim_size=global_comm_dim_size,
         split_sizes=split_sizes,
         split_scales=split_scales,
+        return_stacked=True,
     )
 
     # NorMuon normalization using stacked tensors for fewer kernel launches.
@@ -300,7 +306,6 @@ def normuon_update_megabatch_async(
         split_sizes if (comm_dim is None or process_group is None) else None
     )
     V_local = to_local(V)
-    U_stacked = torch.stack(U)
     V_stacked = torch.stack(V_local)
     U_stacked, V_stacked = normuon_normalization_stacked(
         U_stacked, V_stacked, muon_beta2, split_sizes=norm_split_sizes
