@@ -50,6 +50,8 @@ Our implementations are available as a `pip` package! Install to use in your pro
 pip install git+https://github.com/microsoft/dion.git
 ```
 
+> The optional Gram Newton-Schulz orthogonalization kernels (enabled with `use_gram_newton_schulz=True`) are not pulled in by the base install. Add them with `pip install "dion[gram-newton-schulz]"`.
+
 Then in your code, you can use:
 
 ```python

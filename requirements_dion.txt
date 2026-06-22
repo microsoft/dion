@@ -1,4 +1,2 @@
 numpy
 torch>=2.7.1
-gram-newton-schulz==0.1.4
-quack-kernels==0.4.1

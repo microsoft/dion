@@ -6,6 +6,7 @@ this_directory = os.path.dirname(__file__)
 req_path = os.path.join(this_directory, "requirements_dion.txt")
 req_dev_path = os.path.join(this_directory, "requirements_dev.txt")
 req_train_path = os.path.join(this_directory, "requirements_train.txt")
+req_gns_path = os.path.join(this_directory, "requirements_gns.txt")
 
 
 def read_requirements(path):
@@ -26,6 +27,9 @@ install_dev_requires = install_requires + read_requirements(req_dev_path)
 
 # requirements_train contains the dependencies for training, e.g., datasets, etc.
 install_train_requires = install_requires + read_requirements(req_train_path)
+
+# requirements_gns contains the optional Gram Newton-Schulz orthogonalization kernels
+install_gns_requires = install_requires + read_requirements(req_gns_path)
 
 readme_path = os.path.join(this_directory, "README.md")
 readme_contents = ""
@@ -69,5 +73,6 @@ setup(
         "dev": install_dev_requires,  # Can be installed with `pip install dion[dev]`
         "train": install_train_requires,
         "triton": install_requires + ["triton"],
+        "gram-newton-schulz": install_gns_requires,  # Can be installed with `pip install dion[gram-newton-schulz]`
     },
 )
