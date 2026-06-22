@@ -26,12 +26,10 @@ install_requires = read_requirements(req_path)
 gns_requires = read_requirements(req_gns_path)
 
 # requirements_dev contains the dependencies for development, e.g., testing, linting, etc.
-# GNS is folded in so `dion[dev]` can still exercise the use_gram_newton_schulz tests
-install_dev_requires = install_requires + read_requirements(req_dev_path) + gns_requires
+install_dev_requires = install_requires + read_requirements(req_dev_path)
 
 # requirements_train contains the dependencies for training, e.g., datasets, etc.
-# GNS is folded in so train.py's --use_gram_newton_schulz path stays available
-install_train_requires = install_requires + read_requirements(req_train_path) + gns_requires
+install_train_requires = install_requires + read_requirements(req_train_path)
 
 readme_path = os.path.join(this_directory, "README.md")
 readme_contents = ""

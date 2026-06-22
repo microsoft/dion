@@ -68,6 +68,7 @@ git clone https://github.com/microsoft/dion.git
 cd dion
 pip install -e .[train]
 ```
+> `train` stays free of the Gram Newton-Schulz kernels (and their `nvidia-cutlass-dsl==4.4.2` pin) so the default training install works on Flash-Attention-4 / Blackwell stacks. To train with `--use_gram_newton_schulz`, use `pip install -e ".[train,gns]"` in a separate environment.
 
 Download pretokenized FineWeb dataset:
 ```bash
