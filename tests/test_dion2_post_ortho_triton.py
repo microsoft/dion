@@ -338,6 +338,9 @@ class TestDion2TritonEndToEnd:
     @pytest.mark.parametrize("param_dtype", [torch.float32, torch.bfloat16])
     def test_triton_vs_default(self, shapes, fraction, ef_decay, use_triton, use_gram_newton_schulz, param_dtype):
         """Triton post-ortho should match default up to fused-rounding tolerance."""
+        if use_gram_newton_schulz:
+            pytest.importorskip("gram_newton_schulz", reason="optional dion[gram-newton-schulz] extra not installed")
+
         kwargs = dict(
             lr=0.01, fraction=fraction, ef_decay=ef_decay,
             use_triton=use_triton, use_gram_newton_schulz=use_gram_newton_schulz,
