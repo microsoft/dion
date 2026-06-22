@@ -50,7 +50,7 @@ Our implementations are available as a `pip` package! Install to use in your pro
 pip install git+https://github.com/microsoft/dion.git
 ```
 
-> The optional Gram Newton-Schulz orthogonalization kernels (enabled with `use_gram_newton_schulz=True`) are not pulled in by the base install. Add them with `pip install "dion[gram-newton-schulz]"`.
+> The optional Gram Newton-Schulz orthogonalization kernels (enabled with `use_gram_newton_schulz=True`) are not pulled in by the base install. Add them with `pip install "dion[gram-newton-schulz] @ git+https://github.com/microsoft/dion.git"`, or `pip install -e ".[gram-newton-schulz]"` from a clone. Note: this extra pins `nvidia-cutlass-dsl==4.4.2`, which conflicts with Flash-Attention-4 / Blackwell stacks built on cutlass `4.5.2`, so install it in a separate environment if you need both.
 
 Then in your code, you can use:
 

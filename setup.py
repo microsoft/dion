@@ -22,14 +22,16 @@ def read_requirements(path):
 # requirements_dion contains the dependencies for the standalone optimizer
 install_requires = read_requirements(req_path)
 
+# requirements_gns contains the optional Gram Newton-Schulz orthogonalization kernels
+gns_requires = read_requirements(req_gns_path)
+
 # requirements_dev contains the dependencies for development, e.g., testing, linting, etc.
-install_dev_requires = install_requires + read_requirements(req_dev_path)
+# GNS is folded in so `dion[dev]` can still exercise the use_gram_newton_schulz tests
+install_dev_requires = install_requires + read_requirements(req_dev_path) + gns_requires
 
 # requirements_train contains the dependencies for training, e.g., datasets, etc.
-install_train_requires = install_requires + read_requirements(req_train_path)
-
-# requirements_gns contains the optional Gram Newton-Schulz orthogonalization kernels
-install_gns_requires = install_requires + read_requirements(req_gns_path)
+# GNS is folded in so train.py's --use_gram_newton_schulz path stays available
+install_train_requires = install_requires + read_requirements(req_train_path) + gns_requires
 
 readme_path = os.path.join(this_directory, "README.md")
 readme_contents = ""
@@ -73,6 +75,8 @@ setup(
         "dev": install_dev_requires,  # Can be installed with `pip install dion[dev]`
         "train": install_train_requires,
         "triton": install_requires + ["triton"],
-        "gram-newton-schulz": install_gns_requires,  # Can be installed with `pip install dion[gram-newton-schulz]`
+        # `pip install "dion[gram-newton-schulz] @ git+https://github.com/microsoft/dion.git"` (alias: gns)
+        "gram-newton-schulz": install_requires + gns_requires,
+        "gns": install_requires + gns_requires,
     },
 )
