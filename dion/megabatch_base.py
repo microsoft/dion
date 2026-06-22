@@ -1,4 +1,5 @@
 import math
+import os
 import torch
 import torch.distributed as dist
 from collections import defaultdict
@@ -474,6 +475,40 @@ def megabatch_orthogonalize_async(
             pad_spec = [0, 0] * (-comm_dim - 1) + [0, padded_local_size - original_local_size]
             U_work = [torch.nn.functional.pad(u, pad_spec) for u in U_work]
 
+        if os.environ.get("DION_DISABLE_MEGABATCH") == "1":
+            # A/B-toggle path: same assignment and (bit-identical) result as the
+            # batched path below, but communicated as ``per_rank`` separate
+            # all-to-alls (one matrix-slot per round) instead of one batched
+            # all-to-all over all matrices. Isolates the communication-batching
+            # benefit of megabatching for timing experiments. NOT for production.
+            result = [None] * N_total
+            for j in range(per_rank):
+                in_j = [U_work[r * per_rank + j].unsqueeze(0) for r in range(world_size)]
+                out_j = [torch.empty_like(c) for c in in_j]
+                work = dist.all_to_all(out_j, in_j, group=process_group, async_op=True)
+                yield
+                work.wait()
+                full_j = torch.cat(out_j, dim=comm_dim)
+                full_j = muon_update_newton_schulz(
+                    full_j,
+                    newton_schulz_func=newton_schulz_func,
+                    flatten=flatten,
+                    epsilon=epsilon,
+                )
+                split_j = [
+                    s.contiguous()
+                    for s in torch.tensor_split(full_j, world_size, dim=comm_dim)
+                ]
+                recv_j = [torch.empty_like(c) for c in split_j]
+                work = dist.all_to_all(recv_j, split_j, group=process_group, async_op=True)
+                yield
+                work.wait()
+                for r in range(world_size):
+                    result[r * per_rank + j] = (
+                        recv_j[r][0].narrow(comm_dim, 0, original_local_size).contiguous()
+                    )
+            return result[:N]
+
         input_chunks = [
             torch.stack(U_work[r * per_rank : (r + 1) * per_rank])
             for r in range(world_size)
@@ -518,6 +553,27 @@ def megabatch_orthogonalize_async(
 
     elif N > 1 and process_group is not None:
         # --- Mega-batched non-sharded path ---
+        if os.environ.get("DION_DISABLE_MEGABATCH") == "1":
+            # Unbatched A/B path: per_rank separate all-gathers (one matrix each)
+            # instead of one batched all-gather; same result.
+            result = [None] * N_total
+            for j in range(per_rank):
+                mine = muon_update_newton_schulz(
+                    U_work[device_rank * per_rank + j].unsqueeze(0),
+                    newton_schulz_func=newton_schulz_func,
+                    flatten=flatten,
+                    epsilon=epsilon,
+                )
+                gathered = [torch.empty_like(mine) for _ in range(world_size)]
+                work = dist.all_gather(
+                    gathered, mine.contiguous(), group=process_group, async_op=True
+                )
+                yield
+                work.wait()
+                for r in range(world_size):
+                    result[r * per_rank + j] = gathered[r][0]
+            return result[:N]
+
         start = device_rank * per_rank
         my_matrices = torch.stack(U_work[start : start + per_rank])
         my_matrices = muon_update_newton_schulz(
