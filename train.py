@@ -343,11 +343,13 @@ def init_optimizer(
             weight_decay=0,  # no weight decay for embedding parameters
         )
     )
+    # scale lr for LM head only when using Lion fallback
+    lm_head_lr = hp.lr / math.sqrt(hp.model_dim) if hp.scalar_opt == "lion" else hp.lr
     param_groups.append(
         dict(
             params=lm_head_params,
             algorithm=hp.scalar_opt,
-            lr=hp.lr / math.sqrt(hp.model_dim),  # scale LR for lm_head
+            lr=lm_head_lr,
             betas=(0.95, 0.98),
             weight_decay=0,  # no weight decay for lm_head parameters
         )
