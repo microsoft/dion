@@ -6,6 +6,10 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- AdamW scalar fallback now uses the base learning rate for LM head parameters,
+  while Lion fallback keeps the `1 / sqrt(d_in)` LM-head scaling. This affects
+  shipped `configs/*_160m.yaml` runs, which set `scalar_opt: adamw`.
+
 - **Breaking (install):** `gram-newton-schulz` and `quack-kernels` are no longer
   base dependencies. They moved to an optional `dion[gram-newton-schulz]` extra
   (alias `dion[gns]`), and are also excluded from the `dev` and `train` extras.

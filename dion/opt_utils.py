@@ -1,8 +1,14 @@
+import math
 import torch
 from collections import defaultdict
 from torch import Tensor
 from torch.distributed.tensor import DTensor
 from typing import Generator, List, Optional, Union
+
+
+def lm_head_lr_scale(scalar_opt: str, model_dim: int) -> float:
+    # See Dion paper App. D.2 and Fig. 14 for the Lion-specific 1 / sqrt(d_in) scale.
+    return 1 / math.sqrt(model_dim) if scalar_opt == "lion" else 1.0
 
 
 def to_local(tensor: Union[Tensor, List[Tensor]]) -> Union[Tensor, List[Tensor]]:
