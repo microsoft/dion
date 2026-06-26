@@ -1,6 +1,6 @@
 # Optional Gram Newton-Schulz orthogonalization kernels (use_gram_newton_schulz=True).
 # quack-kernels is pulled in transitively by gram-newton-schulz; the explicit pin here
 # is for reproducibility and must track whatever quack version the pinned gram-newton-schulz
-# requires (gram-newton-schulz==0.1.4 also transitively pins nvidia-cutlass-dsl==4.4.2).
-gram-newton-schulz==0.1.4
-quack-kernels==0.4.1
+# requires (gram-newton-schulz==0.1.5 also transitively pins nvidia-cutlass-dsl==4.5.2).
+gram-newton-schulz==0.1.5
+quack-kernels==0.5.0
