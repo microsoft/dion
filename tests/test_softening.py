@@ -6,8 +6,9 @@ momentum, producing a heavier-tailed finite-Schatten-p update.
 import pytest
 import torch
 
-from dion import Muon, NorMuon
+from dion import Dion2, Muon, NorDion2, NorMuon
 from dion.megabatch_base import _soften_newton_schulz
+from dion.polar_express import polar_express
 
 
 def _polar(X, epsilon=None):
@@ -101,6 +102,25 @@ def test_invalid_softening_raises(bad):
     p = [torch.zeros(4, 4, requires_grad=True)]
     with pytest.raises(ValueError, match="softening"):
         NorMuon(p, softening=bad)
+
+
+@pytest.mark.parametrize("cls", [Muon, NorMuon, Dion2, NorDion2])
+def test_softening_wires_through_all_classes(cls):
+    assert cls([torch.zeros(4, 4, requires_grad=True)], softening=0.0)._softening == 0.0
+    assert cls([torch.zeros(4, 4, requires_grad=True)], softening=0.4)._softening == 0.4
+    with pytest.raises(ValueError, match="softening"):
+        cls([torch.zeros(4, 4, requires_grad=True)], softening=1.5)
+
+
+@pytest.mark.parametrize("cls", [Muon, NorMuon, Dion2, NorDion2])
+def test_softening_zero_leaves_ns_func_unwrapped(cls):
+    # Backward-compat contract: with the default softening=0 the selected NS
+    # function object is used verbatim (no blend wrapper), so behavior is
+    # byte-identical to pre-softening. s>0 must replace it with a wrapper.
+    base = cls([torch.zeros(4, 4, requires_grad=True)], softening=0.0)
+    assert base._newton_schulz_func is polar_express
+    softened = cls([torch.zeros(4, 4, requires_grad=True)], softening=0.3)
+    assert softened._newton_schulz_func is not polar_express
 
 
 def test_optimizer_wires_softening():
