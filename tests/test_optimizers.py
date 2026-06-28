@@ -40,6 +40,19 @@ def _run_steps(optimizer_cls, params, opt_kwargs, n_steps=3):
     return [p.data.clone() for p in params]
 
 
+@pytest.mark.parametrize(
+    ("scalar_opt", "expected_scale"),
+    [
+        ("adamw", 1.0),
+        ("lion", 1 / 768**0.5),
+    ],
+)
+def test_lm_head_lr_scale_by_scalar_opt(scalar_opt, expected_scale):
+    from dion.opt_utils import lm_head_lr_scale
+
+    assert lm_head_lr_scale(scalar_opt, model_dim=768) == pytest.approx(expected_scale)
+
+
 # ---------------------------------------------------------------------------
 # Muon
 # ---------------------------------------------------------------------------

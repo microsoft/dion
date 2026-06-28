@@ -1,5 +1,4 @@
 import argparse
-import math
 import os
 import shutil
 import time
@@ -30,6 +29,7 @@ from dion import MuonReference
 from dion import Dion2
 from dion import NorMuon
 from dion import NorDion2
+from dion.opt_utils import lm_head_lr_scale
 
 
 @dataclass
@@ -343,11 +343,12 @@ def init_optimizer(
             weight_decay=0,  # no weight decay for embedding parameters
         )
     )
+    lm_head_lr = hp.lr * lm_head_lr_scale(hp.scalar_opt, hp.model_dim)
     param_groups.append(
         dict(
             params=lm_head_params,
             algorithm=hp.scalar_opt,
-            lr=hp.lr / math.sqrt(hp.model_dim),  # scale LR for lm_head
+            lr=lm_head_lr,
             betas=(0.95, 0.98),
             weight_decay=0,  # no weight decay for lm_head parameters
         )
