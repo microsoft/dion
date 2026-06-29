@@ -12,6 +12,7 @@ from .megabatch_base import (
     muon_update_newton_schulz,
     adjust_lr_spectral_norm,
     adjust_lr_rms_norm,
+    compute_split_lr_scales,
 )
 from .opt_utils import AsyncTask, to_local
 
@@ -43,6 +44,13 @@ class Muon(DistributedOrthoBase):
         use_gram_newton_schulz: Whether to use Gram Newton-Schulz for orthogonalization.
         newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
             Signature is ``func(input: Tensor, epsilon: float) -> Tensor``.
+
+    Param groups may also set the ``split_sizes`` option to orthogonalize row
+    blocks of a fused 2D weight independently (e.g. a fused QKV projection as
+    separate Q, K, and V blocks, which may have unequal sizes under GQA).
+    Newton-Schulz and the learning-rate adjustment run per block, matching the
+    update that separate per-block parameters would receive, while the model
+    keeps the single wide GEMM. See the README for details.
 
     Muon optimizer algorithm by Keller Jordan: https://kellerjordan.github.io/posts/muon/
     FSDP2 Muon uses all-to-all communications: https://www.essential.ai/blog/infra
@@ -137,11 +145,22 @@ class Muon(DistributedOrthoBase):
                 shape_groups[(p.shape, sharding, p.dtype)].append(p)
 
             num_heads = self._resolve_num_heads(group)
+            split_sizes = self._resolve_split_sizes(group)
 
             for (_shape, _sharding, _dtype), params in shape_groups.items():
                 gradients = [p.grad for p in params]
                 states = [self._get_or_initialize_state(p, "muon") for p in params]
                 momentums = [s["momentum"] for s in states]
+
+                split_args = {}
+                if split_sizes is not None:
+                    self._validate_split_shape(split_sizes, params)
+                    split_args = dict(
+                        split_sizes=split_sizes,
+                        split_scales=compute_split_lr_scales(
+                            split_sizes, params[0].shape, group["adjust_lr"]
+                        ),
+                    )
 
                 if num_heads is not None:
                     params, gradients, momentums = self._prepare_head_split(
@@ -164,6 +183,7 @@ class Muon(DistributedOrthoBase):
                         G=gradients,
                         M=momentums,
                         shard_dim=shard_dim,
+                        **split_args,
                         **megabatch_args,
                     )
                 )
@@ -186,6 +206,8 @@ def muon_update_megabatch_async(
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
     cautious_wd: bool = False,
+    split_sizes: Optional[Tuple[int, ...]] = None,
+    split_scales: Optional[Tuple[float, ...]] = None,
 ) -> Generator[None, None, None]:
     """
     Mega-batched Muon update: processes ALL same-shape parameters in one
@@ -217,7 +239,10 @@ def muon_update_megabatch_async(
     else:
         global_comm_dim_size = None
 
-    # Orthogonalize via shared megabatch communication
+    # Orthogonalize via shared megabatch communication. With split_sizes, each
+    # row block is orthogonalized independently and rescaled by split_scales,
+    # which converts the whole-matrix adjusted_lr applied below into the
+    # per-block adjustment that separate parameters would receive.
     U = yield from megabatch_orthogonalize_async(
         U,
         comm_dim=comm_dim,
@@ -228,6 +253,8 @@ def muon_update_megabatch_async(
         flatten=flatten,
         epsilon=epsilon,
         global_comm_dim_size=global_comm_dim_size,
+        split_sizes=split_sizes,
+        split_scales=split_scales,
     )
 
     # Compute scaled learning rate

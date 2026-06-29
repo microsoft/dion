@@ -11,6 +11,7 @@ from .megabatch_base import (
     megabatch_orthogonalize_async,
     adjust_lr_spectral_norm,
     adjust_lr_rms_norm,
+    compute_split_lr_scales,
 )
 from .opt_utils import AsyncTask, to_local
 from .muon import muon_update_pre_orthogonalize, muon_update_post_orthogonalize
@@ -44,6 +45,14 @@ class NorMuon(DistributedOrthoBase):
         use_triton: Whether to use Triton kernel for Newton-Schulz. Ignored if custom function is provided.
         newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
             Signature is ``func(input: Tensor, epsilon: float) -> Tensor``.
+
+    Param groups may also set the ``split_sizes`` option to orthogonalize row
+    blocks of a fused 2D weight independently (e.g. a fused QKV projection as
+    separate Q, K, and V blocks, which may have unequal sizes under GQA).
+    Newton-Schulz, the learning-rate adjustment, and the NorMuon norm rescale
+    run per block, matching the update that separate per-block parameters
+    would receive, while the model keeps the single wide GEMM. See the README
+    for details.
 
     Muon optimizer algorithm by Keller Jordan: https://kellerjordan.github.io/posts/muon/
     FSDP2 Muon uses all-to-all communications: https://www.essential.ai/blog/infra
@@ -160,12 +169,23 @@ class NorMuon(DistributedOrthoBase):
                 shape_groups[(p.shape, sharding, p.dtype)].append(p)
 
             num_heads = self._resolve_num_heads(group)
+            split_sizes = self._resolve_split_sizes(group)
 
             for (_shape, _sharding, _dtype), params in shape_groups.items():
                 gradients = [p.grad for p in params]
                 states = [self._get_or_initialize_state(p, self._algo_name) for p in params]
                 momentums = [s["momentum"] for s in states]
                 variances_neuron = [s["variance_neuron"] for s in states]
+
+                split_args = {}
+                if split_sizes is not None:
+                    self._validate_split_shape(split_sizes, params)
+                    split_args = dict(
+                        split_sizes=split_sizes,
+                        split_scales=compute_split_lr_scales(
+                            split_sizes, params[0].shape, group["adjust_lr"]
+                        ),
+                    )
 
                 if num_heads is not None:
                     params, gradients, momentums, variances_neuron = (
@@ -191,6 +211,7 @@ class NorMuon(DistributedOrthoBase):
                         M=momentums,
                         V=variances_neuron,
                         shard_dim=shard_dim,
+                        **split_args,
                         **megabatch_args,
                     )
                 )
@@ -215,6 +236,8 @@ def normuon_update_megabatch_async(
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
     cautious_wd: bool = False,
+    split_sizes: Optional[Tuple[int, ...]] = None,
+    split_scales: Optional[Tuple[float, ...]] = None,
 ) -> Generator[None, None, None]:
     """
     Mega-batched NorMuon update: processes ALL same-shape parameters in one
@@ -246,8 +269,19 @@ def normuon_update_megabatch_async(
     else:
         global_comm_dim_size = None
 
-    # Orthogonalize via shared megabatch communication
-    U = yield from megabatch_orthogonalize_async(
+    # Orthogonalize via shared megabatch communication. With split_sizes, each
+    # row block is orthogonalized independently and rescaled by split_scales,
+    # which converts the whole-matrix adjusted_lr applied below into the
+    # per-block adjustment that separate parameters would receive. The scales
+    # commute through the normalization below: a uniform per-block scale
+    # propagates self-consistently into the variance buffer and the per-block
+    # Frobenius rescale, so the normalized update is scaled by the same factor.
+    # Request the stacked [N, *shape] result directly: the normalization below
+    # immediately re-stacks the orthogonalized update, so taking the list and
+    # re-stacking it would be an unbind-then-restack round-trip (N selects + a
+    # stacking copy per shape group). return_stacked hands back the tensor the
+    # megabatch already has assembled.
+    U_stacked = yield from megabatch_orthogonalize_async(
         U,
         comm_dim=comm_dim,
         device_rank=device_rank,
@@ -257,16 +291,32 @@ def normuon_update_megabatch_async(
         flatten=flatten,
         epsilon=epsilon,
         global_comm_dim_size=global_comm_dim_size,
+        split_sizes=split_sizes,
+        split_scales=split_scales,
+        return_stacked=True,
     )
 
-    # NorMuon normalization using stacked tensors for fewer kernel launches
+    # NorMuon normalization using stacked tensors for fewer kernel launches.
+    # With split_sizes, the Frobenius-norm-preserving rescale runs per row
+    # block, matching separate per-block parameters. On the sharded all-to-all
+    # path U holds local shards rather than full matrices, so normalization
+    # stays per-shard there (the existing distributed approximation); block
+    # boundaries are not locally available.
+    norm_split_sizes = (
+        split_sizes if (comm_dim is None or process_group is None) else None
+    )
     V_local = to_local(V)
-    U_stacked = torch.stack(U)
     V_stacked = torch.stack(V_local)
-    U_stacked, V_stacked = normuon_normalization_stacked(U_stacked, V_stacked, muon_beta2)
-    for i in range(N):
-        V_local[i].copy_(V_stacked[i])
-    U = [U_stacked[i] for i in range(N)]
+    U_stacked, V_stacked = normuon_normalization_stacked(
+        U_stacked, V_stacked, muon_beta2, split_sizes=norm_split_sizes
+    )
+    # Write the updated variance buffers back into the persistent per-param
+    # state in a single multi-tensor kernel instead of N separate copy_
+    # launches, and unbind U in one dispatch instead of N selects. Both are
+    # numerically identical to the per-element loops; this is purely a
+    # host-dispatch reduction (the V writeback alone was ~20% of step CPU time).
+    torch._foreach_copy_(V_local, V_stacked.unbind(0))
+    U = list(U_stacked.unbind(0))
 
     # Compute scaled learning rate
     if adjust_lr is None:
@@ -294,13 +344,36 @@ def normuon_normalization_stacked(
     U: Tensor,  # [N, rows, cols]
     V: Tensor,  # [N, rows, 1]  (variance neuron buffer)
     muon_beta2: Tensor,
+    split_sizes: Optional[Tuple[int, ...]] = None,
 ) -> Tuple[Tensor, Tensor]:
     """
     NorMuon normalization on stacked 3D tensors for minimal kernel launches.
     Equivalent to normuon_normalization but operates on a single stacked tensor
     instead of a list, reducing per-element kernel overhead.
+    With ``split_sizes``, each row block is normalized independently so the
+    Frobenius-norm-preserving rescale matches separate per-block parameters.
     Returns (normalized_U, updated_V).
     """
+    if split_sizes is not None:
+        results = [
+            _normuon_normalization_core(u, v, muon_beta2)
+            for u, v in zip(
+                U.split(list(split_sizes), dim=-2),
+                V.split(list(split_sizes), dim=-2),
+            )
+        ]
+        normalized_U = torch.cat([r[0] for r in results], dim=-2)
+        V = torch.cat([r[1] for r in results], dim=-2)
+        return normalized_U, V
+
+    return _normuon_normalization_core(U, V, muon_beta2)
+
+
+def _normuon_normalization_core(
+    U: Tensor,
+    V: Tensor,
+    muon_beta2: Tensor,
+) -> Tuple[Tensor, Tensor]:
     V_dtype = V.dtype
     U = U.to(dtype=V_dtype)
 

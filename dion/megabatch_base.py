@@ -212,6 +212,66 @@ class DistributedOrthoBase(Optimizer):
             )
         return num_heads
 
+    def _resolve_split_sizes(self, group: dict) -> Optional[Tuple[int, ...]]:
+        """Validate the ``split_sizes`` option on a param group.
+
+        ``split_sizes`` partitions dim 0 of a 2D weight into row blocks (e.g. a
+        fused QKV projection into its Q, K, and V blocks, which may have
+        unequal sizes under GQA). Newton-Schulz and the learning-rate
+        adjustment then run independently per block, matching the update that
+        separate per-block parameters would receive, while the parameter
+        itself stays fused for a single wide GEMM in the model.
+
+        Returns the validated sizes as a tuple, or ``None`` when the option is
+        unset. Raises ``ValueError`` for invalid values or incompatible
+        combinations. The sizes must sum to dim 0 of every parameter in the
+        group; that is checked at task-creation time when shapes are known.
+        """
+        split_sizes = group.get("split_sizes")
+        if split_sizes is None:
+            return None
+        if not isinstance(split_sizes, (tuple, list)) or len(split_sizes) < 2:
+            raise ValueError(
+                f"split_sizes must be a tuple or list of at least 2 block sizes, "
+                f"got {split_sizes!r}."
+            )
+        # bool is a subclass of int in Python; reject it explicitly.
+        if any(
+            isinstance(s, bool) or not isinstance(s, int) or s < 1
+            for s in split_sizes
+        ):
+            raise ValueError(
+                f"split_sizes entries must be positive integers, got {split_sizes!r}."
+            )
+        if self._resolve_num_heads(group) is not None:
+            raise ValueError(
+                "split_sizes is incompatible with num_heads > 1: use num_heads "
+                "for uniform per-head splits or split_sizes for uneven row "
+                "blocks, not both."
+            )
+        if group.get("flatten"):
+            raise ValueError(
+                "split_sizes is incompatible with flatten=True: split_sizes "
+                "applies to 2D parameters only."
+            )
+        return tuple(split_sizes)
+
+    def _validate_split_shape(
+        self, split_sizes: Tuple[int, ...], params: List[Tensor]
+    ) -> None:
+        """Check that ``split_sizes`` is consistent with a shape group's params."""
+        shape = params[0].shape
+        if len(shape) != 2:
+            raise ValueError(
+                f"split_sizes is only supported for 2D parameters, got shape "
+                f"{tuple(shape)}."
+            )
+        if sum(split_sizes) != shape[0]:
+            raise ValueError(
+                f"split_sizes {split_sizes} must sum to dim 0 of the parameter "
+                f"(got shape {tuple(shape)})."
+            )
+
     def _prepare_head_split(
         self,
         num_heads: int,
@@ -396,7 +456,10 @@ def megabatch_orthogonalize_async(
     flatten: bool,
     epsilon: Tensor,
     global_comm_dim_size: Optional[int],
-) -> Generator[None, None, List[Tensor]]:
+    split_sizes: Optional[Tuple[int, ...]] = None,
+    split_scales: Optional[Tuple[float, ...]] = None,
+    return_stacked: bool = False,
+) -> Generator[None, None, Union[List[Tensor], Tensor]]:
     """
     Shared megabatch communication + Newton-Schulz orthogonalization.
 
@@ -422,8 +485,26 @@ def megabatch_orthogonalize_async(
             (``param.shape[comm_dim]``). Used to compute
             ``padded_local_size = ceil(global / world_size)`` so the
             alltoall sees uniform per-pair sizes across ranks.
+        split_sizes: Optional row-block sizes for dim -2. Newton-Schulz runs
+            independently per block (on the fully assembled matrices), as if
+            each block were a separate parameter.
+        split_scales: Optional per-block rescaling applied after Newton-Schulz,
+            used to convert the caller's whole-matrix learning-rate adjustment
+            into the per-block adjustment.
+        return_stacked: If True, return the orthogonalized result as a single
+            stacked ``[N, *shape]`` tensor instead of a list of N tensors.
+            Callers that immediately re-stack the result (NorMuon, NorDion2 for
+            their normalization step) use this to skip an unbind-then-restack
+            round-trip. Default False preserves the list contract for callers
+            that consume per-parameter tensors directly (Muon, Dion2).
     """
     N = len(U)
+
+    def _finalize(flat: Tensor) -> Union[List[Tensor], Tensor]:
+        # flat: stacked ``[M, *shape]`` (M >= N) in the caller's parameter
+        # order. Return the first N either stacked or as a list of views.
+        flat = flat[:N]
+        return flat if return_stacked else list(flat.unbind(0))
 
     # Pad to divisible by world_size (needed by both distributed paths)
     if process_group is not None and (N > 1 or comm_dim is not None):
@@ -460,6 +541,19 @@ def megabatch_orthogonalize_async(
             )
         padded_local_size = (global_comm_dim_size + world_size - 1) // world_size
         original_local_size = U_work[0].size(comm_dim)
+        if (
+            split_sizes is not None
+            and comm_dim == -2
+            and padded_local_size * world_size != global_comm_dim_size
+        ):
+            # Shard padding would intersperse zero rows between rank segments
+            # of the assembled matrices, scrambling the row-block boundaries.
+            raise NotImplementedError(
+                f"split_sizes requires dim 0 of the parameter "
+                f"({global_comm_dim_size}) to be divisible by the sharding "
+                f"world_size ({world_size}) so the assembled matrices have no "
+                f"interspersed padding rows."
+            )
         if padded_local_size < original_local_size:
             raise RuntimeError(
                 f"padded_local_size ({padded_local_size}) < this rank's "
@@ -474,10 +568,13 @@ def megabatch_orthogonalize_async(
             pad_spec = [0, 0] * (-comm_dim - 1) + [0, padded_local_size - original_local_size]
             U_work = [torch.nn.functional.pad(u, pad_spec) for u in U_work]
 
-        input_chunks = [
-            torch.stack(U_work[r * per_rank : (r + 1) * per_rank])
-            for r in range(world_size)
-        ]
+        # Pack all per-rank segments with a single stack + view instead of
+        # world_size separate torch.stack calls (each dispatched per_rank
+        # aten::select). The unbind views are contiguous slices of the stacked
+        # buffer, so they are safe to hand to all_to_all.
+        input_chunks = list(
+            torch.stack(U_work).unflatten(0, (world_size, per_rank)).unbind(0)
+        )
 
         output_chunks = [torch.empty_like(c) for c in input_chunks]
         work = dist.all_to_all(
@@ -493,6 +590,8 @@ def megabatch_orthogonalize_async(
             newton_schulz_func=newton_schulz_func,
             flatten=flatten,
             epsilon=epsilon,
+            split_sizes=split_sizes,
+            split_scales=split_scales,
         )
 
         split_chunks = [
@@ -507,14 +606,19 @@ def megabatch_orthogonalize_async(
         yield
         work.wait()
 
-        # Narrow each per-rank result back to the rank's original local size.
-        # On padding-only ranks original_local_size == 0 and the slice is empty.
-        result = [
-            recv_chunks[r][i].narrow(comm_dim, 0, original_local_size).contiguous()
-            for r in range(world_size)
-            for i in range(per_rank)
-        ]
-        return result[:N]
+        # Narrow each per-rank result back to the rank's original local size and
+        # flatten the (rank, per_rank) axes in one shot, instead of a
+        # world_size x per_rank Python loop of select + narrow + contiguous.
+        # comm_dim is negative so it still indexes the matrix dim of the stacked
+        # tensor; flatten(0, 1) preserves the rank-major, per_rank-minor order of
+        # the original comprehension. On padding-only ranks original_local_size
+        # == 0 and the narrowed slices are empty.
+        recv_stacked = (
+            torch.stack(recv_chunks)
+            .narrow(comm_dim, 0, original_local_size)
+            .contiguous()
+        )
+        return _finalize(recv_stacked.flatten(0, 1))
 
     elif N > 1 and process_group is not None:
         # --- Mega-batched non-sharded path ---
@@ -525,6 +629,8 @@ def megabatch_orthogonalize_async(
             newton_schulz_func=newton_schulz_func,
             flatten=flatten,
             epsilon=epsilon,
+            split_sizes=split_sizes,
+            split_scales=split_scales,
         )
 
         all_chunks = [torch.empty_like(my_matrices) for _ in range(world_size)]
@@ -534,18 +640,19 @@ def megabatch_orthogonalize_async(
         yield
         work.wait()
 
-        result = [all_chunks[r][i] for r in range(world_size) for i in range(per_rank)]
-        return result[:N]
+        # Flatten (rank, per_rank) in one op instead of a nested select loop.
+        return _finalize(torch.stack(all_chunks).flatten(0, 1))
 
     elif N == 1:
-        return [
-            muon_update_newton_schulz(
-                U[0],
-                newton_schulz_func=newton_schulz_func,
-                flatten=flatten,
-                epsilon=epsilon,
-            )
-        ]
+        out = muon_update_newton_schulz(
+            U[0],
+            newton_schulz_func=newton_schulz_func,
+            flatten=flatten,
+            epsilon=epsilon,
+            split_sizes=split_sizes,
+            split_scales=split_scales,
+        )
+        return _finalize(out.unsqueeze(0))
 
     else:
         # N > 1, no process_group (single GPU or batch-sharded 3D)
@@ -555,8 +662,10 @@ def megabatch_orthogonalize_async(
             newton_schulz_func=newton_schulz_func,
             flatten=flatten,
             epsilon=epsilon,
+            split_sizes=split_sizes,
+            split_scales=split_scales,
         )
-        return [stacked[i] for i in range(N)]
+        return _finalize(stacked)
 
 
 def muon_update_newton_schulz(
@@ -564,10 +673,19 @@ def muon_update_newton_schulz(
     newton_schulz_func: Callable,
     flatten: bool,
     epsilon: Tensor,
+    split_sizes: Optional[Tuple[int, ...]] = None,
+    split_scales: Optional[Tuple[float, ...]] = None,
 ) -> Tensor:
     """
     Flatten the input tensor if needed and call the Newton-Schulz function.
+    With ``split_sizes``, orthogonalize row blocks of dim -2 independently.
     """
+    if split_sizes is not None:
+        assert not flatten, "split_sizes is incompatible with flatten=True"
+        return _newton_schulz_row_blocks(
+            X, split_sizes, split_scales, newton_schulz_func, epsilon
+        )
+
     original_shape = X.shape
     if flatten and X.ndim >= 3:
         X = X.flatten(start_dim=1)
@@ -575,6 +693,79 @@ def muon_update_newton_schulz(
         X = X.flatten(end_dim=-3)
 
     return newton_schulz_func(X, epsilon=epsilon).reshape(original_shape)
+
+
+def _newton_schulz_row_blocks(
+    X: Tensor,
+    split_sizes: Tuple[int, ...],
+    split_scales: Optional[Tuple[float, ...]],
+    newton_schulz_func: Callable,
+    epsilon: Tensor,
+) -> Tensor:
+    """
+    Orthogonalize row blocks of dim -2 independently, as if each block were a
+    separate parameter. Blocks of equal height are stacked into one batched
+    Newton-Schulz call (e.g. the K and V blocks of a fused QKV weight).
+
+    ``split_scales`` optionally rescales each orthogonalized block, used to
+    convert the caller's whole-matrix learning-rate adjustment into the
+    per-block adjustment that separate parameters would receive.
+    """
+    assert X.size(-2) == sum(split_sizes), (
+        f"dim -2 of input ({X.size(-2)}) does not match sum of split_sizes "
+        f"({split_sizes})"
+    )
+    blocks = list(X.split(list(split_sizes), dim=-2))
+
+    rows_to_idx = defaultdict(list)
+    for i, block in enumerate(blocks):
+        rows_to_idx[block.size(-2)].append(i)
+
+    out = [None] * len(blocks)
+    for idx in rows_to_idx.values():
+        stacked = torch.stack([blocks[i] for i in idx], dim=0)
+        # Newton-Schulz functions expect at most 3D input
+        batched = stacked.flatten(end_dim=-3) if stacked.ndim > 3 else stacked
+        ortho = newton_schulz_func(batched, epsilon=epsilon).reshape(stacked.shape)
+        for j, i in enumerate(idx):
+            block = ortho[j]
+            if split_scales is not None:
+                block = block * split_scales[i]
+            out[i] = block
+
+    return torch.cat(out, dim=-2)
+
+
+def compute_split_lr_scales(
+    split_sizes: Tuple[int, ...],
+    param_shape,
+    adjust_lr: Optional[str],
+) -> Optional[Tuple[float, ...]]:
+    """
+    Per-block learning-rate corrections for ``split_sizes`` row blocks.
+
+    The megabatch update functions compute a single adjusted learning rate
+    from the whole (fused) matrix shape. Each block of a split parameter
+    should instead see the adjustment its own shape would receive as a
+    separate parameter, so each block is rescaled by
+    ``adjust(block_shape) / adjust(full_shape)`` after Newton-Schulz.
+    Returns ``None`` when ``adjust_lr`` is None (no shape-dependent scaling).
+    """
+    if adjust_lr is None:
+        return None
+    elif adjust_lr == "spectral_norm":
+        adjust_fn = adjust_lr_spectral_norm
+    elif adjust_lr == "rms_norm":
+        adjust_fn = adjust_lr_rms_norm
+    else:
+        raise ValueError(f"Unknown adjust_lr value: {adjust_lr}")
+
+    num_cols = param_shape[-1]
+    full_adjust = adjust_fn(1.0, param_shape, flatten=False)
+    return tuple(
+        adjust_fn(1.0, (rows, num_cols), flatten=False) / full_adjust
+        for rows in split_sizes
+    )
 
 
 def adjust_lr_rms_norm(lr, param_shape, flatten):
