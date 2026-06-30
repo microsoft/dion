@@ -109,6 +109,141 @@ class TestMuon:
 
 
 # ---------------------------------------------------------------------------
+# Aurora
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA required")
+class TestAurora:
+    def test_basic(self):
+        from dion import Aurora
+        params = _make_params([(64, 128), (128, 64)])
+        _run_steps(Aurora, params, dict(lr=0.01))
+
+    def test_determinism(self):
+        from dion import Aurora
+        p1 = _make_params([(64, 128)])
+        r1 = _run_steps(Aurora, p1, dict(lr=0.01))
+        p2 = _make_params([(64, 128)])
+        r2 = _run_steps(Aurora, p2, dict(lr=0.01))
+        assert torch.equal(r1[0], r2[0])
+
+    def test_params_change(self):
+        from dion import Aurora
+        params = _make_params([(64, 128)])
+        before = params[0].data.clone()
+        _run_steps(Aurora, params, dict(lr=0.01), n_steps=1)
+        assert not torch.equal(params[0].data, before)
+
+    def test_nesterov(self):
+        from dion import Aurora
+        params = _make_params([(64, 128)])
+        _run_steps(Aurora, params, dict(lr=0.01, nesterov=True))
+
+    def test_cautious_wd(self):
+        from dion import Aurora
+        params = _make_params([(64, 128)])
+        _run_steps(Aurora, params, dict(lr=0.01, cautious_wd=True))
+
+    def test_pp_iterations(self):
+        from dion import Aurora
+        for pp_iterations in [1, 2, 3]:
+            params = _make_params([(64, 128)])
+            _run_steps(Aurora, params, dict(lr=0.01, pp_iterations=pp_iterations))
+
+    def test_megabatch_same_shape(self):
+        from dion import Aurora
+        params = _make_params([(64, 128)] * 5)
+        _run_steps(Aurora, params, dict(lr=0.01))
+
+    def test_mixed_shapes(self):
+        from dion import Aurora
+        params = _make_params([(64, 128), (128, 64), (32, 32)])
+        _run_steps(Aurora, params, dict(lr=0.01))
+
+    def test_invalid_pp_iterations(self):
+        from dion import Aurora
+        with pytest.raises(ValueError, match="pp_iterations"):
+            Aurora(_make_params([(32, 64)]), pp_iterations=0)
+        with pytest.raises(ValueError, match="pp_iterations"):
+            Aurora(_make_params([(32, 64)]), pp_iterations=-1)
+
+    def test_pp_iterations_mutation_takes_effect(self):
+        """Mutating ``pp_iterations`` on a param group at runtime must change
+        the update — the wrapper should be rebuilt each step (mirroring how
+        ``lr`` is re-read from the group)."""
+        from dion import Aurora
+        torch.manual_seed(0)
+        # Tall non-square so pp_iterations actually changes the answer.
+        params = [torch.nn.Parameter(torch.randn(128, 32, device=DEVICE))]
+        opt = Aurora(params, lr=0.01, pp_iterations=1)
+        params[0].grad = torch.randn_like(params[0])
+        opt.step()
+
+        opt.param_groups[0]["pp_iterations"] = 3
+        params[0].grad = torch.randn_like(params[0])
+        # Bad value should now raise from the mutated group state.
+        opt.param_groups[0]["pp_iterations"] = 0
+        with pytest.raises(ValueError, match="pp_iterations"):
+            opt.step()
+
+    def test_reference_runs(self):
+        """Single-file AuroraReference should run on tall/square/wide."""
+        from dion import AuroraReference
+        params = _make_params([(128, 64), (64, 64), (64, 128)])
+        _run_steps(AuroraReference, params, dict(lr=0.05))
+
+    def test_reference_matches_polar_reference_on_square(self):
+        """AuroraReference's polar should equal its bundled simple-quintic
+        polar on square inputs (the diag-preconditioning loop is bypassed)."""
+        from dion.aurora_reference import polar, aurora_polar
+        torch.manual_seed(0)
+        G = torch.randn(128, 128, device=DEVICE)
+        # max(1, m/n)**0.5 = 1 for square, so the aspect-ratio scaling is 1.
+        assert torch.equal(aurora_polar(G), polar(G))
+
+    def test_square_matches_muon_polar(self):
+        """For square matrices, Aurora's orthogonalization should equal the
+        underlying polar function bit-for-bit (the diagonal preconditioning
+        loop is bypassed when m == n)."""
+        from dion.aurora import make_aurora_polar
+        from dion.polar_express import polar_express
+
+        torch.manual_seed(0)
+        G = torch.randn(128, 128, device=DEVICE)
+        ap = make_aurora_polar(polar_express, pp_iterations=2, pp_beta=0.5)
+        u_std = polar_express(G, epsilon=1e-7)
+        u_aur = ap(G, epsilon=1e-7)
+        assert torch.equal(u_std, u_aur)
+
+    def test_row_norms_more_uniform_than_polar(self):
+        """The defining property of Aurora: row norms of the orthogonalized
+        update should be more uniform than standard polar on a non-square
+        matrix. Compares max/min row-norm ratio (target: 1.0)."""
+        from dion.aurora import make_aurora_polar
+        from dion.polar_express import polar_express
+
+        torch.manual_seed(0)
+        # Tall: rows >> cols
+        G = torch.randn(512, 128, device=DEVICE, dtype=torch.float32)
+        u_std = polar_express(G, epsilon=1e-7).to(torch.float32)
+        ap = make_aurora_polar(polar_express, pp_iterations=2, pp_beta=0.5)
+        u_aur = ap(G, epsilon=1e-7).to(torch.float32)
+
+        rn_std = u_std.norm(dim=-1)
+        rn_aur = u_aur.norm(dim=-1)
+        ratio_std = (rn_std.max() / rn_std.min()).item()
+        ratio_aur = (rn_aur.max() / rn_aur.min()).item()
+        # Aurora should noticeably tighten the ratio toward 1.
+        assert ratio_aur < ratio_std, (
+            f"Aurora row-norm ratio {ratio_aur:.3f} should be tighter than "
+            f"standard polar {ratio_std:.3f}"
+        )
+        assert ratio_aur < 1.15, (
+            f"Aurora row-norm ratio {ratio_aur:.3f} should be close to 1"
+        )
+
+
+# ---------------------------------------------------------------------------
 # NorMuon
 # ---------------------------------------------------------------------------
 
