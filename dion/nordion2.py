@@ -321,16 +321,17 @@ def nordion2_update_megabatch_async(
         return
 
     # --- Local selection (default): per-shard top-k, communicate only the
-    # selected rows. Uniform k from the global size (when evenly divisible) so
-    # the alltoall sizes match and the megabatch skips padding; otherwise fall
-    # back to full-shard padding (pre-existing behavior). See dion2.
-    if comm_dim is not None and global_dim_size % world_size == 0:
-        padded_local = global_dim_size // world_size
+    # selected rows. Uniform k = ceil(fraction * ceil(global / world_size)) is
+    # the per-rank selected count under FSDP2 contiguous chunking; the megabatch
+    # pads every shard to exactly k (short/empty shards zero-pad), so the
+    # alltoall stays uniform for uneven divisions too, with no special case. See
+    # dion2 for the full rationale.
+    if comm_dim is not None:
+        padded_local = (global_dim_size + world_size - 1) // world_size
         k = max(1, int(math.ceil(fraction * padded_local)))
-        global_comm_dim_size = k * world_size
     else:
         k = None
-        global_comm_dim_size = global_dim_size
+    global_comm_dim_size = global_dim_size
 
     # Update momentum and compute the inputs for orthogonalization
     # Dion2 pre-orthogonalizes differs from NorMuon by applying damping before updating momentum
@@ -354,6 +355,7 @@ def nordion2_update_megabatch_async(
         flatten=flatten,
         epsilon=epsilon,
         global_comm_dim_size=global_comm_dim_size,
+        local_comm_size=k,
     )
 
     # Update variance neuron buffer for the selected rows and normalize the

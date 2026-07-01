@@ -329,23 +329,22 @@ def dion2_update_megabatch_async(
         return
 
     # --- Local selection (default): per-shard top-k, communicate only the
-    # selected rows. On the row-sharded path, when the global comm dim divides
-    # evenly across ranks every rank holds exactly ``padded_local`` rows, so a
-    # uniform ``k = ceil(fraction * padded_local)`` is selectable on every rank
-    # and never exceeds the local size. We then tell the megabatch the global
-    # size is ``k * world_size``: it computes padded_local_size = k, sees
-    # U_selected already at that size, and skips padding entirely -- comm and
-    # Newton-Schulz both shrink by ``fraction``. When the dim does not divide
-    # evenly (uneven/empty shards, e.g. a tiny num_heads dim), fall back to the
-    # original full-shard padding so the alltoall sizes still match; this is the
-    # pre-existing behavior and stays numerically identical.
-    if comm_dim is not None and global_dim_size % world_size == 0:
-        padded_local = global_dim_size // world_size
+    # selected rows. Under FSDP2 contiguous chunking every rank holds at most
+    # ``padded_local = ceil(global / world_size)`` rows, so a uniform
+    # ``k = ceil(fraction * padded_local)`` is the per-rank selected count. We
+    # select up to ``k`` rows locally (short/empty shards select fewer -- see
+    # dion2_pre_orthogonalize) and tell the megabatch to pad every shard to
+    # exactly ``k`` via ``local_comm_size=k``, so the alltoall stays uniform
+    # while comm and Newton-Schulz both shrink by ``fraction``. This holds for
+    # uneven divisions too (the remainder/empty ranks just contribute zero-padded
+    # rows), so there is no even-division special case. ``global_comm_dim_size``
+    # keeps its true meaning (the unsharded size).
+    if comm_dim is not None:
+        padded_local = (global_dim_size + world_size - 1) // world_size
         k = max(1, int(math.ceil(fraction * padded_local)))
-        global_comm_dim_size = k * world_size
     else:
         k = None
-        global_comm_dim_size = global_dim_size
+    global_comm_dim_size = global_dim_size
 
     # Pre-orthogonalize: momentum update + submatrix selection
     U_selected, indices_list = dion2_pre_orthogonalize(
@@ -368,6 +367,7 @@ def dion2_update_megabatch_async(
         flatten=flatten,
         epsilon=epsilon,
         global_comm_dim_size=global_comm_dim_size,
+        local_comm_size=k,
     )
 
     # Compute scaled learning rate
@@ -444,8 +444,9 @@ def dion2_pre_orthogonalize(
     "local" path so every rank selects the same count, derived from the global
     size, instead of ``ceil(fraction * local_size)``). A rank whose local shard
     is shorter than ``k_override`` selects all of its rows; ``topk`` is clamped
-    to the available count and the result is zero-padded up to ``k_override`` so
-    the downstream alltoall sees a uniform per-rank size.
+    to the available count. The pad up to ``k_override`` is not done here -- the
+    downstream megabatch pads U to ``local_comm_size=k_override`` for a uniform
+    alltoall, and indices stay at the real selected count.
     """
     dtype = M[0].dtype
 
@@ -453,10 +454,20 @@ def dion2_pre_orthogonalize(
     # select_dim is the dimension we select submatrix from
     num_select = M[0].size(select_dim)
     norm_dim = -1 if select_dim == -2 else -2
+    # k is the requested selected count; k_topk is what topk can actually take
+    # from this shard (clamped to its real rows). When the shard is shorter than
+    # k_override -- possible on the last/remainder rank under uneven FSDP2
+    # chunking -- we select all its rows here. U_selected then carries only the
+    # real k_topk rows; the pad up to k happens downstream in
+    # megabatch_orthogonalize_async (local_comm_size=k) purely so the alltoall
+    # sees a uniform per-rank size. indices deliberately stay at k_topk: the
+    # megabatch narrows its result back to k_topk before it is scattered, so the
+    # padded rows never reach post_orthogonalize.
     if k_override is not None:
         k = k_override
     else:
         k = max(1, int(math.ceil(fraction * num_select)))
+    k_topk = min(k, num_select)
 
     # Update momentum: M = M + G
     G = [g.to(dtype=dtype) for g in G]
@@ -482,8 +493,9 @@ def dion2_pre_orthogonalize(
     # Compute L1 norm along norm_dim (sum of absolute values)
     slice_norms = M_stacked.norm(p=1, dim=norm_dim)
 
-    # Batched topk: indices shape (batch_size, k)
-    _, indices = torch.topk(slice_norms, k, dim=-1, sorted=False)
+    # Batched topk: indices shape (batch_size, k_topk). k_topk <= num_select is
+    # guaranteed, so this never raises even on a short remainder shard.
+    _, indices = torch.topk(slice_norms, k_topk, dim=-1, sorted=False)
 
     # Extract the selected rows/columns from each momentum tensor.
     # `indices` has shape (..., k) where k is the number of selected slices.
