@@ -51,10 +51,11 @@ class Dion2(DistributedOrthoBase):
             sharding-dependent approximation that converges slightly worse; opt
             in when comm-bound at large scale. "global_capped": global selection
             at local comm cost -- all-gather the row norms only (~KBs), compute
-            the global top-k everywhere, and send each rank's globally-selected
-            rows through the fixed ``k``-slot pipes; a rank owning more winners
-            than slots defers the overflow (error feedback re-selects them next
-            step), one owning fewer fills spare slots with its next-best rows.
+            the same global top-``k*world_size`` threshold everywhere, and send
+            each rank's globally-selected rows through the fixed ``k``-slot
+            pipes; a rank owning more winners than slots defers the overflow
+            (error feedback re-selects them on a later step), one owning fewer
+            sends zeros in the spare slots so only winners produce updates.
             No-op off the row-sharded path.
 
     Dion2 optimizer by Ahn et al.: TBD
@@ -248,11 +249,16 @@ def dion2_update_megabatch_async(
     - ``"global_capped"``: global selection at local comm cost. The slice L1
       norms are all-gathered (one fp32 per slice, ~KBs), every rank computes the
       same global top-``k*world_size`` threshold, and each rank sends its
-      globally-selected slices through the same fixed ``k``-slot pipes as
-      "local". Overflow winners (a rank owning more winners than slots) are
-      deferred -- error feedback keeps their momentum accumulating so they win a
-      slot on a later step; spare slots fill with the rank's next-best slices.
-      Near-global selection quality at "local" comm cost.
+      globally-selected slices ("winners") through the same fixed ``k``-slot
+      pipes as "local". Overflow winners (a rank owning more winners than slots)
+      are deferred -- they skip error-feedback decay, so their momentum keeps
+      accumulating and they win a slot on a later step. Spare slots travel as
+      zeros: non-winners are never applied and never decayed, which is what
+      distinguishes this scope from "local" (a per-rank top-``k`` fill would be
+      trajectory-identical to "local", since a rank's winners are always its
+      top-norm slices). Note the selection budget is top-``k*world_size``, not
+      top-``ceil(fraction*global)``: the two coincide when ``world_size``
+      divides the sharded dim and the budget is slightly larger otherwise.
 
     Off the row-sharded path (per-head, single-GPU, batch-sharded) each rank
     already holds whole matrices, so local and global selection coincide and
@@ -369,10 +375,11 @@ def dion2_update_megabatch_async(
         k = None
     global_comm_dim_size = global_dim_size
 
-    # "global_capped": accumulate momentum + all-gather the slice norms, then
-    # rank slices by the capacity priority (global winners first) instead of the
-    # local norms. Same fixed k-slot comm as "local" below.
-    priority = None
+    # "global_capped": accumulate momentum + all-gather the slice norms (one
+    # fp32 per slice, ~KBs), and hand the global top-(k*world_size) threshold to
+    # pre_orthogonalize, which applies the capacity rule (winners-only updates,
+    # zeros in spare slots). Same fixed k-slot comm as "local" below.
+    thresh = None
     if (
         selection_scope == "global_capped"
         and comm_dim is not None
@@ -381,8 +388,8 @@ def dion2_update_megabatch_async(
         norms = dion2_pre_accumulate_norms(
             G=to_local(G), M=to_local(M), select_dim=select_dim
         )
-        priority = yield from dion2_capped_priority_async(
-            norms, padded_local, k, device_rank, world_size, process_group
+        thresh = yield from dion2_capped_threshold_async(
+            norms, padded_local, k, world_size, process_group
         )
 
     # Pre-orthogonalize: momentum update + submatrix selection
@@ -393,7 +400,7 @@ def dion2_update_megabatch_async(
         ef_decay=ef_decay,
         select_dim=select_dim,
         k_override=k,
-        priority=priority,
+        thresh=thresh,
     )
 
     # Orthogonalize via shared megabatch communication
@@ -468,9 +475,11 @@ def dion2_pre_accumulate_norms(
     Phase A of the "global_capped" scope: update momentum with the gradient and
     return the stacked slice L1 norms ``[N, local_size]`` (fp32). The caller
     all-gathers these tiny norms across ranks (an eager collective that cannot
-    live inside this compiled graph) and feeds the resulting selection priority
-    back into ``dion2_pre_orthogonalize`` via ``priority`` -- which then must
-    NOT re-accumulate the gradient.
+    live inside this compiled graph) and feeds the resulting global threshold
+    back into ``dion2_pre_orthogonalize`` via ``thresh``. This function is the
+    single owner of momentum accumulation on the capped path: passing ``thresh``
+    tells ``dion2_pre_orthogonalize`` NOT to re-accumulate the gradient, so the
+    gathered norms always reflect the post-accumulation momentum.
     """
     dtype = M[0].dtype
     G = [g.to(dtype=dtype) for g in G]
@@ -481,38 +490,39 @@ def dion2_pre_accumulate_norms(
     return torch.stack(M, dim=0).norm(p=1, dim=norm_dim).float()
 
 
-def dion2_capped_priority_async(
+def dion2_capped_threshold_async(
     norms: Tensor,  # [N, local_size] fp32 from dion2_pre_accumulate_norms
     padded_local: int,
     k: int,
-    device_rank: int,
     world_size: int,
     process_group: Optional[ProcessGroup],
 ) -> Generator[None, None, Tensor]:
     """
-    "global_capped" selection priority: all-gather the slice L1 norms (one fp32
-    per slice -- ~KBs vs MBs for the rows), compute the exact global
-    top-``k*world_size`` threshold identically on every rank, and return a
-    priority tensor ``[N, local_size]`` such that a plain local
-    ``topk(priority, k)`` implements the capacity rule:
-
-      - slices at or above the global threshold ("winners") outrank ALL
-        non-winners (a per-matrix offset larger than any norm), so a rank sends
-        as many of its winners as fit in its ``k`` slots -- overflow winners are
-        deferred, and since only *selected* slices get error-feedback decay,
-        their momentum keeps accumulating and they win a slot on a later step;
-      - spare slots fill with the rank's next-best non-winners (ordinary norm
-        order), harmless extra orthogonalization exactly like "local" scope.
+    "global_capped" selection threshold: all-gather the slice L1 norms (one fp32
+    per slice -- ~KBs vs MBs for the rows) and return the per-matrix global
+    top-``k*world_size`` threshold ``[N, 1]``, computed identically on every
+    rank. ``dion2_pre_orthogonalize`` compares its local norms against this
+    value to apply the capacity rule (winners-only updates -- see its
+    docstring).
 
     Rank consistency is by construction: every rank computes the threshold from
-    the same gathered tensor. Async generator in the megabatch style: yields at
-    the collective, returns the priority.
+    the same bit-identical gathered tensor, and the threshold is a *value* (the
+    ``k_total``-th largest norm), so it does not depend on ``topk`` tie-breaking
+    order. Async generator in the megabatch style: yields at the collective,
+    returns the threshold.
     """
     N, local_size = norms.shape
     # Pad short/empty shards to the rank-uniform padded_local. L1 norms are
     # nonnegative, so -1 padding can never enter the winner set unless
     # k*world_size exceeds the real row count (tiny-matrix degenerate case,
     # where "everything is a winner" is the correct answer anyway).
+    if local_size > padded_local:
+        # F.pad with a negative amount would silently TRIM norms; fail loudly
+        # instead (mirrors the analogous guard in megabatch_orthogonalize_async).
+        raise ValueError(
+            f"Local norm count {local_size} exceeds padded size {padded_local}. "
+            "This should not happen with FSDP2 contiguous sharding."
+        )
     if local_size < padded_local:
         norms_pad = torch.nn.functional.pad(
             norms, (0, padded_local - local_size), value=-1.0
@@ -535,12 +545,7 @@ def dion2_capped_priority_async(
     vals, _ = torch.topk(
         all_norms.permute(1, 0, 2).reshape(N, -1), k_total, dim=-1
     )
-    thresh = vals[:, -1:]
-    own = norms  # this rank's real slices (unpadded view)
-    winner = own >= thresh
-    # Offset strictly larger than any norm: winners always outrank non-winners.
-    offset = vals[:, :1] + 1.0
-    return own + winner.to(own.dtype) * offset
+    return vals[:, -1:]
 
 
 @_inductor_workaround
@@ -552,7 +557,7 @@ def dion2_pre_orthogonalize(
     ef_decay: Tensor,
     select_dim: int,
     k_override: Optional[int] = None,
-    priority: Optional[Tensor] = None,
+    thresh: Optional[Tensor] = None,
 ) -> Tuple[List[Tensor], List[Tensor]]:
     """
     Update momentum with gradient and compute the input to orthogonalization.
@@ -573,12 +578,21 @@ def dion2_pre_orthogonalize(
     downstream megabatch pads U to ``local_comm_size=k_override`` for a uniform
     alltoall, and indices stay at the real selected count.
 
-    ``priority`` (the "global_capped" scope) replaces the locally-computed L1
-    norms as the top-k ranking key ``[N, local_size]``. Passing it also means
-    the momentum was ALREADY accumulated by ``dion2_pre_accumulate_norms`` (the
-    priority derives from post-accumulation norms), so the ``M += G`` here is
-    skipped. Everything downstream (gather, EF on selected, bf16 convert) is
-    identical.
+    ``thresh`` (the "global_capped" scope) is the per-matrix global
+    top-``k*world_size`` norm threshold ``[N, 1]`` from
+    ``dion2_capped_threshold_async``. Passing it means the momentum was ALREADY
+    accumulated by ``dion2_pre_accumulate_norms`` (the single accumulation
+    owner on the capped path -- the gathered norms must reflect the
+    post-accumulation momentum), so the ``M += G`` here is skipped. The top-k
+    gather itself is unchanged: a rank's winners (slices at/above ``thresh``)
+    are by construction its top-norm slices, so they already lead the plain
+    norm-order selection. What changes is what happens to the non-winner
+    "filler" slices occupying spare slots: they are masked to zero in the
+    communicated ``U_selected`` (zero slices pass through Newton-Schulz as
+    exact zeros, so they produce no weight update) and they skip error-feedback
+    decay, letting their momentum accumulate until they cross the global
+    threshold on a later step. Without this masking, capped selection would be
+    trajectory-identical to "local" scope.
     """
     dtype = M[0].dtype
 
@@ -601,10 +615,10 @@ def dion2_pre_orthogonalize(
         k = max(1, int(math.ceil(fraction * num_select)))
     k_topk = min(k, num_select)
 
-    # Update momentum: M = M + G. Skipped when `priority` is given ("global_
-    # capped"): dion2_pre_accumulate_norms already accumulated so the gathered
-    # norms reflect the post-accumulation momentum.
-    if priority is None:
+    # Update momentum: M = M + G. Skipped when `thresh` is given ("global_
+    # capped"): dion2_pre_accumulate_norms is the single accumulation owner on
+    # that path, so the gathered norms reflect the post-accumulation momentum.
+    if thresh is None:
         G = [g.to(dtype=dtype) for g in G]
         torch._foreach_add_(M, G)
 
@@ -624,13 +638,7 @@ def dion2_pre_orthogonalize(
         return U_selected, indices_list
 
     M_stacked = torch.stack(M, dim=0)
-
-    # Top-k ranking key: the capped-scope priority when given (winners outrank
-    # all non-winners), otherwise the local L1 norms along norm_dim.
-    if priority is not None:
-        slice_norms = priority
-    else:
-        slice_norms = M_stacked.norm(p=1, dim=norm_dim)
+    slice_norms = M_stacked.norm(p=1, dim=norm_dim)
 
     # Batched topk: indices shape (batch_size, k_topk). k_topk <= num_select is
     # guaranteed, so this never raises even on a short remainder shard.
@@ -653,20 +661,40 @@ def dion2_pre_orthogonalize(
         )
         selected_stacked = torch.gather(M_stacked, dim=-1, index=indices_expanded)
 
-    # Apply error feedback decay to selected slices in the original M tensors.
-    # We reuse the already-gathered slices and write them back (scaled) using
-    # scatter_, which places values into positions specified by the index tensor.
+    # "global_capped" capacity rule: only slices at/above the global threshold
+    # ("winners") are applied. Winners lead the norm-order selection above by
+    # construction, so `indices` needs no change; non-winner "fillers" in spare
+    # slots are masked to zero for communication (zero slices pass through
+    # Newton-Schulz as exact zeros -> no weight update) and keep their momentum
+    # un-decayed so it accumulates until they win. `>=` marks hard ties at the
+    # threshold as winners, which can inflate the winner set past k*world_size
+    # -- measure-zero for continuous fp32 norms and bounded by the per-rank k
+    # cap, so benign.
+    if thresh is not None:
+        sel_norms = torch.gather(slice_norms, dim=-1, index=indices)  # [N, k_topk]
+        winner = sel_norms >= thresh
+        winner_exp = winner.unsqueeze(-1) if select_dim == -2 else winner.unsqueeze(-2)
+        ef_factor = torch.where(winner_exp, ef_decay, torch.ones_like(ef_decay))
+        U_stacked = selected_stacked * winner_exp.to(selected_stacked.dtype)
+    else:
+        ef_factor = ef_decay
+        U_stacked = selected_stacked
+
+    # Apply error feedback decay to selected slices in the original M tensors
+    # (capped scope: winners only). We reuse the already-gathered slices and
+    # write them back (scaled) using scatter_, which places values into
+    # positions specified by the index tensor.
     indices_list = list(indices.unbind(dim=0))
-    selected_list = list(selected_stacked.unbind(dim=0))
-    for m, idx, selected in zip(M, indices_list, selected_list):
+    ef_src_list = list((selected_stacked * ef_factor).unbind(dim=0))
+    for m, idx, ef_src in zip(M, indices_list, ef_src_list):
         if select_dim == -2:
             idx_exp = idx.unsqueeze(-1).expand(*idx.shape, m.size(-1))
         else:
             idx_exp = idx.unsqueeze(-2).expand(*idx.shape[:-1], m.size(-2), idx.shape[-1])
-        m.scatter_(dim=select_dim, index=idx_exp, src=selected * ef_decay)
+        m.scatter_(dim=select_dim, index=idx_exp, src=ef_src)
 
     # Convert to bf16 and unstack for communication
-    U_selected = list(selected_stacked.to(dtype=torch.bfloat16).unbind(dim=0))
+    U_selected = list(U_stacked.to(dtype=torch.bfloat16).unbind(dim=0))
 
     return U_selected, indices_list
 

@@ -32,7 +32,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.distributed.tensor import DeviceMesh, distribute_tensor, Shard
 
-from dion.dion2 import Dion2
+from dion.dion2 import Dion2, dion2_capped_threshold_async
 from dion.nordion2 import NorDion2
 from dion.polar_express import polar_express
 
@@ -241,3 +241,200 @@ def test_fraction_one_local_equals_global(OptCls, kw, tmp_path):
     dl = _run_sharded(OptCls, "local", 1.0, kw, 2, 29630, tmp_path)
     dg = _run_sharded(OptCls, "global", 1.0, kw, 2, 29640, tmp_path)
     torch.testing.assert_close(dl["W"], dg["W"], rtol=BF16_RTOL, atol=BF16_ATOL)
+
+
+# ---- selection_scope="global_capped" ----
+#
+# The capacity rule: all-gather slice norms only, every rank derives the same
+# global top-(k*world_size) threshold, and only slices at/above it ("winners")
+# are applied -- spare slots travel as zeros and non-winners skip error-feedback
+# decay so their momentum accumulates until they win. NOTE the budget is
+# top-(k*world_size), NOT top-(ceil(fraction*global)); they coincide when
+# world_size divides the sharded dim (test below) and the capped budget is
+# slightly larger otherwise (empty-shard test below exploits this: with
+# k*world >= real rows, everything wins and capped(f) == global(1.0)).
+
+
+def _capped_worker(rank, world_size, port, OptCls, scope, kw, out_path, shape,
+                   fraction, boost, steps):
+    """Multi-step worker with a crafted gradient: small noise everywhere, plus
+    rows in ``boost`` set to a constant so their momentum L1 norm is exactly the
+    boost magnitude. Steps after the first use a zero gradient (isolates the
+    error-feedback dynamics). Saves the full W after every step."""
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    dev = torch.device(f"cuda:{rank}")
+    mesh = DeviceMesh("cuda", list(range(world_size)))
+
+    rows, cols = shape
+    g = torch.Generator(device=dev).manual_seed(1234)
+    W0 = torch.randn(rows, cols, generator=g, device=dev)
+    G = torch.randn(rows, cols, generator=g, device=dev) * 0.01
+    for r, mag in boost.items():
+        G[r] = mag / cols  # exact row L1 norm == mag
+
+    p = torch.nn.Parameter(distribute_tensor(W0, mesh, [Shard(0)]))
+    opt = OptCls(
+        [dict(params=[p])],
+        distributed_mesh=mesh,
+        lr=0.1,
+        fraction=fraction,
+        newton_schulz_func=_ns,
+        selection_scope=scope,
+        **kw,
+    )
+    Ws = []
+    for s in range(steps):
+        grad = G if s == 0 else torch.zeros_like(G)
+        p.grad = distribute_tensor(grad, mesh, [Shard(0)])
+        opt.step()
+        Ws.append(p.detach().full_tensor().cpu())
+    if rank == 0:
+        torch.save({"W0": W0.cpu(), "G": G.cpu(), "Ws": Ws}, out_path)
+    dist.destroy_process_group()
+
+
+def _run_capped(OptCls, scope, kw, port, tmp, *, shape=(16, 32), fraction=0.25,
+                boost=None, steps=1):
+    out = str(tmp / f"out_{port}.pt")
+    mp.spawn(
+        _capped_worker,
+        args=(2, port, OptCls, scope, kw, out, shape, fraction, boost or {}, steps),
+        nprocs=2,
+        join=True,
+    )
+    return torch.load(out)
+
+
+def _changed_rows(W_after, W_before):
+    """Row indices where anything changed at all (bitwise)."""
+    return set((W_after != W_before).any(dim=-1).nonzero().flatten().tolist())
+
+
+@pytest.mark.skipif(CUDA < 2, reason="needs 2 GPUs")
+@pytest.mark.parametrize("OptCls,kw", [
+    (Dion2, {}),
+    (NorDion2, {"mu": 0.95, "muon_beta2": 0.95}),
+])
+def test_capped_scope_matches_global_when_winners_fit(OptCls, kw, tmp_path):
+    """When every rank owns at most k winners and world_size divides the rows
+    (so the top-(k*world) budget equals global's top-ceil(fraction*global)),
+    capped must equal global-scope exactly. 16 rows / 2 ranks / fraction 0.25:
+    k=2, budget 4; the 4 boosted rows are split 2 per rank."""
+    boost = {0: 3.0, 1: 2.9, 8: 2.8, 9: 2.7}
+    dc = _run_capped(OptCls, "global_capped", kw, 29680, tmp_path, boost=boost)
+    dg = _run_capped(OptCls, "global", kw, 29681, tmp_path, boost=boost)
+    torch.testing.assert_close(dc["Ws"][0], dg["Ws"][0],
+                               rtol=BF16_RTOL, atol=BF16_ATOL)
+
+
+@pytest.mark.skipif(CUDA < 2, reason="needs 2 GPUs")
+@pytest.mark.parametrize("OptCls,kw", [
+    (Dion2, {"ef_decay": 0.5, "weight_decay": 0.0}),
+    (NorDion2, {"mu": 0.5, "muon_beta2": 0.95, "weight_decay": 0.0}),
+])
+def test_capped_scope_defers_overflow_winners(OptCls, kw, tmp_path):
+    """All 4 global winners live on rank 0 but it only has k=2 slots: step 1
+    applies exactly its top-2 {0,1} (rows 2,3 deferred WITHOUT error-feedback
+    decay; rank 1's spare slots carry zeros, so NO row of rank 1 changes --
+    this is what distinguishes capped from local, which would fill and apply
+    rank 1's top-2). Step 2 (zero grad): rows 0,1 decayed to 1.5/1.45 while the
+    deferred 2,3 kept 2.8/2.7, so exactly {2,3} are applied. weight_decay=0
+    makes non-applied rows bitwise unchanged."""
+    boost = {0: 3.0, 1: 2.9, 2: 2.8, 3: 2.7}
+    d = _run_capped(OptCls, "global_capped", kw, 29682, tmp_path,
+                    boost=boost, steps=2)
+    assert _changed_rows(d["Ws"][0], d["W0"]) == {0, 1}
+    assert _changed_rows(d["Ws"][1], d["Ws"][0]) == {2, 3}
+
+
+@pytest.mark.skipif(CUDA < 4, reason="needs 4 GPUs")
+@pytest.mark.parametrize("OptCls,kw", [
+    (Dion2, {}),
+    (NorDion2, {"mu": 0.95, "muon_beta2": 0.95}),
+])
+def test_capped_scope_uneven_shards_fraction_one_equals_global(OptCls, kw, tmp_path):
+    """Uneven division (17 rows over 4 ranks -> [5,5,5,2] + one short shard):
+    at fraction=1.0 the threshold is the -1 pad value, everything wins, and
+    capped must equal global (both apply all 17 rows; the megabatch zero-pads
+    the short shard's spare slots)."""
+    dc = _run_sharded(OptCls, "global_capped", 1.0, kw, 4, 29683, tmp_path,
+                      shape=(17, 32))
+    dg = _run_sharded(OptCls, "global", 1.0, kw, 4, 29684, tmp_path,
+                      shape=(17, 32))
+    torch.testing.assert_close(dc["W"], dg["W"], rtol=BF16_RTOL, atol=BF16_ATOL)
+
+
+@pytest.mark.skipif(CUDA < 4, reason="needs 4 GPUs")
+def test_capped_scope_uneven_shards_runs(tmp_path):
+    """Partial-fraction sanity on uneven shards: finite and actually updates."""
+    d = _run_sharded(Dion2, "global_capped", 0.35, {}, 4, 29685, tmp_path,
+                     shape=(17, 32))
+    assert torch.isfinite(d["W"]).all()
+    assert not torch.allclose(d["W"], d["W0"], atol=1e-6)
+
+
+@pytest.mark.skipif(CUDA < 4, reason="needs 4 GPUs")
+def test_capped_scope_empty_shard(tmp_path):
+    """3 rows over 4 ranks chunk to [1,1,1,0]: rank 3's shard is empty. The
+    capped budget k*world = 4 exceeds the 3 real rows, so the threshold is the
+    -1 pad value and every real row wins -- which also makes capped(0.5) equal
+    global(1.0), a live demonstration of the top-(k*world) vs
+    top-(ceil(fraction*global)) budget distinction."""
+    dc = _run_sharded(Dion2, "global_capped", 0.5, {}, 4, 29686, tmp_path,
+                      shape=(3, 32))
+    assert torch.isfinite(dc["W"]).all()
+    dg = _run_sharded(Dion2, "global", 1.0, {}, 4, 29687, tmp_path,
+                      shape=(3, 32))
+    torch.testing.assert_close(dc["W"], dg["W"], rtol=BF16_RTOL, atol=BF16_ATOL)
+
+
+def _thresh_consistency_worker(rank, world_size, port):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    dev = torch.device(f"cuda:{rank}")
+
+    # Distinct norms everywhere (no ties), different on each rank; one short
+    # shard (rank 1 has 3 of padded_local=4 slices) to exercise the -1 pad.
+    N, padded_local, k = 2, 4, 2
+    local = padded_local - rank  # rank0: 4, rank1: 3
+    norms = (torch.arange(N * local, dtype=torch.float32, device=dev)
+             .reshape(N, local) * 1.7 + 3.0 + rank * 0.37)
+
+    gen = dion2_capped_threshold_async(norms, padded_local, k, world_size, None)
+    next(gen)
+    try:
+        next(gen)
+        raise AssertionError("generator should be exhausted after the collective")
+    except StopIteration as e:
+        thresh = e.value
+
+    assert thresh.shape == (N, 1)
+    # (f) rank consistency: every rank must hold the bit-identical threshold.
+    both = [torch.empty_like(thresh) for _ in range(world_size)]
+    dist.all_gather(both, thresh.contiguous())  # thresh is a topk slice view
+    assert torch.equal(both[0], both[1])
+    # With distinct norms and k_total <= real slices, exactly k*world_size
+    # slices per matrix sit at/above the threshold globally.
+    winners = (norms >= thresh).sum()
+    dist.all_reduce(winners)
+    assert winners.item() == N * k * world_size
+    dist.destroy_process_group()
+
+
+@pytest.mark.skipif(CUDA < 2, reason="needs 2 GPUs")
+def test_capped_threshold_rank_consistent():
+    mp.spawn(_thresh_consistency_worker, args=(2, 29688), nprocs=2, join=True)
+
+
+def test_capped_threshold_negative_pad_raises():
+    """local_size > padded_local would make F.pad silently TRIM the norms; the
+    guard must raise instead. (Raise happens before the collective, so no
+    process group is needed.) Pure-CPU unit test."""
+    gen = dion2_capped_threshold_async(torch.zeros(1, 5), 3, 1, 2, None)
+    with pytest.raises(ValueError, match="exceeds padded size"):
+        next(gen)

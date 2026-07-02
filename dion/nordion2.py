@@ -19,7 +19,7 @@ from .dion2 import (
     dion2_post_orthogonalize,
     dion2_pre_accumulate,
     dion2_pre_accumulate_norms,
-    dion2_capped_priority_async,
+    dion2_capped_threshold_async,
     _make_select_and_orthogonalize,
 )
 from .normuon import normuon_normalization_stacked, _normuon_normalization_core
@@ -57,9 +57,10 @@ class NorDion2(DistributedOrthoBase):
             assembled whole matrix -- layout-invariant/reproducible and better-
             converging. "local": per-shard top-k (union) -- cheaper comm but a
             sharding-dependent approximation that converges slightly worse; opt
-            in when comm-bound at large scale. "global_capped": global selection
-            at local comm cost via a norms-only all-gather; overflow winners are
-            deferred through error feedback (see Dion2). No-op off the
+            in when comm-bound at large scale. "global_capped": global
+            top-``k*world_size`` selection at local comm cost via a norms-only
+            all-gather; winners-only updates (spare slots carry zeros), overflow
+            winners deferred through error feedback (see Dion2). No-op off the
             row-sharded path.
 
     NorDion2 optimizer applying Dion2 update to NorMuon
@@ -346,8 +347,12 @@ def nordion2_update_megabatch_async(
         k = None
     global_comm_dim_size = global_dim_size
 
-    # "global_capped": norms-only all-gather + capacity priority; see dion2.
-    priority = None
+    # "global_capped": norms-only all-gather + global threshold; winners-only
+    # updates, zeros in spare slots -- see dion2. (Filler slices come back from
+    # Newton-Schulz as exact zeros, so they get no weight update; their variance
+    # buffer rows still decay by muon_beta2 this step, a benign side effect that
+    # recovers once the row wins a slot.)
+    thresh = None
     if (
         selection_scope == "global_capped"
         and comm_dim is not None
@@ -356,8 +361,8 @@ def nordion2_update_megabatch_async(
         norms = dion2_pre_accumulate_norms(
             G=to_local(G), M=to_local(M), select_dim=select_dim
         )
-        priority = yield from dion2_capped_priority_async(
-            norms, padded_local, k, device_rank, world_size, process_group
+        thresh = yield from dion2_capped_threshold_async(
+            norms, padded_local, k, world_size, process_group
         )
 
     # Update momentum and compute the inputs for orthogonalization
@@ -369,7 +374,7 @@ def nordion2_update_megabatch_async(
         ef_decay=momentum,
         select_dim=select_dim,
         k_override=k,
-        priority=priority,
+        thresh=thresh,
     )
 
     # Orthogonalize via shared megabatch communication
