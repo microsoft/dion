@@ -1,4 +1,6 @@
 import math
+import os
+import time
 import torch
 import torch.distributed as dist
 from collections import defaultdict
@@ -446,6 +448,74 @@ class DistributedOrthoBase(Optimizer):
             )
 
 
+def _maybe_wrap_nan_capture(
+    newton_schulz_func: Callable, device_rank: int
+) -> Callable:
+    """Optionally wrap ``newton_schulz_func`` to dump non-finite outputs to disk.
+
+    Enabled by env var ``DION_NAN_CAPTURE in {"1","true"}``. Each rank that
+    sees a non-finite Newton-Schulz output writes its own
+    ``dion_nan_capture_rank{rank}_shape{...}_pid{...}_{ts_ms}.pt`` to
+    ``DION_NAN_CAPTURE_DIR`` (default ``./dion_nan_captures``), then raises
+    ``RuntimeError`` unless ``DION_NAN_CAPTURE_RAISE in {"0","false"}``.
+
+    The check is local to each rank: there is no extra collective. When the
+    guard is disabled, cost is one ``os.environ`` lookup per megabatch ortho
+    call.
+
+    Intended as a debug capture for issues like microsoft/dion#76, where a
+    Newton-Schulz backend (gram-newton-schulz / quack-kernels) intermittently
+    produces NaNs only on certain hardware/shapes. Capturing the actual input
+    that triggered the failure is the prerequisite for offline reproduction.
+    """
+    if os.environ.get("DION_NAN_CAPTURE", "").lower() not in ("1", "true"):
+        return newton_schulz_func
+
+    dump_dir = os.environ.get("DION_NAN_CAPTURE_DIR", "./dion_nan_captures")
+    raise_on_detect = os.environ.get(
+        "DION_NAN_CAPTURE_RAISE", "1"
+    ).lower() not in ("0", "false")
+    os.makedirs(dump_dir, exist_ok=True)
+
+    def _guarded(X: Tensor, epsilon: Optional[Tensor] = None) -> Tensor:
+        # Snapshot the input before NS runs so we have the offending tensor
+        # even if the kernel mutates X in-place or only the output goes NaN.
+        X_snapshot = X.detach().clone()
+        Y = newton_schulz_func(X, epsilon=epsilon)
+        if not torch.isfinite(Y).all():
+            shape = "x".join(str(s) for s in X_snapshot.shape)
+            ts_ms = int(time.time() * 1000)
+            path = os.path.join(
+                dump_dir,
+                f"dion_nan_capture_rank{device_rank}_shape{shape}"
+                f"_pid{os.getpid()}_{ts_ms}.pt",
+            )
+            payload = {
+                "input": X_snapshot.cpu(),
+                "output": Y.detach().cpu(),
+                "rank": device_rank,
+                "shape": tuple(X_snapshot.shape),
+                "dtype": str(X_snapshot.dtype),
+                "epsilon": (
+                    float(epsilon.item())
+                    if isinstance(epsilon, Tensor)
+                    else (float(epsilon) if epsilon is not None else None)
+                ),
+            }
+            torch.save(payload, path)
+            msg = (
+                f"[dion NaN capture] non-finite Newton-Schulz output on rank "
+                f"{device_rank}, shape {tuple(X_snapshot.shape)}; dumped to "
+                f"{path}"
+            )
+            if raise_on_detect:
+                raise RuntimeError(msg)
+            print(msg, flush=True)
+        return Y
+
+    return _guarded
+
+
 def megabatch_orthogonalize_async(
     U: List[Tensor],
     comm_dim: Optional[int],
@@ -507,6 +577,10 @@ def megabatch_orthogonalize_async(
             uniform while comm and Newton-Schulz shrink by ``fraction``.
             ``global_comm_dim_size`` still carries the true unsharded size.
     """
+    # Optionally swap newton_schulz_func with a wrapper that dumps non-finite
+    # outputs to disk (env-gated; no-op by default, no extra collectives).
+    newton_schulz_func = _maybe_wrap_nan_capture(newton_schulz_func, device_rank)
+
     N = len(U)
 
     def _finalize(flat: Tensor) -> Union[List[Tensor], Tensor]:
