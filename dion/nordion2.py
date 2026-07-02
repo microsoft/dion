@@ -18,6 +18,8 @@ from .dion2 import (
     dion2_pre_orthogonalize,
     dion2_post_orthogonalize,
     dion2_pre_accumulate,
+    dion2_pre_accumulate_norms,
+    dion2_capped_priority_async,
     _make_select_and_orthogonalize,
 )
 from .normuon import normuon_normalization_stacked, _normuon_normalization_core
@@ -55,7 +57,10 @@ class NorDion2(DistributedOrthoBase):
             assembled whole matrix -- layout-invariant/reproducible and better-
             converging. "local": per-shard top-k (union) -- cheaper comm but a
             sharding-dependent approximation that converges slightly worse; opt
-            in when comm-bound at large scale. No-op off the row-sharded path.
+            in when comm-bound at large scale. "global_capped": global selection
+            at local comm cost via a norms-only all-gather; overflow winners are
+            deferred through error feedback (see Dion2). No-op off the
+            row-sharded path.
 
     NorDion2 optimizer applying Dion2 update to NorMuon
     """
@@ -85,9 +90,10 @@ class NorDion2(DistributedOrthoBase):
             raise ValueError(f"Invalid learning rate: {lr}")
         if not (0.0 < fraction <= 1.0):
             raise ValueError(f"fraction must be in (0, 1], got {fraction}")
-        if selection_scope not in ("local", "global"):
+        if selection_scope not in ("local", "global", "global_capped"):
             raise ValueError(
-                f"selection_scope must be 'local' or 'global', got {selection_scope!r}"
+                f"selection_scope must be 'local', 'global', or 'global_capped', "
+                f"got {selection_scope!r}"
             )
         if mu < 0.0:
             raise ValueError(f"Invalid momentum factor (mu): {mu}")
@@ -340,6 +346,20 @@ def nordion2_update_megabatch_async(
         k = None
     global_comm_dim_size = global_dim_size
 
+    # "global_capped": norms-only all-gather + capacity priority; see dion2.
+    priority = None
+    if (
+        selection_scope == "global_capped"
+        and comm_dim is not None
+        and process_group is not None
+    ):
+        norms = dion2_pre_accumulate_norms(
+            G=to_local(G), M=to_local(M), select_dim=select_dim
+        )
+        priority = yield from dion2_capped_priority_async(
+            norms, padded_local, k, device_rank, world_size, process_group
+        )
+
     # Update momentum and compute the inputs for orthogonalization
     # Dion2 pre-orthogonalizes differs from NorMuon by applying damping before updating momentum
     U_selected, indices_list = dion2_pre_orthogonalize(
@@ -349,6 +369,7 @@ def nordion2_update_megabatch_async(
         ef_decay=momentum,
         select_dim=select_dim,
         k_override=k,
+        priority=priority,
     )
 
     # Orthogonalize via shared megabatch communication
