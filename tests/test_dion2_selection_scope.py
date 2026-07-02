@@ -49,14 +49,6 @@ def _ns(x, epsilon=1e-7):
     return polar_express(x, epsilon=epsilon)
 
 
-def _force_full_pad(comm_dim, global_dim_size, world_size, fraction):
-    """Stand-in for ``_local_selection_comm_size`` that forces the pre-fix
-    full-shard-pad path: no uniform per-rank k budget, so each rank selects
-    ``ceil(fraction * local_size)`` rows and the megabatch pads them back to the
-    full shard before the all-to-all (the old behavior)."""
-    return None, global_dim_size
-
-
 # ---- single-process reference: one optimizer step on the whole matrix ----
 def _reference_step(OptCls, W0, G, *, fraction, scope, **kw):
     """Run one step on an unsharded (single-GPU) param. With no process_group,
@@ -87,12 +79,20 @@ def _worker(rank, world_size, port, OptCls, scope, fraction, kw, out_path, force
     mesh = DeviceMesh("cuda", list(range(world_size)))
 
     if force_pad:
-        # Route the "local" scope through the old full-shard-pad path in both
-        # optimizers (the function is imported by name into each module).
+        # Force the pre-fix full-shard-pad path: wrap megabatch_orthogonalize_async
+        # so local_comm_size is dropped (None). The local scope still selects its
+        # k rows, but the megabatch then pads each shard back to the full
+        # ceil(global/world_size) size before the all-to-all -- the old behavior
+        # whose padded zero rows this PR eliminates. Patch both modules' bound
+        # name (each imports megabatch_orthogonalize_async into its namespace).
         import dion.dion2 as _d2
         import dion.nordion2 as _nd2
-        _d2._local_selection_comm_size = _force_full_pad
-        _nd2._local_selection_comm_size = _force_full_pad
+        _real_mb = _d2.megabatch_orthogonalize_async
+        def _forced_mb(*a, **k):
+            k["local_comm_size"] = None
+            return _real_mb(*a, **k)
+        _d2.megabatch_orthogonalize_async = _forced_mb
+        _nd2.megabatch_orthogonalize_async = _forced_mb
 
     # Wide (rows <= cols) so the unsharded reference also selects rows; see the
     # module docstring. Deterministic whole-matrix weight + grad on every rank.
