@@ -1,3 +1,4 @@
+import math
 import torch
 from collections import defaultdict
 from torch import Tensor
@@ -13,8 +14,13 @@ from .megabatch_base import (
     adjust_lr_rms_norm,
 )
 from .opt_utils import AsyncTask, to_local
-from .dion2 import dion2_pre_orthogonalize, dion2_post_orthogonalize
-from .normuon import normuon_normalization_stacked
+from .dion2 import (
+    dion2_pre_orthogonalize,
+    dion2_post_orthogonalize,
+    dion2_pre_accumulate,
+    _make_select_and_orthogonalize,
+)
+from .normuon import normuon_normalization_stacked, _normuon_normalization_core
 
 
 class NorDion2(DistributedOrthoBase):
@@ -66,12 +72,17 @@ class NorDion2(DistributedOrthoBase):
         use_gram_newton_schulz: bool = False,
         newton_schulz_func: Optional[Callable] = None,
         triton_post_ortho: bool = False,
+        selection_scope: str = "local",
     ):
         # Validate hyperparameters
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
         if not (0.0 < fraction <= 1.0):
             raise ValueError(f"fraction must be in (0, 1], got {fraction}")
+        if selection_scope not in ("local", "global"):
+            raise ValueError(
+                f"selection_scope must be 'local' or 'global', got {selection_scope!r}"
+            )
         if mu < 0.0:
             raise ValueError(f"Invalid momentum factor (mu): {mu}")
         if muon_beta2 < 0.0:
@@ -96,6 +107,7 @@ class NorDion2(DistributedOrthoBase):
             adjust_lr=adjust_lr,
             algorithm="nordion2",
             step=0,
+            selection_scope=selection_scope,
         )
         super().__init__(
             params, distributed_mesh, "nordion2", defaults,
@@ -161,6 +173,7 @@ class NorDion2(DistributedOrthoBase):
                 process_group=self._process_group,
                 newton_schulz_func=self._newton_schulz_func,
                 triton_post_ortho=self._triton_post_ortho,
+                selection_scope=group["selection_scope"],
             )
 
             shape_groups: dict[tuple, list] = defaultdict(list)
@@ -226,10 +239,16 @@ def nordion2_update_megabatch_async(
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
     triton_post_ortho: bool = False,
+    selection_scope: str = "local",
 ) -> Generator[None, None, None]:
     """
     Mega-batched NorDion2 update: processes ALL same-shape parameters in one
     communication round instead of world_size-sized batches.
+
+    ``selection_scope`` mirrors Dion2: "local" selects each rank's top-k rows
+    before communication (cheap comm, world-size variant); "global" sends the
+    full shard and selects on the assembled whole matrix (full comm, invariant).
+    See ``dion2_update_megabatch_async`` for details.
     """
     N = len(X)
     assert N == len(G) == len(M) == len(V)
@@ -238,18 +257,9 @@ def nordion2_update_megabatch_async(
     select_dim = -2
     is_sharded = shard_dim is not None
 
-    # Update momentum and compute the inputs for orthogonalization
-    # Dion2 pre-orthogonalizes differs from NorMuon by applying damping before updating momentum
-    U_selected, indices_list = dion2_pre_orthogonalize(
-        G=to_local(G),
-        M=to_local(M),
-        fraction=fraction,
-        ef_decay=momentum,
-        select_dim=select_dim,
-    )
-
     # comm_dim for sharded communication: use select_dim
     comm_dim = select_dim if is_sharded else None
+    global_scope = selection_scope == "global" and comm_dim is not None
 
     # On the sharded path X[0] must still be a DTensor, so .shape[comm_dim]
     # is the unsharded global size. The megabatch fn uses this to compute
@@ -262,9 +272,77 @@ def nordion2_update_megabatch_async(
                 "Sharded path requires X[0] to be a DTensor so .shape gives "
                 f"the global size; got {type(X[0]).__name__}."
             )
-        global_comm_dim_size = X[0].shape[comm_dim]
+        global_dim_size = X[0].shape[comm_dim]
     else:
-        global_comm_dim_size = None
+        global_dim_size = None
+
+    if global_scope:
+        # --- Global selection: send the full shard, select after assembly ---
+        U_full = dion2_pre_accumulate(G=to_local(G), M=to_local(M))
+        select_ns = _make_select_and_orthogonalize(
+            newton_schulz_func, fraction, select_dim
+        )
+        U_ortho = yield from megabatch_orthogonalize_async(
+            U_full,
+            comm_dim=comm_dim,
+            device_rank=device_rank,
+            world_size=world_size,
+            process_group=process_group,
+            newton_schulz_func=select_ns,
+            flatten=flatten,
+            epsilon=epsilon,
+            global_comm_dim_size=global_dim_size,
+        )
+        if adjust_lr is None:
+            adjusted_lr = lr
+        elif adjust_lr == "spectral_norm":
+            adjusted_lr = adjust_lr_spectral_norm(lr, X[0].shape, flatten=flatten)
+        elif adjust_lr == "rms_norm":
+            adjusted_lr = adjust_lr_rms_norm(lr, X[0].shape, flatten=flatten)
+        else:
+            raise ValueError(f"Unknown adjust_lr: {adjust_lr}")
+        # U_ortho rows are exactly zero except at globally-selected positions
+        # this rank owns. The masked post applies error-feedback decay to those
+        # rows of M, runs NorMuon per-neuron normalization on the selected rows
+        # (updating the local variance buffer V in place), and applies the
+        # masked weight update -- all keyed off the nonzero mask, no indices.
+        nordion2_post_orthogonalize_masked(
+            X=to_local(X),
+            M=to_local(M),
+            V=to_local(V),
+            U=U_ortho,
+            base_lr=lr,
+            adjusted_lr=adjusted_lr,
+            weight_decay=weight_decay,
+            ef_decay=momentum,
+            muon_beta2=muon_beta2,
+            select_dim=select_dim,
+        )
+        return
+
+    # --- Local selection (default): per-shard top-k, communicate only the
+    # selected rows. Uniform k = ceil(fraction * ceil(global / world_size)) is
+    # the per-rank selected count under FSDP2 contiguous chunking; the megabatch
+    # pads every shard to exactly k (short/empty shards zero-pad), so the
+    # alltoall stays uniform for uneven divisions too, with no special case. See
+    # dion2 for the full rationale.
+    if comm_dim is not None:
+        padded_local = (global_dim_size + world_size - 1) // world_size
+        k = max(1, int(math.ceil(fraction * padded_local)))
+    else:
+        k = None
+    global_comm_dim_size = global_dim_size
+
+    # Update momentum and compute the inputs for orthogonalization
+    # Dion2 pre-orthogonalizes differs from NorMuon by applying damping before updating momentum
+    U_selected, indices_list = dion2_pre_orthogonalize(
+        G=to_local(G),
+        M=to_local(M),
+        fraction=fraction,
+        ef_decay=momentum,
+        select_dim=select_dim,
+        k_override=k,
+    )
 
     # Orthogonalize via shared megabatch communication
     U_ortho = yield from megabatch_orthogonalize_async(
@@ -277,6 +355,7 @@ def nordion2_update_megabatch_async(
         flatten=flatten,
         epsilon=epsilon,
         global_comm_dim_size=global_comm_dim_size,
+        local_comm_size=k,
     )
 
     # Update variance neuron buffer for the selected rows and normalize the
@@ -354,3 +433,53 @@ def nordion2_normalize_selected_stacked(
     U_normed, V_sel_new = normuon_normalization_stacked(U, V_sel, muon_beta2)
     V_full = V_full.scatter(dim=-2, index=idx, src=V_sel_new.to(V_full.dtype))
     return U_normed, V_full
+
+
+@torch.compile(fullgraph=True)
+def nordion2_post_orthogonalize_masked(
+    X: List[Tensor],
+    M: List[Tensor],
+    V: List[Tensor],
+    U: List[Tensor],
+    base_lr: Tensor,
+    adjusted_lr: Tensor,
+    weight_decay: Tensor,
+    ef_decay: Tensor,
+    muon_beta2: Tensor,
+    select_dim: int,
+):
+    """
+    Global-scope NorDion2 post-orthogonalize. ``U`` holds full-size orthogonalized
+    shards, exactly zero except at the globally-selected rows this rank owns.
+
+    Selection is along rows (``select_dim == -2``), so a selected row is nonzero
+    over all columns. We:
+      1. derive the selected-row mask from the nonzero rows of U,
+      2. apply error-feedback decay to those rows of M,
+      3. run NorMuon per-neuron normalization over the full matrix (equivalent to
+         the selected submatrix alone, since orthonormal rows have unit norm and
+         non-selected rows are exactly zero). The per-neuron variance EMA is
+         written back to V only on selected rows.
+      4. apply the masked weight update X += -adjusted_lr * U_normed.
+    Inputs/outputs are regular Tensors, not DTensor.
+    """
+    assert select_dim == -2
+    dtype = X[0].dtype
+
+    # Weight decay on all weights
+    torch._foreach_mul_(X, 1 - base_lr * weight_decay)
+
+    one = torch.ones((), dtype=M[0].dtype, device=M[0].device)
+    ef = ef_decay.to(M[0].dtype)
+    neg_lr = -adjusted_lr
+    for x, m, v, u in zip(X, M, V, U):
+        # [rows, 1] mask: True for selected (nonzero) rows.
+        sel = u.to(torch.float32).abs().sum(dim=-1, keepdim=True) > 0
+        # Error-feedback decay on the selected rows of momentum.
+        m.mul_(torch.where(sel, ef, one))
+        # NorMuon per-neuron normalization over the full matrix. V is updated
+        # only on selected rows (gated by the mask).
+        u_normed, v_new = _normuon_normalization_core(u, v.float(), muon_beta2)
+        v.copy_(torch.where(sel, v_new.to(v.dtype), v))
+        # Masked weight update: zero rows are no-ops.
+        x.add_((neg_lr * u_normed).to(dtype))

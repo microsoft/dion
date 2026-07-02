@@ -459,6 +459,7 @@ def megabatch_orthogonalize_async(
     split_sizes: Optional[Tuple[int, ...]] = None,
     split_scales: Optional[Tuple[float, ...]] = None,
     return_stacked: bool = False,
+    local_comm_size: Optional[int] = None,
 ) -> Generator[None, None, Union[List[Tensor], Tensor]]:
     """
     Shared megabatch communication + Newton-Schulz orthogonalization.
@@ -497,6 +498,14 @@ def megabatch_orthogonalize_async(
             their normalization step) use this to skip an unbind-then-restack
             round-trip. Default False preserves the list contract for callers
             that consume per-parameter tensors directly (Muon, Dion2).
+        local_comm_size: Optional explicit per-rank size along ``comm_dim`` to
+            pad the local shard to, overriding the ``ceil(global / world_size)``
+            derivation. Used by the Dion2/NorDion2 "local" scope, which has
+            already selected exactly ``k`` rows per rank before communication:
+            passing ``local_comm_size=k`` pads to ``k`` (a no-op when the shard
+            is already ``k``, a zero-pad for short shards) so the alltoall stays
+            uniform while comm and Newton-Schulz shrink by ``fraction``.
+            ``global_comm_dim_size`` still carries the true unsharded size.
     """
     N = len(U)
 
@@ -539,7 +548,25 @@ def megabatch_orthogonalize_async(
                 "None; callers should pass the unsharded DTensor's global "
                 "size along comm_dim."
             )
-        padded_local_size = (global_comm_dim_size + world_size - 1) // world_size
+        # local_comm_size, when given, is the explicit per-rank padded size (the
+        # caller pre-selected exactly this many rows). Otherwise derive it from
+        # the global size assuming FSDP2 contiguous chunking.
+        if local_comm_size is not None:
+            # The local-selection scope pads to k rows per rank, so k*world_size
+            # is (deliberately) not global_comm_dim_size. That would spuriously
+            # trip the split_sizes guard below, whose divisibility test assumes
+            # padded_local_size derives from the global size. The two features
+            # have never been combined; reject it explicitly rather than emit a
+            # misleading "not divisible by world_size" error.
+            if split_sizes is not None:
+                raise NotImplementedError(
+                    "local_comm_size (row-sharded 'local' selection) is not "
+                    "supported together with split_sizes; the per-rank pad-to-k "
+                    "would intersperse zero rows within the assembled row blocks."
+                )
+            padded_local_size = local_comm_size
+        else:
+            padded_local_size = (global_comm_dim_size + world_size - 1) // world_size
         original_local_size = U_work[0].size(comm_dim)
         if (
             split_sizes is not None

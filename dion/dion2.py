@@ -65,12 +65,17 @@ class Dion2(DistributedOrthoBase):
         newton_schulz_func: Optional[Callable] = None,
         verbose: bool = False,
         triton_post_ortho: bool = False,
+        selection_scope: str = "local",
     ):
         # Validate hyperparameters
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
         if not (0.0 < fraction <= 1.0):
             raise ValueError(f"fraction must be in (0, 1], got {fraction}")
+        if selection_scope not in ("local", "global"):
+            raise ValueError(
+                f"selection_scope must be 'local' or 'global', got {selection_scope!r}"
+            )
         if ef_decay < 0.0:
             raise ValueError(f"Invalid ef_decay: {ef_decay}")
         if len(betas) != 2 or betas[0] < 0.0 or betas[1] < 0.0:
@@ -92,6 +97,7 @@ class Dion2(DistributedOrthoBase):
             adjust_lr=adjust_lr,
             algorithm="dion2",
             step=0,
+            selection_scope=selection_scope,
         )
         super().__init__(
             params, distributed_mesh, "dion2", defaults,
@@ -141,6 +147,7 @@ class Dion2(DistributedOrthoBase):
                 newton_schulz_func=self._newton_schulz_func,
                 verbose=self.verbose,
                 triton_post_ortho=self._triton_post_ortho,
+                selection_scope=group["selection_scope"],
             )
 
             shape_groups: dict[tuple, list] = defaultdict(list)
@@ -203,10 +210,30 @@ def dion2_update_megabatch_async(
     newton_schulz_func: Optional[Callable] = None,
     verbose: bool = False,
     triton_post_ortho: bool = False,
+    selection_scope: str = "local",  # "local" (per-shard top-k, cheap comm) or "global" (whole-matrix top-k)
 ) -> Generator[None, None, None]:
     """
     Mega-batched Dion2 update: processes ALL same-shape parameters in one
     communication round instead of world_size-sized batches.
+
+    ``selection_scope`` controls how the orthogonalized submatrix is chosen on
+    the row-sharded path:
+
+    - ``"local"``: each rank picks its own top-k rows, and only those rows are
+      communicated and orthogonalized. Comm and Newton-Schulz cost scale with
+      ``fraction``. The selected set is the union of per-rank top-k, so it
+      depends on the sharding layout (world-size variant). This matches the
+      pre-megabatch Dion2 behavior; numerically identical to the previous
+      full-pad implementation (the padded zero rows it dropped never affected
+      U^T U), just without paying for the dropped rows.
+    - ``"global"``: the full shard is communicated (like NorMuon), the top-k is
+      taken on the assembled whole matrix, and Newton-Schulz runs on that
+      submatrix. Comm is full-size but the selected set is exact and invariant
+      to the sharding layout (reproducible across world sizes).
+
+    Off the row-sharded path (per-head, single-GPU, batch-sharded) each rank
+    already holds whole matrices, so local and global selection coincide and
+    ``selection_scope`` is a no-op.
     """
     N = len(X)
     assert N == len(G) == len(M)
@@ -232,17 +259,14 @@ def dion2_update_megabatch_async(
     if verbose:
         _print_selection_choice(X[0].shape, shard_dim, select_dim, ndim)
 
-    # Pre-orthogonalize: momentum update + submatrix selection
-    U_selected, indices_list = dion2_pre_orthogonalize(
-        G=to_local(G),
-        M=to_local(M),
-        fraction=fraction,
-        ef_decay=ef_decay,
-        select_dim=select_dim,
-    )
-
     # comm_dim for sharded communication: use select_dim (which equals normalized shard_dim)
     comm_dim = select_dim if is_sharded else None
+
+    # Decide whether selection happens before communication ("local", and only
+    # meaningful on the row-sharded path) or after the whole matrix is assembled
+    # ("global"). Off the sharded path each rank holds whole matrices, so the two
+    # are identical and we keep the cheaper pre-comm selection.
+    global_scope = selection_scope == "global" and comm_dim is not None
 
     # On the sharded path X[0] must still be a DTensor, so .shape[comm_dim]
     # is the unsharded global size. The megabatch fn uses this to compute
@@ -255,9 +279,82 @@ def dion2_update_megabatch_async(
                 "Sharded path requires X[0] to be a DTensor so .shape gives "
                 f"the global size; got {type(X[0]).__name__}."
             )
-        global_comm_dim_size = X[0].shape[comm_dim]
+        global_dim_size = X[0].shape[comm_dim]
     else:
-        global_comm_dim_size = None
+        global_dim_size = None
+
+    if global_scope:
+        # --- Global selection: send the full shard, select after assembly ---
+        # No pre-comm selection; momentum gets the gradient and the whole shard
+        # is communicated. ``select_and_orthogonalize_func`` wraps the real
+        # Newton-Schulz so that the top-k is taken on each assembled whole matrix
+        # (and per-block / per-head, since it rides inside the NS callable).
+        U_full = dion2_pre_accumulate(G=to_local(G), M=to_local(M))
+        global_comm_dim_size = global_dim_size
+        select_ns = _make_select_and_orthogonalize(
+            newton_schulz_func, fraction, select_dim
+        )
+        U_ortho = yield from megabatch_orthogonalize_async(
+            U_full,
+            comm_dim=comm_dim,
+            device_rank=device_rank,
+            world_size=world_size,
+            process_group=process_group,
+            newton_schulz_func=select_ns,
+            flatten=flatten,
+            epsilon=epsilon,
+            global_comm_dim_size=global_comm_dim_size,
+        )
+        if adjust_lr is None:
+            adjusted_lr = lr
+        elif adjust_lr == "spectral_norm":
+            adjusted_lr = adjust_lr_spectral_norm(lr, X[0].shape, flatten=flatten)
+        elif adjust_lr == "rms_norm":
+            adjusted_lr = adjust_lr_rms_norm(lr, X[0].shape, flatten=flatten)
+        else:
+            raise ValueError(f"Unknown adjust_lr: {adjust_lr}")
+        # U_ortho rows are exactly zero except at the globally-selected positions
+        # this rank owns. Apply error-feedback decay to those rows of M and the
+        # masked weight update, both keyed off the nonzero mask (no indices).
+        dion2_post_orthogonalize_masked(
+            X=to_local(X),
+            M=to_local(M),
+            U=U_ortho,
+            base_lr=lr,
+            adjusted_lr=adjusted_lr,
+            weight_decay=weight_decay,
+            ef_decay=ef_decay,
+            select_dim=select_dim,
+        )
+        return
+
+    # --- Local selection (default): per-shard top-k, communicate only the
+    # selected rows. Under FSDP2 contiguous chunking every rank holds at most
+    # ``padded_local = ceil(global / world_size)`` rows, so a uniform
+    # ``k = ceil(fraction * padded_local)`` is the per-rank selected count. We
+    # select up to ``k`` rows locally (short/empty shards select fewer -- see
+    # dion2_pre_orthogonalize) and tell the megabatch to pad every shard to
+    # exactly ``k`` via ``local_comm_size=k``, so the alltoall stays uniform
+    # while comm and Newton-Schulz both shrink by ``fraction``. This holds for
+    # uneven divisions too (the remainder/empty ranks just contribute zero-padded
+    # rows), so there is no even-division special case. ``global_comm_dim_size``
+    # keeps its true meaning (the unsharded size).
+    if comm_dim is not None:
+        padded_local = (global_dim_size + world_size - 1) // world_size
+        k = max(1, int(math.ceil(fraction * padded_local)))
+    else:
+        k = None
+    global_comm_dim_size = global_dim_size
+
+    # Pre-orthogonalize: momentum update + submatrix selection
+    U_selected, indices_list = dion2_pre_orthogonalize(
+        G=to_local(G),
+        M=to_local(M),
+        fraction=fraction,
+        ef_decay=ef_decay,
+        select_dim=select_dim,
+        k_override=k,
+    )
 
     # Orthogonalize via shared megabatch communication
     U_ortho = yield from megabatch_orthogonalize_async(
@@ -270,6 +367,7 @@ def dion2_update_megabatch_async(
         flatten=flatten,
         epsilon=epsilon,
         global_comm_dim_size=global_comm_dim_size,
+        local_comm_size=k,
     )
 
     # Compute scaled learning rate
@@ -329,6 +427,7 @@ def dion2_pre_orthogonalize(
     fraction: Tensor,
     ef_decay: Tensor,
     select_dim: int,
+    k_override: Optional[int] = None,
 ) -> Tuple[List[Tensor], List[Tensor]]:
     """
     Update momentum with gradient and compute the input to orthogonalization.
@@ -340,6 +439,14 @@ def dion2_pre_orthogonalize(
         - output submatrices and indices
     Inputs and outputs should be lists of regular Tensor, not DTensor.
     This is a separate function for compatibility with torch.compile().
+
+    ``k_override`` forces the number of selected slices (used by the row-sharded
+    "local" path so every rank selects the same count, derived from the global
+    size, instead of ``ceil(fraction * local_size)``). A rank whose local shard
+    is shorter than ``k_override`` selects all of its rows; ``topk`` is clamped
+    to the available count. The pad up to ``k_override`` is not done here -- the
+    downstream megabatch pads U to ``local_comm_size=k_override`` for a uniform
+    alltoall, and indices stay at the real selected count.
     """
     dtype = M[0].dtype
 
@@ -347,7 +454,20 @@ def dion2_pre_orthogonalize(
     # select_dim is the dimension we select submatrix from
     num_select = M[0].size(select_dim)
     norm_dim = -1 if select_dim == -2 else -2
-    k = max(1, int(math.ceil(fraction * num_select)))
+    # k is the requested selected count; k_topk is what topk can actually take
+    # from this shard (clamped to its real rows). When the shard is shorter than
+    # k_override -- possible on the last/remainder rank under uneven FSDP2
+    # chunking -- we select all its rows here. U_selected then carries only the
+    # real k_topk rows; the pad up to k happens downstream in
+    # megabatch_orthogonalize_async (local_comm_size=k) purely so the alltoall
+    # sees a uniform per-rank size. indices deliberately stay at k_topk: the
+    # megabatch narrows its result back to k_topk before it is scattered, so the
+    # padded rows never reach post_orthogonalize.
+    if k_override is not None:
+        k = k_override
+    else:
+        k = max(1, int(math.ceil(fraction * num_select)))
+    k_topk = min(k, num_select)
 
     # Update momentum: M = M + G
     G = [g.to(dtype=dtype) for g in G]
@@ -373,8 +493,9 @@ def dion2_pre_orthogonalize(
     # Compute L1 norm along norm_dim (sum of absolute values)
     slice_norms = M_stacked.norm(p=1, dim=norm_dim)
 
-    # Batched topk: indices shape (batch_size, k)
-    _, indices = torch.topk(slice_norms, k, dim=-1, sorted=False)
+    # Batched topk: indices shape (batch_size, k_topk). k_topk <= num_select is
+    # guaranteed, so this never raises even on a short remainder shard.
+    _, indices = torch.topk(slice_norms, k_topk, dim=-1, sorted=False)
 
     # Extract the selected rows/columns from each momentum tensor.
     # `indices` has shape (..., k) where k is the number of selected slices.
@@ -409,6 +530,99 @@ def dion2_pre_orthogonalize(
     U_selected = list(selected_stacked.to(dtype=torch.bfloat16).unbind(dim=0))
 
     return U_selected, indices_list
+
+
+@torch.compile(fullgraph=True)
+def dion2_pre_accumulate(G: List[Tensor], M: List[Tensor]) -> List[Tensor]:
+    """
+    Global-scope pre-orthogonalize: update momentum with the gradient and return
+    the whole shard in bf16 for communication. No selection happens here -- the
+    top-k is taken after the full matrix is assembled, inside the wrapped
+    Newton-Schulz function. Error-feedback decay is deferred to the masked post
+    step. Inputs/outputs are regular Tensors, not DTensor.
+    """
+    dtype = M[0].dtype
+    G = [g.to(dtype=dtype) for g in G]
+    torch._foreach_add_(M, G)
+    return [m.to(dtype=torch.bfloat16) for m in M]
+
+
+def _make_select_and_orthogonalize(
+    newton_schulz_func: Callable, fraction: float, select_dim: int
+) -> Callable:
+    """
+    Wrap a Newton-Schulz function so it (1) selects the top-k slices of each
+    assembled whole matrix by L1 norm along ``select_dim``, (2) orthogonalizes
+    only that submatrix, and (3) scatters the result back into a full-size,
+    otherwise-zero tensor. Used by the "global" selection scope: because the
+    wrapper is invoked on whole matrices (and per head, since it rides inside
+    the per-head split), the selection is exact and invariant to the sharding
+    layout. The returned full-size tensor has exactly
+    zero rows/cols everywhere except the selected positions, which the masked
+    post step keys off.
+    """
+
+    def _select_ns(X: Tensor, epsilon=None) -> Tensor:
+        num_select = X.size(select_dim)
+        norm_dim = -1 if select_dim == -2 else -2
+        k = max(1, int(math.ceil(fraction * num_select)))
+        slice_norms = X.norm(p=1, dim=norm_dim)
+        _, indices = torch.topk(slice_norms, k, dim=-1, sorted=False)
+        if select_dim == -2:
+            idx_exp = indices.unsqueeze(-1).expand(*indices.shape, X.size(-1))
+        else:
+            idx_exp = indices.unsqueeze(-2).expand(
+                *indices.shape[:-1], X.size(-2), indices.shape[-1]
+            )
+        sub = torch.gather(X, dim=select_dim, index=idx_exp)
+        ortho = newton_schulz_func(sub, epsilon=epsilon)
+        out = torch.zeros_like(X)
+        out.scatter_(dim=select_dim, index=idx_exp, src=ortho.to(out.dtype))
+        return out
+
+    return _select_ns
+
+
+@torch.compile(fullgraph=True)
+def dion2_post_orthogonalize_masked(
+    X: List[Tensor],
+    M: List[Tensor],
+    U: List[Tensor],
+    base_lr: Tensor,
+    adjusted_lr: Tensor,
+    weight_decay: Tensor,
+    ef_decay: Tensor,
+    select_dim: int,
+):
+    """
+    Global-scope post-orthogonalize. ``U`` holds full-size orthogonalized shards
+    that are exactly zero except at the globally-selected slices this rank owns.
+    Derive the selected mask from the nonzero slices (orthonormal rows/cols have
+    unit norm; non-selected are exactly 0), then apply error-feedback decay to
+    the selected slices of ``M`` and the masked weight update -- no indices
+    needed. Inputs/outputs are regular Tensors, not DTensor.
+    """
+    norm_dim = -1 if select_dim == -2 else -2
+    dtype = X[0].dtype
+
+    # Weight decay on all weights (matches the unmasked dion2_post_orthogonalize)
+    torch._foreach_mul_(X, 1 - base_lr * weight_decay)
+
+    one = torch.ones((), dtype=M[0].dtype, device=M[0].device)
+    ef = ef_decay.to(M[0].dtype)
+    neg_lr = -adjusted_lr
+    for x, m, u in zip(X, M, U):
+        # Boolean mask over the selected dim: True where the orthogonalized
+        # slice is nonzero (i.e. a selected slice). Keepdim so it broadcasts
+        # back over the full slice for the in-place updates below.
+        sel = u.to(torch.float32).abs().sum(dim=norm_dim, keepdim=True) > 0
+        # Error-feedback decay on the selected slices of momentum: multiply
+        # selected slices by ef_decay, leave the rest unchanged.
+        m.mul_(torch.where(sel, ef, one))
+        # Masked weight update X += -adjusted_lr * U. U is exactly zero off the
+        # selected slices, so a plain add only touches them (equivalent to the
+        # scatter_add over indices used by the local path).
+        x.add_((neg_lr * u).to(dtype))
 
 
 # NOTE: if this function starts failing with an InductorError on recompilation
