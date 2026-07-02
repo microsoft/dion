@@ -50,6 +50,12 @@ class NorDion2(DistributedOrthoBase):
         use_triton: Whether to use Triton kernel for Newton-Schulz. Ignored if custom function is provided.
         newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
             Signature is ``func(input: Tensor, epsilon: float) -> Tensor``.
+        selection_scope: On the FSDP2 row-sharded path, how the orthogonalized
+            submatrix is selected. "global" (default): exact top-k on the
+            assembled whole matrix -- layout-invariant/reproducible and better-
+            converging. "local": per-shard top-k (union) -- cheaper comm but a
+            sharding-dependent approximation that converges slightly worse; opt
+            in when comm-bound at large scale. No-op off the row-sharded path.
 
     NorDion2 optimizer applying Dion2 update to NorMuon
     """
@@ -72,7 +78,7 @@ class NorDion2(DistributedOrthoBase):
         use_gram_newton_schulz: bool = False,
         newton_schulz_func: Optional[Callable] = None,
         triton_post_ortho: bool = False,
-        selection_scope: str = "local",
+        selection_scope: str = "global",
     ):
         # Validate hyperparameters
         if lr < 0.0:
@@ -239,16 +245,17 @@ def nordion2_update_megabatch_async(
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
     triton_post_ortho: bool = False,
-    selection_scope: str = "local",
+    selection_scope: str = "global",
 ) -> Generator[None, None, None]:
     """
     Mega-batched NorDion2 update: processes ALL same-shape parameters in one
     communication round instead of world_size-sized batches.
 
-    ``selection_scope`` mirrors Dion2: "local" selects each rank's top-k rows
-    before communication (cheap comm, world-size variant); "global" sends the
-    full shard and selects on the assembled whole matrix (full comm, invariant).
-    See ``dion2_update_megabatch_async`` for details.
+    ``selection_scope`` mirrors Dion2: "global" (default) sends the full shard
+    and selects the exact top-k on the assembled whole matrix (full comm,
+    layout-invariant, better-converging); "local" selects each rank's top-k rows
+    before communication (cheaper comm, but a sharding-variant approximation that
+    converges slightly worse). See ``dion2_update_megabatch_async`` for details.
     """
     N = len(X)
     assert N == len(G) == len(M) == len(V)
@@ -280,7 +287,7 @@ def nordion2_update_megabatch_async(
         # --- Global selection: send the full shard, select after assembly ---
         U_full = dion2_pre_accumulate(G=to_local(G), M=to_local(M))
         select_ns = _make_select_and_orthogonalize(
-            newton_schulz_func, fraction, select_dim
+            newton_schulz_func, fraction, select_dim, global_select_size=global_dim_size
         )
         U_ortho = yield from megabatch_orthogonalize_async(
             U_full,
@@ -320,7 +327,7 @@ def nordion2_update_megabatch_async(
         )
         return
 
-    # --- Local selection (default): per-shard top-k, communicate only the
+    # --- Local selection (opt-in, selection_scope="local"): per-shard top-k, communicate only the
     # selected rows. Uniform k = ceil(fraction * ceil(global / world_size)) is
     # the per-rank selected count under FSDP2 contiguous chunking; the megabatch
     # pads every shard to exactly k (short/empty shards zero-pad), so the
