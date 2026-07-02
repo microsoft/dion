@@ -299,7 +299,7 @@ def dion2_update_megabatch_async(
         U_full = dion2_pre_accumulate(G=to_local(G), M=to_local(M))
         global_comm_dim_size = global_dim_size
         select_ns = _make_select_and_orthogonalize(
-            newton_schulz_func, fraction, select_dim
+            newton_schulz_func, fraction, select_dim, global_select_size=global_dim_size
         )
         U_ortho = yield from megabatch_orthogonalize_async(
             U_full,
@@ -555,7 +555,10 @@ def dion2_pre_accumulate(G: List[Tensor], M: List[Tensor]) -> List[Tensor]:
 
 
 def _make_select_and_orthogonalize(
-    newton_schulz_func: Callable, fraction: float, select_dim: int
+    newton_schulz_func: Callable,
+    fraction: float,
+    select_dim: int,
+    global_select_size: Optional[int] = None,
 ) -> Callable:
     """
     Wrap a Newton-Schulz function so it (1) selects the top-k slices of each
@@ -567,12 +570,28 @@ def _make_select_and_orthogonalize(
     layout. The returned full-size tensor has exactly
     zero rows/cols everywhere except the selected positions, which the masked
     post step keys off.
+
+    ``global_select_size`` is the true unsharded size along ``select_dim``. On
+    the row-sharded path the matrix handed to this wrapper is zero-padded to
+    ``ceil(global / world_size) * world_size`` rows, which exceeds the true
+    global size whenever it is not divisible by ``world_size``. Deriving ``k``
+    from ``X.size(select_dim)`` would then select ``ceil(fraction * padded)``
+    slices -- more than the true whole-matrix top-k, and a count that depends on
+    ``world_size`` -- silently breaking the exact/reproducible-across-world-sizes
+    guarantee. So ``k`` is computed from ``global_select_size`` when provided;
+    the padded rows are exactly zero and never rank into the top-k, so selecting
+    over the padded matrix still picks exactly the real global top-k. Falls back
+    to ``X.size(select_dim)`` when not given (e.g. an already-whole matrix).
     """
 
     def _select_ns(X: Tensor, epsilon=None) -> Tensor:
-        num_select = X.size(select_dim)
+        num_select = (
+            X.size(select_dim) if global_select_size is None else global_select_size
+        )
         norm_dim = -1 if select_dim == -2 else -2
-        k = max(1, int(math.ceil(fraction * num_select)))
+        # k derives from the true global size but never exceeds the (padded)
+        # matrix handed in, so topk is always valid.
+        k = min(max(1, int(math.ceil(fraction * num_select))), X.size(select_dim))
         slice_norms = X.norm(p=1, dim=norm_dim)
         _, indices = torch.topk(slice_norms, k, dim=-1, sorted=False)
         if select_dim == -2:

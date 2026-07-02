@@ -287,7 +287,7 @@ def nordion2_update_megabatch_async(
         # --- Global selection: send the full shard, select after assembly ---
         U_full = dion2_pre_accumulate(G=to_local(G), M=to_local(M))
         select_ns = _make_select_and_orthogonalize(
-            newton_schulz_func, fraction, select_dim
+            newton_schulz_func, fraction, select_dim, global_select_size=global_dim_size
         )
         U_ortho = yield from megabatch_orthogonalize_async(
             U_full,

@@ -70,7 +70,7 @@ def _reference_step(OptCls, W0, G, *, fraction, scope, **kw):
     return p.detach().clone()
 
 
-def _worker(rank, world_size, port, OptCls, scope, fraction, kw, out_path, force_pad):
+def _worker(rank, world_size, port, OptCls, scope, fraction, kw, out_path, force_pad, shape):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     torch.cuda.set_device(rank)
@@ -96,7 +96,7 @@ def _worker(rank, world_size, port, OptCls, scope, fraction, kw, out_path, force
 
     # Wide (rows <= cols) so the unsharded reference also selects rows; see the
     # module docstring. Deterministic whole-matrix weight + grad on every rank.
-    rows, cols = 16, 32
+    rows, cols = shape
     g = torch.Generator(device=dev).manual_seed(1234)
     W0 = torch.randn(rows, cols, generator=g, device=dev)
     G = torch.randn(rows, cols, generator=g, device=dev)
@@ -122,15 +122,51 @@ def _worker(rank, world_size, port, OptCls, scope, fraction, kw, out_path, force
     dist.destroy_process_group()
 
 
-def _run_sharded(OptCls, scope, fraction, kw, world_size, port, tmp, force_pad=False):
+def _run_sharded(
+    OptCls, scope, fraction, kw, world_size, port, tmp, force_pad=False, shape=(16, 32)
+):
     out = str(tmp / f"out_{port}.pt")
     mp.spawn(
         _worker,
-        args=(world_size, port, OptCls, scope, fraction, kw, out, force_pad),
+        args=(world_size, port, OptCls, scope, fraction, kw, out, force_pad, shape),
         nprocs=world_size,
         join=True,
     )
     return torch.load(out)
+
+
+def test_global_scope_k_uses_global_size_not_padded():
+    """Global-scope selection must derive k from the TRUE unsharded size, not the
+    zero-padded assembled size. On the row-sharded path the matrix handed to the
+    select-and-orthogonalize wrapper is padded to ceil(global/world)*world rows;
+    deriving k from that padded size selects ceil(fraction*padded) slices -- more
+    than the whole-matrix top-k, and a count that varies with world_size -- when
+    global is not divisible by world_size, silently breaking the exact/reproducible
+    guarantee that motivates the global default. The existing sharded tests use a
+    divisible matrix (16 rows, 2 ranks) so they never exercise this. Pure-CPU unit
+    test of the wrapper (no GPUs, no distribution)."""
+    import math
+    from dion.dion2 import _make_select_and_orthogonalize
+
+    fraction, global_rows, cols = 0.35, 17, 6
+    # Simulate world_size=4: padded_local=ceil(17/4)=5 -> assembled = 20 rows
+    # (17 real + 3 zero-pad), so ceil(0.35*20)=7 but the true top-k is
+    # ceil(0.35*17)=6.
+    padded_rows = 20
+    torch.manual_seed(0)
+    X = torch.cat(
+        [torch.randn(global_rows, cols), torch.zeros(padded_rows - global_rows, cols)],
+        dim=0,
+    )
+    # Identity NS isolates the selection logic from the orthogonalization.
+    sel_ns = _make_select_and_orthogonalize(
+        lambda t, epsilon=None: t, fraction, -2, global_select_size=global_rows
+    )
+    out = sel_ns(X)
+    n_selected = int((out.abs().sum(-1) > 0).sum())
+    assert n_selected == math.ceil(fraction * global_rows)  # 6, not ceil(.35*20)=7
+    # Padded zero rows must never be selected.
+    assert out[global_rows:].abs().sum() == 0
 
 
 @pytest.mark.skipif(CUDA < 2, reason="needs 2 GPUs")
@@ -143,6 +179,26 @@ def test_global_scope_matches_single_gpu_reference(OptCls, kw, tmp_path):
     d = _run_sharded(OptCls, "global", 0.25, kw, 2, 29610, tmp_path)
     W0 = d["W0"].cuda(); G = d["G"].cuda()
     ref = _reference_step(OptCls, W0, G, fraction=0.25, scope="global", **kw).cpu()
+    torch.testing.assert_close(d["W"], ref, rtol=BF16_RTOL, atol=BF16_ATOL)
+
+
+@pytest.mark.skipif(CUDA < 4, reason="needs 4 GPUs")
+@pytest.mark.parametrize("OptCls,kw", [
+    (Dion2, {}),
+    (NorDion2, {"mu": 0.95, "muon_beta2": 0.95}),
+])
+def test_global_scope_uneven_shards_matches_reference(OptCls, kw, tmp_path):
+    """global-scope over shards that do NOT divide evenly must still equal the
+    single-GPU whole-matrix reference. 17 rows over 4 ranks chunk to [5,5,5,2];
+    each shard zero-pads to ceil(17/4)=5, so the assembled matrix has 20 rows
+    (17 real + 3 pad). With fraction=0.35 the true top-k is ceil(0.35*17)=6, but a
+    k derived from the padded size would be ceil(0.35*20)=7 -- selecting an extra
+    row and diverging from the reference (and varying with world_size). This is
+    the uneven-division counterpart to the divisible test above, and exercises the
+    fix end-to-end on the row-sharded path."""
+    d = _run_sharded(OptCls, "global", 0.35, kw, 4, 29670, tmp_path, shape=(17, 32))
+    W0 = d["W0"].cuda(); G = d["G"].cuda()
+    ref = _reference_step(OptCls, W0, G, fraction=0.35, scope="global", **kw).cpu()
     torch.testing.assert_close(d["W"], ref, rtol=BF16_RTOL, atol=BF16_ATOL)
 
 
