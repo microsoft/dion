@@ -11,6 +11,7 @@ from typing import Callable, Generator, List, Optional, Tuple, Union
 from .megabatch_base import (
     DistributedOrthoBase,
     megabatch_orthogonalize_async,
+    muon_update_newton_schulz,
     adjust_lr_spectral_norm,
     adjust_lr_rms_norm,
 )
@@ -49,14 +50,17 @@ class Dion2(DistributedOrthoBase):
             assembled whole matrix -- layout-invariant/reproducible and better-
             converging. "local": per-shard top-k (union) -- cheaper comm but a
             sharding-dependent approximation that converges slightly worse; opt
-            in when comm-bound at large scale. "global_capped": global selection
-            at local comm cost -- all-gather the row norms only (~KBs), compute
-            the same global top-``k*world_size`` threshold everywhere, and send
-            each rank's globally-selected rows through the fixed ``k``-slot
-            pipes; a rank owning more winners than slots defers the overflow
-            (error feedback re-selects them on a later step), one owning fewer
-            sends zeros in the spare slots so only winners produce updates.
-            No-op off the row-sharded path.
+            in when comm-bound at large scale. "global_capped": exact global
+            top-``ceil(fraction*global)`` selection at ~local comm cost --
+            all-gather the row norms only (~KBs), then pack each rank's winner
+            rows into fixed-size chunks POOLED across the megabatch's matrices
+            (an int32 count header rides in each chunk). A rank whose winners
+            overflow its pooled chunk defers the overflow via error feedback;
+            see ``capacity_factor``. Groups where the packing cannot save comm
+            route to "global". No-op off the row-sharded path.
+        capacity_factor: "global_capped" pooled-chunk slack. None (default) =
+            auto per group, ``1 + 2*sqrt((1-1/world)/(per_rank*k))`` (covers
+            ~2 sigma of winner-count fluctuation); a float >= 1.0 pins it.
 
     Dion2 optimizer by Ahn et al.: TBD
     """
@@ -80,6 +84,7 @@ class Dion2(DistributedOrthoBase):
         verbose: bool = False,
         triton_post_ortho: bool = False,
         selection_scope: str = "global",
+        capacity_factor: Optional[float] = None,
     ):
         # Validate hyperparameters
         if lr < 0.0:
@@ -90,6 +95,10 @@ class Dion2(DistributedOrthoBase):
             raise ValueError(
                 f"selection_scope must be 'local', 'global', or 'global_capped', "
                 f"got {selection_scope!r}"
+            )
+        if capacity_factor is not None and capacity_factor < 1.0:
+            raise ValueError(
+                f"capacity_factor must be None (auto) or >= 1.0, got {capacity_factor}"
             )
         if ef_decay < 0.0:
             raise ValueError(f"Invalid ef_decay: {ef_decay}")
@@ -113,6 +122,7 @@ class Dion2(DistributedOrthoBase):
             algorithm="dion2",
             step=0,
             selection_scope=selection_scope,
+            capacity_factor=capacity_factor,
         )
         super().__init__(
             params, distributed_mesh, "dion2", defaults,
@@ -163,6 +173,7 @@ class Dion2(DistributedOrthoBase):
                 verbose=self.verbose,
                 triton_post_ortho=self._triton_post_ortho,
                 selection_scope=group["selection_scope"],
+                capacity_factor=group["capacity_factor"],
             )
 
             shape_groups: dict[tuple, list] = defaultdict(list)
@@ -226,6 +237,7 @@ def dion2_update_megabatch_async(
     verbose: bool = False,
     triton_post_ortho: bool = False,
     selection_scope: str = "global",  # "global" (exact whole-matrix top-k, default) or "local" (per-shard top-k; cheaper comm, sharding-variant)
+    capacity_factor: Optional[float] = None,  # "global_capped" pooled-chunk slack; None = auto (z=2 model)
 ) -> Generator[None, None, None]:
     """
     Mega-batched Dion2 update: processes ALL same-shape parameters in one
@@ -246,19 +258,19 @@ def dion2_update_megabatch_async(
       sharding-dependent approximation of the true top-k (world-size variant).
       Cheaper comm (the win grows with model size), but converges slightly
       worse; opt in when comm-bound at large scale.
-    - ``"global_capped"``: global selection at local comm cost. The slice L1
-      norms are all-gathered (one fp32 per slice, ~KBs), every rank computes the
-      same global top-``k*world_size`` threshold, and each rank sends its
-      globally-selected slices ("winners") through the same fixed ``k``-slot
-      pipes as "local". Overflow winners (a rank owning more winners than slots)
-      are deferred -- they skip error-feedback decay, so their momentum keeps
-      accumulating and they win a slot on a later step. Spare slots travel as
-      zeros: non-winners are never applied and never decayed, which is what
-      distinguishes this scope from "local" (a per-rank top-``k`` fill would be
-      trajectory-identical to "local", since a rank's winners are always its
-      top-norm slices). Note the selection budget is top-``k*world_size``, not
-      top-``ceil(fraction*global)``: the two coincide when ``world_size``
-      divides the sharded dim and the budget is slightly larger otherwise.
+    - ``"global_capped"``: exact global top-``ceil(fraction*global)`` selection
+      at ~"local" comm cost, via packed transport. The slice L1 norms are
+      all-gathered (one fp32 per slice, ~KBs) and every rank derives the same
+      exact-count winner set (stable-sort tie-break). Each rank packs its
+      winner rows into a fixed ``budget``-row chunk per destination, POOLED
+      across the destination's ``per_rank`` matrices, with an int32 count
+      header bit-cast into the chunk's first row -- the receiver parses the
+      sender's plan instead of recomputing it. Winners that overflow the
+      pooled budget are deferred: they skip error-feedback decay (only applied
+      rows are decayed, by the masked post), so their momentum accumulates and
+      they win later. Non-winners are never applied and never decayed -- a
+      per-rank top-k fill would be trajectory-identical to "local". Groups
+      whose budget would reach the full shard route to "global" instead.
 
     Off the row-sharded path (per-head, single-GPU, batch-sharded) each rank
     already holds whole matrices, so local and global selection coincide and
@@ -291,12 +303,6 @@ def dion2_update_megabatch_async(
     # comm_dim for sharded communication: use select_dim (which equals normalized shard_dim)
     comm_dim = select_dim if is_sharded else None
 
-    # Decide whether selection happens before communication ("local", and only
-    # meaningful on the row-sharded path) or after the whole matrix is assembled
-    # ("global"). Off the sharded path each rank holds whole matrices, so the two
-    # are identical and we keep the cheaper pre-comm selection.
-    global_scope = selection_scope == "global" and comm_dim is not None
-
     # On the sharded path X[0] must still be a DTensor, so .shape[comm_dim]
     # is the unsharded global size. The megabatch fn uses this to compute
     # the rank-consistent pad size for its alltoall. Catch the case where a
@@ -311,6 +317,89 @@ def dion2_update_megabatch_async(
         global_dim_size = X[0].shape[comm_dim]
     else:
         global_dim_size = None
+
+    # --- "global_capped" packed-path decision (row-sharded 2D only) ---
+    # Pooled chunk budget: per (rank -> dest) pair, B = ceil(c * per_rank * k)
+    # rows shared across the dest's per_rank matrices. c defaults to the
+    # z=2 fluctuation model (see dion2_capped_pack); if the budget reaches the
+    # full shard, packing saves nothing and the group routes to exact "global".
+    capped_packed = (
+        selection_scope == "global_capped"
+        and comm_dim is not None
+        and process_group is not None
+        and select_dim == -2
+        and X[0].ndim == 2
+    )
+    if capped_packed:
+        padded_local = (global_dim_size + world_size - 1) // world_size
+        k = max(1, int(math.ceil(fraction * padded_local)))
+        per_rank = (N + world_size - 1) // world_size
+        if capacity_factor is None:
+            c = 1.0 + 2.0 * math.sqrt((1.0 - 1.0 / world_size) / (per_rank * k))
+        else:
+            c = float(capacity_factor)
+        budget = int(math.ceil(c * per_rank * k))
+        # Route to exact "global" when packing cannot pay for itself (slack
+        # reaches the full shard) or the int32 count header cannot fit in the
+        # chunk's first row (2 bf16 slots per matrix).
+        if budget >= per_rank * padded_local or 2 * per_rank > X[0].shape[-1]:
+            capped_packed = False
+
+    # Decide whether selection happens before communication ("local", and only
+    # meaningful on the row-sharded path) or after the whole matrix is assembled
+    # ("global"). Off the sharded path each rank holds whole matrices, so the two
+    # are identical and we keep the cheaper pre-comm selection. "global_capped"
+    # groups that fell out of the packed path (degenerate budget, col-sharded,
+    # non-2D) take the exact global path.
+    global_scope = comm_dim is not None and (
+        selection_scope == "global"
+        or (selection_scope == "global_capped" and not capped_packed)
+    )
+
+    if capped_packed:
+        # --- "global_capped": winner-only packed transport ---
+        # Accumulate momentum (single owner on this path), all-gather the slice
+        # norms, pack the global winners into pooled fixed-size chunks, and
+        # come back with full-size shards that are zero except at the applied
+        # winner rows -- exactly the global path's masked-post format.
+        norms = dion2_pre_accumulate_norms(
+            G=to_local(G), M=to_local(M), select_dim=select_dim
+        )
+        U_ortho = yield from dion2_capped_packed_async(
+            M_local=to_local(M),
+            norms=norms,
+            padded_local=padded_local,
+            fraction=fraction,
+            global_size=global_dim_size,
+            device_rank=device_rank,
+            world_size=world_size,
+            process_group=process_group,
+            per_rank=per_rank,
+            budget=budget,
+            kw=k * world_size,
+            newton_schulz_func=newton_schulz_func,
+            flatten=flatten,
+            epsilon=epsilon,
+        )
+        if adjust_lr is None:
+            adjusted_lr = lr
+        elif adjust_lr == "spectral_norm":
+            adjusted_lr = adjust_lr_spectral_norm(lr, X[0].shape, flatten=flatten)
+        elif adjust_lr == "rms_norm":
+            adjusted_lr = adjust_lr_rms_norm(lr, X[0].shape, flatten=flatten)
+        else:
+            raise ValueError(f"Unknown adjust_lr: {adjust_lr}")
+        dion2_post_orthogonalize_masked(
+            X=to_local(X),
+            M=to_local(M),
+            U=U_ortho,
+            base_lr=lr,
+            adjusted_lr=adjusted_lr,
+            weight_decay=weight_decay,
+            ef_decay=ef_decay,
+            select_dim=select_dim,
+        )
+        return
 
     if global_scope:
         # --- Global selection: send the full shard, select after assembly ---
@@ -375,23 +464,6 @@ def dion2_update_megabatch_async(
         k = None
     global_comm_dim_size = global_dim_size
 
-    # "global_capped": accumulate momentum + all-gather the slice norms (one
-    # fp32 per slice, ~KBs), and hand the global top-(k*world_size) threshold to
-    # pre_orthogonalize, which applies the capacity rule (winners-only updates,
-    # zeros in spare slots). Same fixed k-slot comm as "local" below.
-    thresh = None
-    if (
-        selection_scope == "global_capped"
-        and comm_dim is not None
-        and process_group is not None
-    ):
-        norms = dion2_pre_accumulate_norms(
-            G=to_local(G), M=to_local(M), select_dim=select_dim
-        )
-        thresh = yield from dion2_capped_threshold_async(
-            norms, padded_local, k, world_size, process_group
-        )
-
     # Pre-orthogonalize: momentum update + submatrix selection
     U_selected, indices_list = dion2_pre_orthogonalize(
         G=to_local(G),
@@ -400,7 +472,6 @@ def dion2_update_megabatch_async(
         ef_decay=ef_decay,
         select_dim=select_dim,
         k_override=k,
-        thresh=thresh,
     )
 
     # Orthogonalize via shared megabatch communication
@@ -475,11 +546,10 @@ def dion2_pre_accumulate_norms(
     Phase A of the "global_capped" scope: update momentum with the gradient and
     return the stacked slice L1 norms ``[N, local_size]`` (fp32). The caller
     all-gathers these tiny norms across ranks (an eager collective that cannot
-    live inside this compiled graph) and feeds the resulting global threshold
-    back into ``dion2_pre_orthogonalize`` via ``thresh``. This function is the
-    single owner of momentum accumulation on the capped path: passing ``thresh``
-    tells ``dion2_pre_orthogonalize`` NOT to re-accumulate the gradient, so the
-    gathered norms always reflect the post-accumulation momentum.
+    live inside this compiled graph; see ``dion2_capped_select_async``). This
+    is the ONLY momentum accumulation on the capped path -- the packed
+    transport never calls ``dion2_pre_orthogonalize``, so the gathered norms
+    always reflect the post-accumulation momentum.
     """
     dtype = M[0].dtype
     G = [g.to(dtype=dtype) for g in G]
@@ -490,32 +560,41 @@ def dion2_pre_accumulate_norms(
     return torch.stack(M, dim=0).norm(p=1, dim=norm_dim).float()
 
 
-def dion2_capped_threshold_async(
+# Deferral instrumentation for the "global_capped" packed path. Updated per
+# megabatch step with GPU tensors (no host sync); external code may read and
+# log e.g. CAPPED_STATS["deferred_rows"] / CAPPED_STATS["winner_rows"].
+CAPPED_STATS: dict = {}
+
+
+def dion2_capped_select_async(
     norms: Tensor,  # [N, local_size] fp32 from dion2_pre_accumulate_norms
     padded_local: int,
-    k: int,
+    fraction: float,
+    global_size: int,
+    device_rank: int,
     world_size: int,
     process_group: Optional[ProcessGroup],
-) -> Generator[None, None, Tensor]:
+) -> Generator[None, None, Tuple[Tensor, Tensor]]:
     """
-    "global_capped" selection threshold: all-gather the slice L1 norms (one fp32
-    per slice -- ~KBs vs MBs for the rows) and return the per-matrix global
-    top-``k*world_size`` threshold ``[N, 1]``, computed identically on every
-    rank. ``dion2_pre_orthogonalize`` compares its local norms against this
-    value to apply the capacity rule (winners-only updates -- see its
-    docstring).
+    "global_capped" winner selection: all-gather the slice L1 norms (one fp32
+    per slice -- ~KBs vs MBs for the rows) and return, for this rank,
 
-    Rank consistency is by construction: every rank computes the threshold from
-    the same bit-identical gathered tensor, and the threshold is a *value* (the
-    ``k_total``-th largest norm), so it does not depend on ``topk`` tie-breaking
-    order. Async generator in the megabatch style: yields at the collective,
-    returns the threshold.
+      - ``winner`` bool ``[N, local_size]``: membership in the exact global
+        top-``k_total`` set, ``k_total = ceil(fraction * global_size)``. The
+        set is EXACT-COUNT: a stable descending argsort over the gathered
+        norms breaks ties deterministically by flat (rank, row) position, so
+        ties cannot inflate the winner set past the budget (the receiver-side
+        buffer bound in the packed transport relies on this).
+      - ``thresh`` ``[N, 1]``: the k_total-th largest norm per matrix, used to
+        scale-normalize cross-matrix deferral priorities in the pack step.
+
+    ``k_total <= global_size`` always, so the -1 shard padding can never win.
+    Rank consistency: every rank sorts the same bit-identical gathered tensor;
+    the receiver clip in ``dion2_capped_assemble`` guards the (pathological)
+    divergent case. Async generator in the megabatch style: yields at the
+    collective, returns the pair.
     """
     N, local_size = norms.shape
-    # Pad short/empty shards to the rank-uniform padded_local. L1 norms are
-    # nonnegative, so -1 padding can never enter the winner set unless
-    # k*world_size exceeds the real row count (tiny-matrix degenerate case,
-    # where "everything is a winner" is the correct answer anyway).
     if local_size > padded_local:
         # F.pad with a negative amount would silently TRIM norms; fail loudly
         # instead (mirrors the analogous guard in megabatch_orthogonalize_async).
@@ -539,13 +618,278 @@ def dion2_capped_threshold_async(
     yield
     work.wait()
 
-    # [world, N, padded_local] -> per-matrix global threshold = k_total-th value
-    all_norms = gathered.view(world_size, N, padded_local)
-    k_total = min(k * world_size, world_size * padded_local)
-    vals, _ = torch.topk(
-        all_norms.permute(1, 0, 2).reshape(N, -1), k_total, dim=-1
+    # [world, N, padded_local] -> flat per-matrix [N, world*padded_local] with
+    # rank-major flat position (r * padded_local + row).
+    flat = gathered.view(world_size, N, padded_local).permute(1, 0, 2).reshape(N, -1)
+    k_total = min(max(1, int(math.ceil(fraction * global_size))), global_size)
+    order = torch.argsort(flat, dim=-1, descending=True, stable=True)
+    winner_flat = torch.zeros_like(flat, dtype=torch.bool)
+    winner_flat.scatter_(1, order[:, :k_total], True)
+    thresh = flat.gather(1, order[:, k_total - 1 : k_total])
+    own = winner_flat.view(N, world_size, padded_local)[:, device_rank, :local_size]
+    return own.contiguous(), thresh
+
+
+@_inductor_workaround
+@torch.compile(fullgraph=True)
+def dion2_capped_pack(
+    M: List[Tensor],  # N tensors [local, cols] (momentum, already accumulated)
+    norms: Tensor,  # [N, local] fp32
+    winner: Tensor,  # [N, local] bool, from dion2_capped_select_async
+    thresh: Tensor,  # [N, 1] fp32
+    world_size: int,
+    per_rank: int,
+    budget: int,  # pooled row budget B per (rank -> dest) chunk
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """
+    Sender side of the packed "global_capped" transport. Matrices are assigned
+    to destination ranks in blocks of ``per_rank`` (megabatch order); for each
+    destination this rank packs its winner rows of that destination's matrices
+    back-to-back into a fixed ``budget``-row chunk -- slots are POOLED across
+    the per_rank matrices, so one matrix's overflow uses another's spare room.
+
+    If a destination's total winners exceed ``budget``, the lowest-priority
+    rows are deferred (error feedback: they keep full momentum and win later).
+    Priority is the SCALE-NORMALIZED ``norm / thresh`` -- raw norms are not
+    comparable across matrices, and a large-scale matrix must not evict a
+    small-scale matrix's winners from the shared chunk.
+
+    Returns ``(payload [world, budget, cols] bf16, counts [world, per_rank]
+    int32, src_index [world, budget] long, deferred_rows scalar)``. Empty
+    slots gather a dedicated zero row (never read by the receiver, which
+    parses only ``counts`` rows per segment). ``src_index`` maps each slot to
+    its flat local row (sentinel = the zero row) and is kept by the sender to
+    scatter the orthogonalized rows home; the packing is stable and
+    position-preserving -- the reverse path relies on it.
+    """
+    N = len(M)
+    local = M[0].size(-2)
+    cols = M[0].size(-1)
+    n_pad = world_size * per_rank
+    device = M[0].device
+
+    M_stacked = torch.stack(M, dim=0)  # [N, local, cols]
+    if n_pad > N:
+        # Virtual matrices padding the group to world_size * per_rank: no
+        # winners, zero rows.
+        M_stacked = torch.cat(
+            [M_stacked, torch.zeros(n_pad - N, local, cols, dtype=M_stacked.dtype, device=device)]
+        )
+        winner = torch.cat(
+            [winner, torch.zeros(n_pad - N, local, dtype=torch.bool, device=device)]
+        )
+        norms = torch.cat(
+            [norms, torch.zeros(n_pad - N, local, dtype=norms.dtype, device=device)]
+        )
+        thresh = torch.cat(
+            [thresh, torch.ones(n_pad - N, 1, dtype=thresh.dtype, device=device)]
+        )
+
+    prio = norms / thresh.clamp_min(1e-12)
+    score = torch.where(winner, prio, torch.full_like(prio, float("-inf")))
+    score_d = score.view(world_size, per_rank * local)
+    b_eff = min(budget, per_rank * local)
+    vals, idxs = torch.topk(score_d, b_eff, dim=-1)
+    kept_flat = torch.zeros_like(score_d, dtype=torch.bool)
+    kept_flat.scatter_(1, idxs, vals.isfinite())  # winners only; spare slots stay empty
+    kept = kept_flat.view(world_size, per_rank, local)
+
+    counts = kept.sum(dim=-1)  # [world, per_rank]
+    seg_border = counts.cumsum(dim=1) - counts  # exclusive, within chunk
+    # Slot of each kept row: matrix segment border + within-matrix ordinal
+    # (row order preserved -- stable packing).
+    ordinal = kept.cumsum(dim=-1) - 1
+    slot = seg_border.unsqueeze(-1) + ordinal
+    slot_safe = torch.where(kept, slot, torch.full_like(slot, budget))  # trash col
+
+    fid = torch.arange(n_pad * local, device=device).view(world_size, per_rank, local)
+    sentinel = n_pad * local  # index of the appended zero row
+    src_index = torch.full(
+        (world_size, budget + 1), sentinel, dtype=torch.long, device=device
     )
-    return vals[:, -1:]
+    src_index.scatter_(
+        1, slot_safe.reshape(world_size, -1), fid.reshape(world_size, -1)
+    )
+    src_index = src_index[:, :budget]
+
+    M_flat = torch.cat(
+        [M_stacked.reshape(n_pad * local, cols),
+         torch.zeros(1, cols, dtype=M_stacked.dtype, device=device)]
+    )
+    payload = M_flat[src_index].to(torch.bfloat16)  # [world, budget, cols]
+    deferred = winner.sum() - kept.sum()
+    return payload, counts.to(torch.int32), src_index, deferred
+
+
+@torch.compile(fullgraph=True)
+def dion2_capped_assemble(
+    payload: Tensor,  # [world, budget, cols] bf16 (received chunks, no header)
+    counts: Tensor,  # [world, per_rank] int32 (parsed headers)
+    kw: int,  # static NS row count per matrix (k * world_size)
+) -> Tuple[Tensor, Tensor]:
+    """
+    Receiver side: assemble each of this rank's ``per_rank`` matrices from the
+    variable-length segments of all senders' chunks into a static, zero-padded
+    ``[per_rank, kw, cols]`` Newton-Schulz input. Rows land in (sender rank,
+    within-segment) order; NS is permutation-equivariant and the reverse path
+    inverts the same mapping, so the order is only required to be stable.
+
+    Arrivals beyond ``kw`` for a matrix (impossible with exact-count winners;
+    possible only under a divergent sender) are clipped to a trash slot rather
+    than corrupting the buffer. Returns ``(ns_input, ns_index)`` where
+    ``ns_index [per_rank, kw]`` maps NS rows back to flat payload positions
+    (sentinel = zero row) for ``dion2_capped_repack``.
+    """
+    world_size, budget, cols = payload.shape
+    per_rank = counts.size(1)
+    device = payload.device
+    cnt = counts.to(torch.long)
+
+    seg_border = cnt.cumsum(dim=1) - cnt  # [world, per_rank] within sender chunk
+    dst_border = cnt.cumsum(dim=0) - cnt  # [world, per_rank] within NS rows
+    max_seg = min(budget, kw)
+    j = torch.arange(max_seg, device=device)
+    valid = j < cnt.unsqueeze(-1)  # [world, per_rank, max_seg]
+    src_pos = (
+        torch.arange(world_size, device=device).view(-1, 1, 1) * budget
+        + seg_border.unsqueeze(-1)
+        + j
+    )
+    src_pos = torch.where(valid, src_pos, torch.full_like(src_pos, world_size * budget))
+    dst_pos = dst_border.unsqueeze(-1) + j
+    dst_pos = torch.where(
+        valid & (dst_pos < kw), dst_pos, torch.full_like(dst_pos, kw)  # receiver clip
+    )
+
+    ns_index = torch.full(
+        (per_rank, kw + 1), world_size * budget, dtype=torch.long, device=device
+    )
+    ns_index.scatter_(
+        1,
+        dst_pos.permute(1, 0, 2).reshape(per_rank, -1),
+        src_pos.permute(1, 0, 2).reshape(per_rank, -1),
+    )
+    ns_index = ns_index[:, :kw]
+
+    pay_flat = torch.cat(
+        [payload.reshape(world_size * budget, cols),
+         torch.zeros(1, cols, dtype=payload.dtype, device=device)]
+    )
+    ns_input = pay_flat[ns_index]  # [per_rank, kw, cols], zero-padded tail
+    return ns_input, ns_index
+
+
+@torch.compile(fullgraph=True)
+def dion2_capped_repack(
+    ns_out: Tensor,  # [per_rank, kw, cols] orthogonalized
+    ns_index: Tensor,  # [per_rank, kw] from dion2_capped_assemble
+    world_size: int,
+    budget: int,
+) -> Tensor:
+    """Inverse of assemble: scatter NS rows back to their payload positions.
+    Padding/sentinel rows collapse onto a trash row; payload slots that carried
+    no real row stay exactly zero (so the sender scatters zeros = no update)."""
+    per_rank, kw, cols = ns_out.shape
+    out = torch.zeros(
+        world_size * budget + 1, cols, dtype=ns_out.dtype, device=ns_out.device
+    )
+    out.scatter_(0, ns_index.reshape(-1, 1).expand(-1, cols), ns_out.reshape(-1, cols))
+    return out[: world_size * budget].view(world_size, budget, cols)
+
+
+@torch.compile(fullgraph=True)
+def dion2_capped_unpack(
+    recv: Tensor,  # [world, budget, cols] orthogonalized rows, sender's layout
+    src_index: Tensor,  # [world, budget] from dion2_capped_pack
+    n_params: int,
+    local: int,
+    total_rows: int,  # n_pad * local (sentinel index)
+) -> List[Tensor]:
+    """Sender-side finish: scatter the returned rows to their home (matrix,
+    row) positions. Output is a list of full-size ``[local, cols]`` shards that
+    are exactly zero except at this rank's applied winner rows -- the format
+    ``dion2_post_orthogonalize_masked`` consumes (same as the global scope)."""
+    world_size, budget, cols = recv.shape
+    U_flat = torch.zeros(
+        total_rows + 1, cols, dtype=recv.dtype, device=recv.device
+    )
+    U_flat.scatter_(0, src_index.reshape(-1, 1).expand(-1, cols), recv.reshape(-1, cols))
+    return list(U_flat[: n_params * local].view(n_params, local, cols).unbind(0))
+
+
+def dion2_capped_packed_async(
+    M_local: List[Tensor],
+    norms: Tensor,
+    padded_local: int,
+    fraction: float,
+    global_size: int,
+    device_rank: int,
+    world_size: int,
+    process_group: Optional[ProcessGroup],
+    per_rank: int,
+    budget: int,
+    kw: int,
+    newton_schulz_func: Callable,
+    flatten: bool,
+    epsilon: Tensor,
+) -> Generator[None, None, List[Tensor]]:
+    """
+    "global_capped" packed transport: winner selection (norms-only all-gather)
+    -> pooled pack -> fixed-size a2a with an int32 count header bit-cast into
+    each chunk's first row -> assemble + Newton-Schulz -> repack -> reverse a2a
+    -> scatter home. All collective sizes are construction-time constants; the
+    data-dependence lives entirely in GPU-side gathers/scatters (no host
+    syncs). The header makes the sender's packing plan the single source of
+    truth -- the receiver never recomputes winner counts.
+    """
+    winner, thresh = yield from dion2_capped_select_async(
+        norms, padded_local, fraction, global_size,
+        device_rank, world_size, process_group,
+    )
+    payload, counts, src_index, deferred = dion2_capped_pack(
+        M_local, norms, winner, thresh, world_size, per_rank, budget
+    )
+    CAPPED_STATS["deferred_rows"] = deferred
+    CAPPED_STATS["winner_rows"] = winner.sum()
+
+    # Header row: int32 counts bit-cast into bf16 (2 bf16 per int32). Counts
+    # are NOT representable as bf16 *values* (exact only to 256); the bit-cast
+    # round-trips exactly.
+    cols = payload.size(-1)
+    header = torch.zeros(
+        world_size, 1, cols, dtype=torch.bfloat16, device=payload.device
+    )
+    header[:, 0, : per_rank * 2] = counts.contiguous().view(torch.bfloat16)
+    chunks = torch.cat([header, payload], dim=1)  # [world, 1 + budget, cols]
+
+    send = [c.contiguous() for c in chunks.unbind(0)]
+    recv = [torch.empty_like(c) for c in send]
+    work = dist.all_to_all(recv, send, group=process_group, async_op=True)
+    yield
+    work.wait()
+
+    recv_t = torch.stack(recv)
+    counts_recv = recv_t[:, 0, : per_rank * 2].contiguous().view(torch.int32)
+    ns_input, ns_index = dion2_capped_assemble(
+        recv_t[:, 1:].contiguous(), counts_recv, kw
+    )
+    ns_out = muon_update_newton_schulz(
+        ns_input, newton_schulz_func=newton_schulz_func,
+        flatten=flatten, epsilon=epsilon,
+    )
+    back = dion2_capped_repack(ns_out, ns_index, world_size, budget)
+
+    send2 = [c.contiguous() for c in back.unbind(0)]
+    recv2 = [torch.empty_like(c) for c in send2]
+    work = dist.all_to_all(recv2, send2, group=process_group, async_op=True)
+    yield
+    work.wait()
+
+    local = M_local[0].size(-2)
+    n_pad = world_size * per_rank
+    return dion2_capped_unpack(
+        torch.stack(recv2), src_index, len(M_local), local, n_pad * local
+    )
 
 
 @_inductor_workaround
@@ -557,7 +901,6 @@ def dion2_pre_orthogonalize(
     ef_decay: Tensor,
     select_dim: int,
     k_override: Optional[int] = None,
-    thresh: Optional[Tensor] = None,
 ) -> Tuple[List[Tensor], List[Tensor]]:
     """
     Update momentum with gradient and compute the input to orthogonalization.
@@ -578,21 +921,8 @@ def dion2_pre_orthogonalize(
     downstream megabatch pads U to ``local_comm_size=k_override`` for a uniform
     alltoall, and indices stay at the real selected count.
 
-    ``thresh`` (the "global_capped" scope) is the per-matrix global
-    top-``k*world_size`` norm threshold ``[N, 1]`` from
-    ``dion2_capped_threshold_async``. Passing it means the momentum was ALREADY
-    accumulated by ``dion2_pre_accumulate_norms`` (the single accumulation
-    owner on the capped path -- the gathered norms must reflect the
-    post-accumulation momentum), so the ``M += G`` here is skipped. The top-k
-    gather itself is unchanged: a rank's winners (slices at/above ``thresh``)
-    are by construction its top-norm slices, so they already lead the plain
-    norm-order selection. What changes is what happens to the non-winner
-    "filler" slices occupying spare slots: they are masked to zero in the
-    communicated ``U_selected`` (zero slices pass through Newton-Schulz as
-    exact zeros, so they produce no weight update) and they skip error-feedback
-    decay, letting their momentum accumulate until they cross the global
-    threshold on a later step. Without this masking, capped selection would be
-    trajectory-identical to "local" scope.
+    (The "global_capped" scope does not pass through here at all -- it uses
+    the packed transport, ``dion2_capped_packed_async``, and the masked post.)
     """
     dtype = M[0].dtype
 
@@ -615,12 +945,9 @@ def dion2_pre_orthogonalize(
         k = max(1, int(math.ceil(fraction * num_select)))
     k_topk = min(k, num_select)
 
-    # Update momentum: M = M + G. Skipped when `thresh` is given ("global_
-    # capped"): dion2_pre_accumulate_norms is the single accumulation owner on
-    # that path, so the gathered norms reflect the post-accumulation momentum.
-    if thresh is None:
-        G = [g.to(dtype=dtype) for g in G]
-        torch._foreach_add_(M, G)
+    # Update momentum: M = M + G
+    G = [g.to(dtype=dtype) for g in G]
+    torch._foreach_add_(M, G)
 
     # Empty local shard along select_dim: FSDP2 contiguous chunking leaves this
     # rank with a size-0 shard when the param's sharded dim is smaller than
@@ -661,35 +988,15 @@ def dion2_pre_orthogonalize(
         )
         selected_stacked = torch.gather(M_stacked, dim=-1, index=indices_expanded)
 
-    # "global_capped" capacity rule: only slices at/above the global threshold
-    # ("winners") are applied. Winners lead the norm-order selection above by
-    # construction, so `indices` needs no change; non-winner "fillers" in spare
-    # slots are masked to zero for communication (zero slices pass through
-    # Newton-Schulz as exact zeros -> no weight update) and keep their momentum
-    # un-decayed so it accumulates until they win. `>=` marks hard ties at the
-    # threshold as winners, which can inflate the winner set past k*world_size
-    # -- measure-zero for continuous fp32 norms and bounded by the per-rank k
-    # cap, so benign.
-    if thresh is not None:
-        sel_norms = torch.gather(slice_norms, dim=-1, index=indices)  # [N, k_topk]
-        winner = sel_norms >= thresh
-        winner_exp = winner.unsqueeze(-1) if select_dim == -2 else winner.unsqueeze(-2)
-        ef_factor = torch.where(winner_exp, ef_decay, torch.ones_like(ef_decay))
-        U_stacked = selected_stacked * winner_exp.to(selected_stacked.dtype)
-    else:
-        ef_factor = ef_decay
-        U_stacked = selected_stacked
-
-    # Apply error feedback decay to selected slices in the original M tensors
-    # (capped scope: winners only). We reuse the already-gathered slices and
-    # write them back (scaled) using scatter_, which places values into
-    # positions specified by the index tensor. The .to(dtype) matters for bf16
-    # momentum: the capped ef_factor is a *dimensioned* fp32 tensor, so
-    # bf16 * fp32 promotes to fp32 (unlike the 0-dim ef_decay scalar, which
-    # loses promotion to a dimensioned bf16), and scatter_ requires src dtype
-    # to match M exactly. Multiply in fp32, round once into M's dtype.
+    # Apply error feedback decay to selected slices in the original M tensors.
+    # We reuse the already-gathered slices and write them back (scaled) using
+    # scatter_, which places values into positions specified by the index
+    # tensor. The .to(dtype) guards bf16 momentum: scatter_ requires src dtype
+    # to match M exactly, and it keeps a single fp32-multiply-then-round if
+    # ef_decay ever becomes a dimensioned tensor (a 0-dim fp32 scalar loses
+    # type promotion to bf16, but a dimensioned one would win it).
     indices_list = list(indices.unbind(dim=0))
-    ef_src_list = list((selected_stacked * ef_factor).to(dtype).unbind(dim=0))
+    ef_src_list = list((selected_stacked * ef_decay).to(dtype).unbind(dim=0))
     for m, idx, ef_src in zip(M, indices_list, ef_src_list):
         if select_dim == -2:
             idx_exp = idx.unsqueeze(-1).expand(*idx.shape, m.size(-1))
@@ -698,7 +1005,7 @@ def dion2_pre_orthogonalize(
         m.scatter_(dim=select_dim, index=idx_exp, src=ef_src)
 
     # Convert to bf16 and unstack for communication
-    U_selected = list(U_stacked.to(dtype=torch.bfloat16).unbind(dim=0))
+    U_selected = list(selected_stacked.to(dtype=torch.bfloat16).unbind(dim=0))
 
     return U_selected, indices_list
 
