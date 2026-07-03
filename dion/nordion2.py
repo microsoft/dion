@@ -15,9 +15,12 @@ from .megabatch_base import (
 )
 from .opt_utils import AsyncTask, to_local
 from .dion2 import (
+    CAPPED_STATS,
     dion2_pre_orthogonalize,
     dion2_post_orthogonalize,
     dion2_pre_accumulate,
+    dion2_pre_accumulate_norms,
+    dion2_capped_packed_async,
     _make_select_and_orthogonalize,
 )
 from .normuon import normuon_normalization_stacked, _normuon_normalization_core
@@ -55,7 +58,11 @@ class NorDion2(DistributedOrthoBase):
             assembled whole matrix -- layout-invariant/reproducible and better-
             converging. "local": per-shard top-k (union) -- cheaper comm but a
             sharding-dependent approximation that converges slightly worse; opt
-            in when comm-bound at large scale. No-op off the row-sharded path.
+            in when comm-bound at large scale. "global_capped": exact global
+            top-``ceil(fraction*global)`` selection at ~local comm cost via a
+            norms-only all-gather + pooled packed transport; overflow winners
+            deferred through error feedback (see Dion2, incl.
+            ``capacity_factor``). No-op off the row-sharded path.
 
     NorDion2 optimizer applying Dion2 update to NorMuon
     """
@@ -79,15 +86,21 @@ class NorDion2(DistributedOrthoBase):
         newton_schulz_func: Optional[Callable] = None,
         triton_post_ortho: bool = False,
         selection_scope: str = "global",
+        capacity_factor: Optional[float] = None,
     ):
         # Validate hyperparameters
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
         if not (0.0 < fraction <= 1.0):
             raise ValueError(f"fraction must be in (0, 1], got {fraction}")
-        if selection_scope not in ("local", "global"):
+        if selection_scope not in ("local", "global", "global_capped"):
             raise ValueError(
-                f"selection_scope must be 'local' or 'global', got {selection_scope!r}"
+                f"selection_scope must be 'local', 'global', or 'global_capped', "
+                f"got {selection_scope!r}"
+            )
+        if capacity_factor is not None and capacity_factor < 1.0:
+            raise ValueError(
+                f"capacity_factor must be None (auto) or >= 1.0, got {capacity_factor}"
             )
         if mu < 0.0:
             raise ValueError(f"Invalid momentum factor (mu): {mu}")
@@ -114,6 +127,7 @@ class NorDion2(DistributedOrthoBase):
             algorithm="nordion2",
             step=0,
             selection_scope=selection_scope,
+            capacity_factor=capacity_factor,
         )
         super().__init__(
             params, distributed_mesh, "nordion2", defaults,
@@ -155,6 +169,9 @@ class NorDion2(DistributedOrthoBase):
         Mega-batched NorDion2 task creation: groups ALL same-shape parameters
         into a single task to minimize communication rounds and kernel launches.
         """
+        # New optimizer step: reset the rank-local capped-deferral counters so
+        # they accumulate exactly this step's packed megabatches.
+        CAPPED_STATS.clear()
         for group in param_groups:
             assert group["algorithm"] == self._algo_name
             assert all(
@@ -180,6 +197,7 @@ class NorDion2(DistributedOrthoBase):
                 newton_schulz_func=self._newton_schulz_func,
                 triton_post_ortho=self._triton_post_ortho,
                 selection_scope=group["selection_scope"],
+                capacity_factor=group["capacity_factor"],
             )
 
             shape_groups: dict[tuple, list] = defaultdict(list)
@@ -246,6 +264,7 @@ def nordion2_update_megabatch_async(
     newton_schulz_func: Optional[Callable] = None,
     triton_post_ortho: bool = False,
     selection_scope: str = "global",
+    capacity_factor: Optional[float] = None,
 ) -> Generator[None, None, None]:
     """
     Mega-batched NorDion2 update: processes ALL same-shape parameters in one
@@ -266,7 +285,6 @@ def nordion2_update_megabatch_async(
 
     # comm_dim for sharded communication: use select_dim
     comm_dim = select_dim if is_sharded else None
-    global_scope = selection_scope == "global" and comm_dim is not None
 
     # On the sharded path X[0] must still be a DTensor, so .shape[comm_dim]
     # is the unsharded global size. The megabatch fn uses this to compute
@@ -282,6 +300,85 @@ def nordion2_update_megabatch_async(
         global_dim_size = X[0].shape[comm_dim]
     else:
         global_dim_size = None
+
+    # --- "global_capped" packed-path decision; mirrors dion2 (see there) ---
+    capped_packed = (
+        selection_scope == "global_capped"
+        and comm_dim is not None
+        and process_group is not None
+        and X[0].ndim == 2
+    )
+    if capped_packed:
+        padded_local = (global_dim_size + world_size - 1) // world_size
+        k = max(1, int(math.ceil(fraction * padded_local)))
+        per_rank = (N + world_size - 1) // world_size
+        if capacity_factor is None:
+            c = 1.0 + 2.0 * math.sqrt((1.0 - 1.0 / world_size) / (per_rank * k))
+        else:
+            c = float(capacity_factor)
+        budget = int(math.ceil(c * per_rank * k))
+        # Route to exact "global" when packing cannot pay for itself -- the
+        # packed chunk sends 1 + budget rows (count header included), so
+        # break-even against sending the full shard is budget + 1 -- or when
+        # the int32 count header cannot fit in the chunk's first row (2 bf16
+        # slots per matrix).
+        if budget + 1 >= per_rank * padded_local or 2 * per_rank > X[0].shape[-1]:
+            capped_packed = False
+
+    global_scope = comm_dim is not None and (
+        selection_scope == "global"
+        or (selection_scope == "global_capped" and not capped_packed)
+    )
+
+    if capped_packed:
+        # --- "global_capped": winner-only packed transport (see dion2) ---
+        # Returns full-size shards, zero except at applied winner rows -- the
+        # masked post's format. Deferred winners skip both EF decay and the
+        # muon_beta2 variance update (the masked post only touches nonzero
+        # rows), so their momentum accumulates until they win a slot.
+        norms = dion2_pre_accumulate_norms(
+            G=to_local(G), M=to_local(M), select_dim=select_dim
+        )
+        U_ortho = yield from dion2_capped_packed_async(
+            M_local=to_local(M),
+            norms=norms,
+            padded_local=padded_local,
+            fraction=fraction,
+            global_size=global_dim_size,
+            device_rank=device_rank,
+            world_size=world_size,
+            process_group=process_group,
+            per_rank=per_rank,
+            budget=budget,
+            kw=k * world_size,
+            newton_schulz_func=newton_schulz_func,
+            flatten=flatten,
+            epsilon=epsilon,
+        )
+        if adjust_lr is None:
+            adjusted_lr = lr
+        elif adjust_lr == "spectral_norm":
+            adjusted_lr = adjust_lr_spectral_norm(lr, X[0].shape, flatten=flatten)
+        elif adjust_lr == "rms_norm":
+            adjusted_lr = adjust_lr_rms_norm(lr, X[0].shape, flatten=flatten)
+        else:
+            raise ValueError(f"Unknown adjust_lr: {adjust_lr}")
+        _masked_post = nordion2_post_orthogonalize_masked
+        if triton_post_ortho:
+            from .dion2_triton import nordion2_post_orthogonalize_masked_triton as _masked_post
+        _masked_post(
+            X=to_local(X),
+            M=to_local(M),
+            V=to_local(V),
+            U=U_ortho,
+            base_lr=lr,
+            adjusted_lr=adjusted_lr,
+            weight_decay=weight_decay,
+            ef_decay=momentum,
+            muon_beta2=muon_beta2,
+            select_dim=select_dim,
+        )
+        return
 
     if global_scope:
         # --- Global selection: send the full shard, select after assembly ---
@@ -313,7 +410,10 @@ def nordion2_update_megabatch_async(
         # rows of M, runs NorMuon per-neuron normalization on the selected rows
         # (updating the local variance buffer V in place), and applies the
         # masked weight update -- all keyed off the nonzero mask, no indices.
-        nordion2_post_orthogonalize_masked(
+        _masked_post = nordion2_post_orthogonalize_masked
+        if triton_post_ortho:
+            from .dion2_triton import nordion2_post_orthogonalize_masked_triton as _masked_post
+        _masked_post(
             X=to_local(X),
             M=to_local(M),
             V=to_local(V),
