@@ -384,8 +384,12 @@ def nordion2_update_megabatch_async(
         )
         if selection_scope == "global_exact":
             # slots = max winner count this step => no deferral => exact global
-            # selection at (near-)local comm cost (see dion2).
-            k_comm = min(padded_local, max(1, int(kmax.item())))
+            # selection at (near-)local comm cost. Quantize into buckets (round
+            # UP, still >= kmax so still exact) so the compile-specialized k_comm
+            # does not thrash pre_orthogonalize's cache. See dion2.
+            kmax_i = max(1, int(kmax.item()))
+            q = max(1, padded_local // 16)
+            k_comm = min(padded_local, ((kmax_i + q - 1) // q) * q)
 
     # Update momentum and compute the inputs for orthogonalization
     # Dion2 pre-orthogonalizes differs from NorMuon by applying damping before updating momentum

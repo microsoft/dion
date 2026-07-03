@@ -417,7 +417,14 @@ def dion2_update_megabatch_async(
             norms, padded_local, k, world_size, process_group
         )
         if selection_scope == "global_exact":
-            k_comm = min(padded_local, max(1, int(kmax.item())))
+            kmax_i = max(1, int(kmax.item()))
+            # Quantize the dynamic slot count into a few buckets: pre_orthogonalize
+            # is torch.compile'd and SPECIALIZES on k_comm (an int arg), so a
+            # per-step-varying value thrashes the compile cache. Round UP so
+            # k_comm >= kmax -> every winner still fits -> selection stays exact,
+            # at <= q extra zero-slots of comm (q ~ padded_local/16).
+            q = max(1, padded_local // 16)
+            k_comm = min(padded_local, ((kmax_i + q - 1) // q) * q)
 
     # Pre-orthogonalize: momentum update + submatrix selection
     U_selected, indices_list = dion2_pre_orthogonalize(
