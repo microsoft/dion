@@ -15,6 +15,7 @@ from .megabatch_base import (
 )
 from .opt_utils import AsyncTask, to_local
 from .dion2 import (
+    CAPPED_STATS,
     dion2_pre_orthogonalize,
     dion2_post_orthogonalize,
     dion2_pre_accumulate,
@@ -168,6 +169,9 @@ class NorDion2(DistributedOrthoBase):
         Mega-batched NorDion2 task creation: groups ALL same-shape parameters
         into a single task to minimize communication rounds and kernel launches.
         """
+        # New optimizer step: reset the rank-local capped-deferral counters so
+        # they accumulate exactly this step's packed megabatches.
+        CAPPED_STATS.clear()
         for group in param_groups:
             assert group["algorithm"] == self._algo_name
             assert all(
@@ -313,10 +317,12 @@ def nordion2_update_megabatch_async(
         else:
             c = float(capacity_factor)
         budget = int(math.ceil(c * per_rank * k))
-        # Route to exact "global" when packing cannot pay for itself (slack
-        # reaches the full shard) or the int32 count header cannot fit in the
-        # chunk's first row (2 bf16 slots per matrix).
-        if budget >= per_rank * padded_local or 2 * per_rank > X[0].shape[-1]:
+        # Route to exact "global" when packing cannot pay for itself -- the
+        # packed chunk sends 1 + budget rows (count header included), so
+        # break-even against sending the full shard is budget + 1 -- or when
+        # the int32 count header cannot fit in the chunk's first row (2 bf16
+        # slots per matrix).
+        if budget + 1 >= per_rank * padded_local or 2 * per_rank > X[0].shape[-1]:
             capped_packed = False
 
     global_scope = comm_dim is not None and (

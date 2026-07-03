@@ -148,6 +148,9 @@ class Dion2(DistributedOrthoBase):
         Mega-batched Dion2 task creation: groups ALL same-shape parameters
         into a single task to minimize communication rounds and kernel launches.
         """
+        # New optimizer step: reset the rank-local capped-deferral counters so
+        # they accumulate exactly this step's packed megabatches.
+        CAPPED_STATS.clear()
         for group in param_groups:
             assert group["algorithm"] == self._algo_name
             assert all(
@@ -339,10 +342,12 @@ def dion2_update_megabatch_async(
         else:
             c = float(capacity_factor)
         budget = int(math.ceil(c * per_rank * k))
-        # Route to exact "global" when packing cannot pay for itself (slack
-        # reaches the full shard) or the int32 count header cannot fit in the
-        # chunk's first row (2 bf16 slots per matrix).
-        if budget >= per_rank * padded_local or 2 * per_rank > X[0].shape[-1]:
+        # Route to exact "global" when packing cannot pay for itself -- the
+        # packed chunk sends 1 + budget rows (count header included), so
+        # break-even against sending the full shard is budget + 1 -- or when
+        # the int32 count header cannot fit in the chunk's first row (2 bf16
+        # slots per matrix).
+        if budget + 1 >= per_rank * padded_local or 2 * per_rank > X[0].shape[-1]:
             capped_packed = False
 
     # Decide whether selection happens before communication ("local", and only
@@ -560,9 +565,13 @@ def dion2_pre_accumulate_norms(
     return torch.stack(M, dim=0).norm(p=1, dim=norm_dim).float()
 
 
-# Deferral instrumentation for the "global_capped" packed path. Updated per
-# megabatch step with GPU tensors (no host sync); external code may read and
-# log e.g. CAPPED_STATS["deferred_rows"] / CAPPED_STATS["winner_rows"].
+# Deferral instrumentation for the "global_capped" packed path. RANK-LOCAL
+# semantics: cleared once per optimizer step (at ortho-task creation) and
+# ACCUMULATED across that step's packed megabatches (shape groups), as GPU
+# scalar tensors -- reading them costs no sync until the consumer calls
+# .item(). Empty dict => no packed group ran this step (do not reuse stale
+# values). "winner_rows" counts THIS rank's winners and can legitimately be
+# zero; aggregate across ranks before forming a deferral ratio.
 CAPPED_STATS: dict = {}
 
 
@@ -689,7 +698,13 @@ def dion2_capped_pack(
     score = torch.where(winner, prio, torch.full_like(prio, float("-inf")))
     score_d = score.view(world_size, per_rank * local)
     b_eff = min(budget, per_rank * local)
-    vals, idxs = torch.topk(score_d, b_eff, dim=-1)
+    # Stable argsort (not topk): on tied normalized priorities the flat
+    # (matrix, row) order is the deterministic secondary key, so WHICH row
+    # defers on overflow is reproducible across runs/devices -- matching the
+    # stable tie contract of the winner selection itself.
+    order = torch.argsort(score_d, dim=-1, descending=True, stable=True)
+    idxs = order[:, :b_eff]
+    vals = torch.gather(score_d, 1, idxs)
     kept_flat = torch.zeros_like(score_d, dtype=torch.bool)
     kept_flat.scatter_(1, idxs, vals.isfinite())  # winners only; spare slots stay empty
     kept = kept_flat.view(world_size, per_rank, local)
@@ -849,8 +864,8 @@ def dion2_capped_packed_async(
     payload, counts, src_index, deferred = dion2_capped_pack(
         M_local, norms, winner, thresh, world_size, per_rank, budget
     )
-    CAPPED_STATS["deferred_rows"] = deferred
-    CAPPED_STATS["winner_rows"] = winner.sum()
+    CAPPED_STATS["deferred_rows"] = CAPPED_STATS.get("deferred_rows", 0) + deferred
+    CAPPED_STATS["winner_rows"] = CAPPED_STATS.get("winner_rows", 0) + winner.sum()
 
     # Header row: int32 counts bit-cast into bf16 (2 bf16 per int32). Counts
     # are NOT representable as bf16 *values* (exact only to 256); the bit-cast
