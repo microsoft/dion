@@ -22,6 +22,13 @@ All notable changes to this project are documented in this file.
   raises a clear `ImportError` at runtime instead of the kernels being silently
   present.
 
+- Bumped the optional `dion[gns]` extra to `gram-newton-schulz==0.1.6`
+  (`quack-kernels==0.5.0`, `nvidia-cutlass-dsl==4.5.2` unchanged). `0.1.6` turns off
+  quack's autotuner in the Gram Newton-Schulz kernel backend (gram-newton-schulz
+  PR #22), fixing a reserved-GPU-memory leak that laddered to OOM under sharded
+  training. It also lands the GNS algorithm-selection/transpose refactor
+  (gram-newton-schulz PR #18); the orthogonalization math is unchanged.
+
 - Bumped the optional `dion[gns]` extra to `gram-newton-schulz==0.1.5`
   (`quack-kernels==0.5.0`). This moves its transitive `nvidia-cutlass-dsl` pin from
   `4.4.2` to `4.5.2`, matching current Flash-Attention-4 / Blackwell stacks, so the
