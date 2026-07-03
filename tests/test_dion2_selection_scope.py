@@ -411,7 +411,7 @@ def _thresh_consistency_worker(rank, world_size, port):
         next(gen)
         raise AssertionError("generator should be exhausted after the collective")
     except StopIteration as e:
-        thresh = e.value
+        thresh, kmax = e.value
 
     assert thresh.shape == (N, 1)
     # (f) rank consistency: every rank must hold the bit-identical threshold.
@@ -423,6 +423,12 @@ def _thresh_consistency_worker(rank, world_size, port):
     winners = (norms >= thresh).sum()
     dist.all_reduce(winners)
     assert winners.item() == N * k * world_size
+    # kmax (for global_exact) is the max per-(rank, matrix) winner count and is
+    # rank-consistent (same gathered tensor); >= 1 and <= padded_local.
+    kmaxes = [torch.empty_like(kmax) for _ in range(world_size)]
+    dist.all_gather(kmaxes, kmax.contiguous())
+    assert torch.equal(kmaxes[0], kmaxes[1])
+    assert 1 <= int(kmax.item()) <= padded_local
     dist.destroy_process_group()
 
 

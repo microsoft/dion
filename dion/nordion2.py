@@ -92,10 +92,10 @@ class NorDion2(DistributedOrthoBase):
             raise ValueError(f"Invalid learning rate: {lr}")
         if not (0.0 < fraction <= 1.0):
             raise ValueError(f"fraction must be in (0, 1], got {fraction}")
-        if selection_scope not in ("local", "global", "global_capped"):
+        if selection_scope not in ("local", "global", "global_capped", "global_exact"):
             raise ValueError(
-                f"selection_scope must be 'local', 'global', or 'global_capped', "
-                f"got {selection_scope!r}"
+                f"selection_scope must be 'local', 'global', 'global_capped', or "
+                f"'global_exact', got {selection_scope!r}"
             )
         if capped_slack < 1.0:
             raise ValueError(
@@ -372,16 +372,20 @@ def nordion2_update_megabatch_async(
     # recovers once the row wins a slot.)
     thresh = None
     if (
-        selection_scope == "global_capped"
+        selection_scope in ("global_capped", "global_exact")
         and comm_dim is not None
         and process_group is not None
     ):
         norms = dion2_pre_accumulate_norms(
             G=to_local(G), M=to_local(M), select_dim=select_dim
         )
-        thresh = yield from dion2_capped_threshold_async(
+        thresh, kmax = yield from dion2_capped_threshold_async(
             norms, padded_local, k, world_size, process_group
         )
+        if selection_scope == "global_exact":
+            # slots = max winner count this step => no deferral => exact global
+            # selection at (near-)local comm cost (see dion2).
+            k_comm = min(padded_local, max(1, int(kmax.item())))
 
     # Update momentum and compute the inputs for orthogonalization
     # Dion2 pre-orthogonalizes differs from NorMuon by applying damping before updating momentum

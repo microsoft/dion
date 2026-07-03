@@ -87,10 +87,10 @@ class Dion2(DistributedOrthoBase):
             raise ValueError(f"Invalid learning rate: {lr}")
         if not (0.0 < fraction <= 1.0):
             raise ValueError(f"fraction must be in (0, 1], got {fraction}")
-        if selection_scope not in ("local", "global", "global_capped"):
+        if selection_scope not in ("local", "global", "global_capped", "global_exact"):
             raise ValueError(
-                f"selection_scope must be 'local', 'global', or 'global_capped', "
-                f"got {selection_scope!r}"
+                f"selection_scope must be 'local', 'global', 'global_capped', or "
+                f"'global_exact', got {selection_scope!r}"
             )
         if capped_slack < 1.0:
             raise ValueError(
@@ -397,22 +397,27 @@ def dion2_update_megabatch_async(
         k_comm = None
     global_comm_dim_size = global_dim_size
 
-    # "global_capped": accumulate momentum + all-gather the slice norms (one
-    # fp32 per slice, ~KBs), and hand the global top-(k*world_size) threshold to
-    # pre_orthogonalize, which applies the capacity rule (winners-only updates,
-    # zeros in spare slots). Same fixed k-slot comm as "local" below.
+    # "global_capped"/"global_exact": accumulate momentum + all-gather the slice
+    # norms (one fp32 per slice, ~KBs), and hand the global top-(k*world_size)
+    # threshold to pre_orthogonalize, which applies the capacity rule (winners-
+    # only updates, zeros in spare slots). "global_exact" additionally sets the
+    # comm-slot count k_comm to the max per-(rank, matrix) winner count this
+    # step, so EVERY winner fits with no deferral -- exact global selection at
+    # (near-)local comm cost, one scalar host sync for the dynamic k_comm.
     thresh = None
     if (
-        selection_scope == "global_capped"
+        selection_scope in ("global_capped", "global_exact")
         and comm_dim is not None
         and process_group is not None
     ):
         norms = dion2_pre_accumulate_norms(
             G=to_local(G), M=to_local(M), select_dim=select_dim
         )
-        thresh = yield from dion2_capped_threshold_async(
+        thresh, kmax = yield from dion2_capped_threshold_async(
             norms, padded_local, k, world_size, process_group
         )
+        if selection_scope == "global_exact":
+            k_comm = min(padded_local, max(1, int(kmax.item())))
 
     # Pre-orthogonalize: momentum update + submatrix selection
     U_selected, indices_list = dion2_pre_orthogonalize(
@@ -567,7 +572,15 @@ def dion2_capped_threshold_async(
     vals, _ = torch.topk(
         all_norms.permute(1, 0, 2).reshape(N, -1), k_total, dim=-1
     )
-    return vals[:, -1:]
+    thresh = vals[:, -1:]
+    # Also return the max per-(rank, matrix) winner count -- the "global_exact"
+    # scope uses this as its comm-slot count so EVERY winner fits with no
+    # deferral (exact global top-(k*world) selection). Padding rows are -1 and
+    # thresh >= 0 except in the degenerate everything-wins case (thresh == -1,
+    # where counting the pads correctly yields padded_local = the full shard).
+    # A device scalar -- the caller .item()s it only on the exact path.
+    kmax = (all_norms >= thresh.view(1, N, 1)).sum(dim=-1).max()
+    return thresh, kmax
 
 
 @_inductor_workaround
