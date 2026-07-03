@@ -256,11 +256,13 @@ def test_fraction_one_local_equals_global(OptCls, kw, tmp_path):
 
 
 def _capped_worker(rank, world_size, port, OptCls, scope, kw, out_path, shape,
-                   fraction, boost, steps):
+                   fraction, boost, steps, dtype):
     """Multi-step worker with a crafted gradient: small noise everywhere, plus
     rows in ``boost`` set to a constant so their momentum L1 norm is exactly the
     boost magnitude. Steps after the first use a zero gradient (isolates the
-    error-feedback dynamics). Saves the full W after every step."""
+    error-feedback dynamics). Saves the full W after every step. ``dtype`` sets
+    the param (and therefore momentum) dtype -- bf16 exercises the
+    mixed-precision EF write-back path that fp32 params can never reach."""
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     torch.cuda.set_device(rank)
@@ -270,8 +272,8 @@ def _capped_worker(rank, world_size, port, OptCls, scope, kw, out_path, shape,
 
     rows, cols = shape
     g = torch.Generator(device=dev).manual_seed(1234)
-    W0 = torch.randn(rows, cols, generator=g, device=dev)
-    G = torch.randn(rows, cols, generator=g, device=dev) * 0.01
+    W0 = torch.randn(rows, cols, generator=g, device=dev).to(dtype)
+    G = (torch.randn(rows, cols, generator=g, device=dev) * 0.01).to(dtype)
     for r, mag in boost.items():
         G[r] = mag / cols  # exact row L1 norm == mag
 
@@ -297,11 +299,12 @@ def _capped_worker(rank, world_size, port, OptCls, scope, kw, out_path, shape,
 
 
 def _run_capped(OptCls, scope, kw, port, tmp, *, shape=(16, 32), fraction=0.25,
-                boost=None, steps=1):
+                boost=None, steps=1, dtype=torch.float32):
     out = str(tmp / f"out_{port}.pt")
     mp.spawn(
         _capped_worker,
-        args=(2, port, OptCls, scope, kw, out, shape, fraction, boost or {}, steps),
+        args=(2, port, OptCls, scope, kw, out, shape, fraction, boost or {},
+              steps, dtype),
         nprocs=2,
         join=True,
     )
@@ -389,6 +392,27 @@ def test_capped_scope_empty_shard(tmp_path):
     dg = _run_sharded(Dion2, "global", 1.0, {}, 4, 29687, tmp_path,
                       shape=(3, 32))
     torch.testing.assert_close(dc["W"], dg["W"], rtol=BF16_RTOL, atol=BF16_ATOL)
+
+
+@pytest.mark.skipif(CUDA < 2, reason="needs 2 GPUs")
+@pytest.mark.parametrize("scope", ["local", "global_capped"])
+@pytest.mark.parametrize("OptCls,kw", [
+    (Dion2, {}),
+    (NorDion2, {"mu": 0.95, "muon_beta2": 0.95}),
+])
+def test_scope_bf16_momentum(OptCls, kw, scope, tmp_path):
+    """bf16 params (=> bf16 momentum) must run through the selection scopes.
+    Guards the EF write-back dtype: the capped-scope ef_factor is a
+    *dimensioned* fp32 tensor, and ``bf16 * fp32[N,k,1]`` type-promotes to
+    fp32, which the in-place ``scatter_`` into bf16 momentum rejects with
+    "Expected self.dtype to be equal to src.dtype". A 0-dim fp32 scalar (the
+    pre-capped code, and the local branch) does NOT promote, so fp32-param
+    tests can never catch this -- it only fires in real bf16 training."""
+    port = 29690 + (scope == "global_capped") * 2 + (OptCls is NorDion2)
+    d = _run_capped(OptCls, scope, kw, port, tmp_path, dtype=torch.bfloat16)
+    W = d["Ws"][0]
+    assert torch.isfinite(W.float()).all()
+    assert not torch.equal(W, d["W0"])  # the step actually applied an update
 
 
 def _thresh_consistency_worker(rank, world_size, port):

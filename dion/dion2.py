@@ -683,9 +683,13 @@ def dion2_pre_orthogonalize(
     # Apply error feedback decay to selected slices in the original M tensors
     # (capped scope: winners only). We reuse the already-gathered slices and
     # write them back (scaled) using scatter_, which places values into
-    # positions specified by the index tensor.
+    # positions specified by the index tensor. The .to(dtype) matters for bf16
+    # momentum: the capped ef_factor is a *dimensioned* fp32 tensor, so
+    # bf16 * fp32 promotes to fp32 (unlike the 0-dim ef_decay scalar, which
+    # loses promotion to a dimensioned bf16), and scatter_ requires src dtype
+    # to match M exactly. Multiply in fp32, round once into M's dtype.
     indices_list = list(indices.unbind(dim=0))
-    ef_src_list = list((selected_stacked * ef_factor).unbind(dim=0))
+    ef_src_list = list((selected_stacked * ef_factor).to(dtype).unbind(dim=0))
     for m, idx, ef_src in zip(M, indices_list, ef_src_list):
         if select_dim == -2:
             idx_exp = idx.unsqueeze(-1).expand(*idx.shape, m.size(-1))
