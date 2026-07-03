@@ -394,7 +394,10 @@ def dion2_update_megabatch_async(
             adjusted_lr = adjust_lr_rms_norm(lr, X[0].shape, flatten=flatten)
         else:
             raise ValueError(f"Unknown adjust_lr: {adjust_lr}")
-        dion2_post_orthogonalize_masked(
+        _masked_post = dion2_post_orthogonalize_masked
+        if triton_post_ortho:
+            from .dion2_triton import dion2_post_orthogonalize_masked_triton as _masked_post
+        _masked_post(
             X=to_local(X),
             M=to_local(M),
             U=U_ortho,
@@ -439,7 +442,10 @@ def dion2_update_megabatch_async(
         # U_ortho rows are exactly zero except at the globally-selected positions
         # this rank owns. Apply error-feedback decay to those rows of M and the
         # masked weight update, both keyed off the nonzero mask (no indices).
-        dion2_post_orthogonalize_masked(
+        _masked_post = dion2_post_orthogonalize_masked
+        if triton_post_ortho:
+            from .dion2_triton import dion2_post_orthogonalize_masked_triton as _masked_post
+        _masked_post(
             X=to_local(X),
             M=to_local(M),
             U=U_ortho,

@@ -363,7 +363,10 @@ def nordion2_update_megabatch_async(
             adjusted_lr = adjust_lr_rms_norm(lr, X[0].shape, flatten=flatten)
         else:
             raise ValueError(f"Unknown adjust_lr: {adjust_lr}")
-        nordion2_post_orthogonalize_masked(
+        _masked_post = nordion2_post_orthogonalize_masked
+        if triton_post_ortho:
+            from .dion2_triton import nordion2_post_orthogonalize_masked_triton as _masked_post
+        _masked_post(
             X=to_local(X),
             M=to_local(M),
             V=to_local(V),
@@ -407,7 +410,10 @@ def nordion2_update_megabatch_async(
         # rows of M, runs NorMuon per-neuron normalization on the selected rows
         # (updating the local variance buffer V in place), and applies the
         # masked weight update -- all keyed off the nonzero mask, no indices.
-        nordion2_post_orthogonalize_masked(
+        _masked_post = nordion2_post_orthogonalize_masked
+        if triton_post_ortho:
+            from .dion2_triton import nordion2_post_orthogonalize_masked_triton as _masked_post
+        _masked_post(
             X=to_local(X),
             M=to_local(M),
             V=to_local(V),
