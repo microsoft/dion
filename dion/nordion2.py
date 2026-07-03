@@ -85,6 +85,7 @@ class NorDion2(DistributedOrthoBase):
         newton_schulz_func: Optional[Callable] = None,
         triton_post_ortho: bool = False,
         selection_scope: str = "global",
+        capped_slack: float = 1.0,
     ):
         # Validate hyperparameters
         if lr < 0.0:
@@ -95,6 +96,11 @@ class NorDion2(DistributedOrthoBase):
             raise ValueError(
                 f"selection_scope must be 'local', 'global', or 'global_capped', "
                 f"got {selection_scope!r}"
+            )
+        if capped_slack < 1.0:
+            raise ValueError(
+                f"capped_slack must be >= 1.0 (slots = ceil(slack*k) >= the winner "
+                f"budget k), got {capped_slack}"
             )
         if mu < 0.0:
             raise ValueError(f"Invalid momentum factor (mu): {mu}")
@@ -121,6 +127,7 @@ class NorDion2(DistributedOrthoBase):
             algorithm="nordion2",
             step=0,
             selection_scope=selection_scope,
+            capped_slack=float(capped_slack),
         )
         super().__init__(
             params, distributed_mesh, "nordion2", defaults,
@@ -187,6 +194,7 @@ class NorDion2(DistributedOrthoBase):
                 newton_schulz_func=self._newton_schulz_func,
                 triton_post_ortho=self._triton_post_ortho,
                 selection_scope=group["selection_scope"],
+                capped_slack=group["capped_slack"],
             )
 
             shape_groups: dict[tuple, list] = defaultdict(list)
@@ -253,6 +261,7 @@ def nordion2_update_megabatch_async(
     newton_schulz_func: Optional[Callable] = None,
     triton_post_ortho: bool = False,
     selection_scope: str = "global",
+    capped_slack: float = 1.0,  # "global_capped" only: comm slots = ceil(slack*k); >1 defers fewer winners for a slack*-comm premium
 ) -> Generator[None, None, None]:
     """
     Mega-batched NorDion2 update: processes ALL same-shape parameters in one
@@ -343,8 +352,17 @@ def nordion2_update_megabatch_async(
     if comm_dim is not None:
         padded_local = (global_dim_size + world_size - 1) // world_size
         k = max(1, int(math.ceil(fraction * padded_local)))
+        # "global_capped" slack: more comm slots (k_comm) than the winner budget
+        # k so fewer winners overflow; the threshold below still uses k, so the
+        # selected set is unchanged. Clamped to padded_local. capped_slack=1.0
+        # (default) => k_comm==k, so default behavior is bit-identical. See dion2.
+        if selection_scope == "global_capped":
+            k_comm = min(padded_local, max(k, int(math.ceil(capped_slack * k))))
+        else:
+            k_comm = k
     else:
         k = None
+        k_comm = None
     global_comm_dim_size = global_dim_size
 
     # "global_capped": norms-only all-gather + global threshold; winners-only
@@ -373,7 +391,7 @@ def nordion2_update_megabatch_async(
         fraction=fraction,
         ef_decay=momentum,
         select_dim=select_dim,
-        k_override=k,
+        k_override=k_comm,
         thresh=thresh,
     )
 
@@ -388,7 +406,7 @@ def nordion2_update_megabatch_async(
         flatten=flatten,
         epsilon=epsilon,
         global_comm_dim_size=global_comm_dim_size,
-        local_comm_size=k,
+        local_comm_size=k_comm,
     )
 
     # Update variance neuron buffer for the selected rows and normalize the

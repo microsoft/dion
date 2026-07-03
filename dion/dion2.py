@@ -80,6 +80,7 @@ class Dion2(DistributedOrthoBase):
         verbose: bool = False,
         triton_post_ortho: bool = False,
         selection_scope: str = "global",
+        capped_slack: float = 1.0,
     ):
         # Validate hyperparameters
         if lr < 0.0:
@@ -90,6 +91,11 @@ class Dion2(DistributedOrthoBase):
             raise ValueError(
                 f"selection_scope must be 'local', 'global', or 'global_capped', "
                 f"got {selection_scope!r}"
+            )
+        if capped_slack < 1.0:
+            raise ValueError(
+                f"capped_slack must be >= 1.0 (slots = ceil(slack*k) >= the winner "
+                f"budget k), got {capped_slack}"
             )
         if ef_decay < 0.0:
             raise ValueError(f"Invalid ef_decay: {ef_decay}")
@@ -113,6 +119,7 @@ class Dion2(DistributedOrthoBase):
             algorithm="dion2",
             step=0,
             selection_scope=selection_scope,
+            capped_slack=float(capped_slack),
         )
         super().__init__(
             params, distributed_mesh, "dion2", defaults,
@@ -163,6 +170,7 @@ class Dion2(DistributedOrthoBase):
                 verbose=self.verbose,
                 triton_post_ortho=self._triton_post_ortho,
                 selection_scope=group["selection_scope"],
+                capped_slack=group["capped_slack"],
             )
 
             shape_groups: dict[tuple, list] = defaultdict(list)
@@ -226,6 +234,7 @@ def dion2_update_megabatch_async(
     verbose: bool = False,
     triton_post_ortho: bool = False,
     selection_scope: str = "global",  # "global" (exact whole-matrix top-k, default) or "local" (per-shard top-k; cheaper comm, sharding-variant)
+    capped_slack: float = 1.0,  # "global_capped" only: comm slots = ceil(slack*k); >1 defers fewer winners for a slack*-comm premium
 ) -> Generator[None, None, None]:
     """
     Mega-batched Dion2 update: processes ALL same-shape parameters in one
@@ -371,8 +380,21 @@ def dion2_update_megabatch_async(
     if comm_dim is not None:
         padded_local = (global_dim_size + world_size - 1) // world_size
         k = max(1, int(math.ceil(fraction * padded_local)))
+        # "global_capped" slack: allocate more comm slots (k_comm) than the
+        # winner budget k so fewer winners overflow (are deferred). The winner
+        # THRESHOLD below still uses k (top-k*world_size), so the selected set is
+        # unchanged -- only per-rank capacity grows; the extra slots carry
+        # zeroed non-winners (winners-only masking) or, once a rank's winners
+        # exceed k, more of its real winners. Clamped to padded_local (the full
+        # shard, == "global" comm cost). capped_slack=1.0 (default) => k_comm==k,
+        # so "local"/"global_capped" default behavior is bit-identical.
+        if selection_scope == "global_capped":
+            k_comm = min(padded_local, max(k, int(math.ceil(capped_slack * k))))
+        else:
+            k_comm = k
     else:
         k = None
+        k_comm = None
     global_comm_dim_size = global_dim_size
 
     # "global_capped": accumulate momentum + all-gather the slice norms (one
@@ -399,7 +421,7 @@ def dion2_update_megabatch_async(
         fraction=fraction,
         ef_decay=ef_decay,
         select_dim=select_dim,
-        k_override=k,
+        k_override=k_comm,
         thresh=thresh,
     )
 
@@ -414,7 +436,7 @@ def dion2_update_megabatch_async(
         flatten=flatten,
         epsilon=epsilon,
         global_comm_dim_size=global_comm_dim_size,
-        local_comm_size=k,
+        local_comm_size=k_comm,
     )
 
     # Compute scaled learning rate
@@ -685,7 +707,11 @@ def dion2_pre_orthogonalize(
     # write them back (scaled) using scatter_, which places values into
     # positions specified by the index tensor.
     indices_list = list(indices.unbind(dim=0))
-    ef_src_list = list((selected_stacked * ef_factor).unbind(dim=0))
+    # Cast the error-feedback write-back to M's dtype: ef_factor derives from the
+    # scalar ef_decay (float32), so selected_stacked(bf16) * ef_factor promotes to
+    # float32; scatter_ into a bf16 M requires matching dtype. fp32-then-cast is
+    # also numerically preferable to a bf16 multiply. (No-op when M is float32.)
+    ef_src_list = list((selected_stacked * ef_factor).to(dtype).unbind(dim=0))
     for m, idx, ef_src in zip(M, indices_list, ef_src_list):
         if select_dim == -2:
             idx_exp = idx.unsqueeze(-1).expand(*idx.shape, m.size(-1))
