@@ -142,7 +142,7 @@ def test_global_scope_k_uses_global_size_not_padded():
     deriving k from that padded size selects ceil(fraction*padded) slices -- more
     than the whole-matrix top-k, and a count that varies with world_size -- when
     global is not divisible by world_size, silently breaking the exact/reproducible
-    guarantee that motivates the global default. The existing sharded tests use a
+    guarantee that global scope provides. The existing sharded tests use a
     divisible matrix (16 rows, 2 ranks) so they never exercise this. Pure-CPU unit
     test of the wrapper (no GPUs, no distribution)."""
     import math
