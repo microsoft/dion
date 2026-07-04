@@ -169,6 +169,32 @@ def test_global_scope_k_uses_global_size_not_padded():
     assert out[global_rows:].abs().sum() == 0
 
 
+def test_default_selection_scope_is_local():
+    """The default ``selection_scope`` is "local" -- the sole behavior change of
+    #101. Pin it in one cheap CPU-only place (no GPUs, no distribution) so an
+    accidental re-flip, or drift between the four default sites -- ``Dion2`` and
+    ``NorDion2`` ``__init__`` and their ``*_update_megabatch_async`` functions --
+    is caught by CI. The convergence/throughput case for the value lives in the
+    A/B evidence; this only guards the constant and keeps the two optimizers (and
+    their direct-call entry points) in agreement."""
+    import inspect
+    from dion.dion2 import dion2_update_megabatch_async
+    from dion.nordion2 import nordion2_update_megabatch_async
+
+    p = torch.nn.Parameter(torch.randn(4, 6))
+    d2 = Dion2([dict(params=[p])], distributed_mesh=None, lr=0.1)
+    nd2 = NorDion2(
+        [dict(params=[p])], distributed_mesh=None, lr=0.1, mu=0.95, muon_beta2=0.95
+    )
+    assert d2.param_groups[0]["selection_scope"] == "local"
+    assert nd2.param_groups[0]["selection_scope"] == "local"
+
+    # The megabatch update functions carry their own default; a direct caller that
+    # omits selection_scope must see the same "local" the optimizer applies.
+    for fn in (dion2_update_megabatch_async, nordion2_update_megabatch_async):
+        assert inspect.signature(fn).parameters["selection_scope"].default == "local"
+
+
 @pytest.mark.skipif(CUDA < 2, reason="needs 2 GPUs")
 @pytest.mark.parametrize("OptCls,kw", [
     (Dion2, {}),
