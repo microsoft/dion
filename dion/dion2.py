@@ -44,11 +44,13 @@ class Dion2(DistributedOrthoBase):
             Signature is ``func(input: Tensor, epsilon: float) -> Tensor``.
         verbose: Whether to print debug information during updates. If True, it prints whether rows or columns are selected for the submatrix selection process.
         selection_scope: On the FSDP2 row-sharded path, how the orthogonalized
-            submatrix is selected. "global" (default): exact top-k on the
-            assembled whole matrix -- layout-invariant/reproducible and better-
-            converging. "local": per-shard top-k (union) -- cheaper comm but a
-            sharding-dependent approximation that converges slightly worse; opt
-            in when comm-bound at large scale. No-op off the row-sharded path.
+            submatrix is selected. "local" (default): per-shard top-k (union) --
+            cheaper comm (the win grows with model size), a sharding-dependent
+            approximation of the true top-k. "global": exact top-k on the
+            assembled whole matrix -- full comm, layout-invariant/reproducible.
+            The gap is scale-dependent (see megabatch docstring); they tie at
+            moderate scale, so "local" is the default. No-op off the row-sharded
+            path.
 
     Dion2 optimizer by Ahn et al.: TBD
     """
@@ -71,7 +73,7 @@ class Dion2(DistributedOrthoBase):
         newton_schulz_func: Optional[Callable] = None,
         verbose: bool = False,
         triton_post_ortho: bool = False,
-        selection_scope: str = "global",
+        selection_scope: str = "local",
     ):
         # Validate hyperparameters
         if lr < 0.0:
@@ -216,7 +218,7 @@ def dion2_update_megabatch_async(
     newton_schulz_func: Optional[Callable] = None,
     verbose: bool = False,
     triton_post_ortho: bool = False,
-    selection_scope: str = "global",  # "global" (exact whole-matrix top-k, default) or "local" (per-shard top-k; cheaper comm, sharding-variant)
+    selection_scope: str = "local",  # "local" (per-shard top-k, cheaper comm, default) or "global" (exact whole-matrix top-k; layout-invariant)
 ) -> Generator[None, None, None]:
     """
     Mega-batched Dion2 update: processes ALL same-shape parameters in one
@@ -225,18 +227,22 @@ def dion2_update_megabatch_async(
     ``selection_scope`` controls how the orthogonalized submatrix is chosen on
     the row-sharded path:
 
-    - ``"global"`` (default): the full shard is communicated (like NorMuon), the
-      top-k is taken on the assembled whole matrix, and Newton-Schulz runs on
-      that submatrix. Comm is full-size but the selected set is the exact global
+    - ``"local"`` (default): each rank picks its own top-k rows, and only those
+      rows are communicated and orthogonalized, so comm and Newton-Schulz cost
+      scale with ``fraction``. The selected set is the union of per-rank top-k --
+      a sharding-dependent approximation of the true top-k (world-size variant).
+      Cheaper comm, and the win grows with model size.
+    - ``"global"``: the full shard is communicated (like NorMuon), the top-k is
+      taken on the assembled whole matrix, and Newton-Schulz runs on that
+      submatrix. Comm is full-size but the selected set is the exact global
       top-k -- invariant to the sharding layout (reproducible across world
-      sizes) and, in A/B tests, better-converging than "local" (which under-
-      performed it by ~0.09 nat at matched steps on a 1.5B dense run).
-    - ``"local"``: each rank picks its own top-k rows, and only those rows are
-      communicated and orthogonalized, so comm and Newton-Schulz cost scale with
-      ``fraction``. The selected set is the union of per-rank top-k -- a
-      sharding-dependent approximation of the true top-k (world-size variant).
-      Cheaper comm (the win grows with model size), but converges slightly
-      worse; opt in when comm-bound at large scale.
+      sizes).
+
+    Convergence is scale/shard-dependent. At 1B (dense MixFormer, 8-way FSDP,
+    10B tokens) "local" and "global" tie within noise on train CE, downstream
+    CORE, and BPB; an earlier 1.5B dense A/B saw "local" trail by ~0.09 nat at
+    matched steps. "local" is the default for its lower comm; choose "global"
+    for exact layout-invariant selection or at scales where the gap matters.
 
     Off the row-sharded path (per-head, single-GPU, batch-sharded) each rank
     already holds whole matrices, so local and global selection coincide and
@@ -335,7 +341,7 @@ def dion2_update_megabatch_async(
         )
         return
 
-    # --- Local selection (opt-in, selection_scope="local"): per-shard top-k, communicate only the
+    # --- Local selection (default; selection_scope="local"): per-shard top-k, communicate only the
     # selected rows. Under FSDP2 contiguous chunking every rank holds at most
     # ``padded_local = ceil(global / world_size)`` rows, so a uniform
     # ``k = ceil(fraction * padded_local)`` is the per-rank selected count. We

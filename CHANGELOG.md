@@ -6,6 +6,17 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- The FSDP2 row-sharded `selection_scope` default (both `Dion2` and `NorDion2`)
+  is now `"local"` (per-shard top-k) again, reverting the `"global"` default from
+  #98 while keeping that PR's `global_select_size` padding-correctness fix intact.
+  `"local"` has cheaper per-shard communication (the win grows with matrix size)
+  and, in a 1B / 8-way-FSDP A/B, converges indistinguishably from `"global"`.
+  Note that `"local"` selection is sharding/world-size dependent, so default runs
+  are no longer bit-reproducible across world sizes; pass
+  `selection_scope="global"` for exact, layout-invariant selection (preferable at
+  larger scale or higher shard counts, where an earlier 1.5B A/B saw `"local"`
+  trail). No effect off the row-sharded path, where the two coincide.
+
 - AdamW scalar fallback now uses the base learning rate for LM head parameters,
   while Lion fallback keeps the `1 / sqrt(d_in)` LM-head scaling. This affects
   shipped `configs/*_160m.yaml` runs, which set `scalar_opt: adamw`.
