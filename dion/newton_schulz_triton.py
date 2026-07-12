@@ -46,6 +46,11 @@ def _get_autotune_configs():
 
 
 @triton.jit
+def _batch_offset(batch_idx, batch_stride):
+    return batch_idx.to(tl.int64) * batch_stride
+
+
+@triton.jit
 def _pid_to_block(
     pid,
     M,
@@ -116,8 +121,8 @@ def ns_line_1_kernel(
         return
 
     # Index into one matrix of batch
-    A_ptr += batch_idx * a_stride_b
-    C_ptr += batch_idx * c_stride_b
+    A_ptr += _batch_offset(batch_idx, a_stride_b)
+    C_ptr += _batch_offset(batch_idx, c_stride_b)
 
     # Create pointer arrays for A and A.T
     offs_m = (m_idx + tl.arange(0, BLOCK_SIZE_M)) % M
@@ -235,8 +240,8 @@ def ns_line_2_kernel(
         return
 
     # Index into one matrix of batch
-    A_ptr += batch_idx * a_stride_b
-    C_ptr += batch_idx * c_stride_b
+    A_ptr += _batch_offset(batch_idx, a_stride_b)
+    C_ptr += _batch_offset(batch_idx, c_stride_b)
 
     # Create pointer arrays for A and A.T
     offs_m = (m_idx + tl.arange(0, BLOCK_SIZE_M)) % M
@@ -403,9 +408,9 @@ def ns_line_3_kernel(
     )
 
     # Offset base pointers to this batch
-    B_ptr += batch * b_stride_b
-    X_ptr += batch * x_stride_b
-    C_ptr += batch * c_stride_b
+    B_ptr += _batch_offset(batch, b_stride_b)
+    X_ptr += _batch_offset(batch, x_stride_b)
+    C_ptr += _batch_offset(batch, c_stride_b)
 
     # Create index ranges for the tile
     offs_m = m_start + tl.arange(0, BLOCK_SIZE_M)
