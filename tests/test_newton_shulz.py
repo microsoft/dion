@@ -11,6 +11,7 @@ import torch
 
 from dion.newton_schulz_triton import (
     TRITON_AVAILABLE,
+    _batch_offset,
     ns_line_1,
     ns_line_2,
     newton_schulz_triton,
@@ -20,6 +21,21 @@ from dion.newton_schulz_triton import (
 torch._dynamo.config.cache_size_limit = 100  # noqa: SLF001
 
 CUDA_AVAILABLE = torch.cuda.is_available()
+
+if TRITON_AVAILABLE:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _fixed_offset_probe(out_ptr, batch_idx, batch_stride):
+        # Exercises the shipped helper: the multiply must happen in int64.
+        tl.store(out_ptr, _batch_offset(batch_idx, batch_stride))
+
+    @triton.jit
+    def _naive_offset_probe(out_ptr, batch_idx, batch_stride):
+        # Pre-fix behaviour: an int32 * int32 multiply that overflows.
+        tl.store(out_ptr, (batch_idx * batch_stride).to(tl.int64))
+
 
 # For bf16/f16, Triton should be at least as accurate as cuBLAS (multiplier=1).
 # For f32, Triton's tl.dot uses a less favorable internal reduction tree than
@@ -131,3 +147,53 @@ def test_newton_schulz_triton_vs_reference(m: int, n: int):
             f"Newton-Schulz implementations diverged: max diff {diff:.3e} "
             f"(shape={tuple(G.shape)}, dtype={G.dtype})"
         )
+
+
+# Regression tests for int64 batched pointer offsets (PR #102).
+#
+# Real Muon megabatches (e.g. the w13 tensor with shape [320, 2560, 3072]) push
+# the last batch's element offset past INT32_MAX. The per-matrix stride still
+# fits in int32, so the overflow comes purely from batch_idx * stride: the helper
+# must widen batch_idx to int64 before the multiply. These probes verify that in
+# ~one element of memory instead of allocating the multi-GB tensor it would take
+# to trigger the overflow through the public kernels.
+_NS_ROWS, _NS_COLS, _NS_BATCHES = 2560, 3072, 320
+_INT32_MAX = 2**31 - 1
+
+
+@pytest.mark.skipif(not TRITON_AVAILABLE, reason="triton not installed")
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA device required")
+def test_batch_offset_no_int32_overflow():
+    """_batch_offset computes batch_idx * stride in int64 for large batches."""
+    stride = _NS_ROWS * _NS_COLS  # 7,864,320 (fits in int32)
+    last_batch = _NS_BATCHES - 1  # 319
+    expected = last_batch * stride  # 2,508,718,080 (exceeds int32)
+    assert stride < _INT32_MAX
+    assert expected > _INT32_MAX
+
+    out = torch.zeros(1, dtype=torch.int64, device="cuda")
+    _fixed_offset_probe[(1,)](out, last_batch, stride)
+    assert out.item() == expected, f"overflow: got {out.item()}, want {expected}"
+
+    # The guard has teeth: the pre-fix int32 multiply wraps to a wrong (negative)
+    # offset for the same inputs, so a regression would fail the assert above.
+    naive = torch.zeros(1, dtype=torch.int64, device="cuda")
+    _naive_offset_probe[(1,)](naive, last_batch, stride)
+    assert naive.item() != expected
+    assert naive.item() < 0
+
+
+@pytest.mark.skipif(not TRITON_AVAILABLE, reason="triton not installed")
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA device required")
+def test_batch_offset_ttir_multiplies_in_i64():
+    """The generated TTIR performs the batch-offset multiply in i64."""
+    stride = _NS_ROWS * _NS_COLS
+    last_batch = _NS_BATCHES - 1
+    out = torch.zeros(1, dtype=torch.int64, device="cuda")
+    compiled = _fixed_offset_probe.warmup(out, last_batch, stride, grid=(1,))
+    ttir = compiled.asm["ttir"]
+
+    muli_lines = [ln for ln in ttir.splitlines() if "arith.muli" in ln]
+    assert muli_lines, f"no integer multiply found in TTIR:\n{ttir}"
+    non_i64 = [ln for ln in muli_lines if "i64" not in ln]
+    assert not non_i64, f"batch-offset multiply not in i64: {non_i64}"
