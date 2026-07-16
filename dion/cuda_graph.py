@@ -12,19 +12,30 @@ graph launch (GPU time unchanged), and the capture holds through the megabatch a
 Usage (drop-in around any optimizer whose step() is graph-safe -- no host syncs, fixed
 shapes, gradients living in stable ``.grad`` tensors):
 
-    opt = CudaGraphOptimizer(Dion2(param_groups, ...), warmup_steps=10)
+    inner = Dion2(param_groups, ...)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(inner, T_max=...)  # NOT the wrapper
+    opt = CudaGraphOptimizer(inner, warmup_steps=10)
     for batch in loader:
         loss = model(batch); loss.backward()
         opt.step()                    # eager for warmup_steps, then captured+replayed
         opt.zero_grad(set_to_none=False)   # MUST keep .grad tensors stable for replay
+        sched.step()
 
 Requirements / caveats:
+  * LR schedulers must be constructed on the *inner* optimizer: torch's ``LRScheduler``
+    rejects anything failing ``isinstance(opt, torch.optim.Optimizer)``, which this
+    wrapper is not. Scheduling still works -- the scheduler writes ``group["lr"]`` and the
+    wrapper pushes that into the device LR tensors before each replay.
   * ``loss.backward()`` must accumulate into the same ``p.grad`` tensors each step, so
     call ``zero_grad(set_to_none=False)`` (the wrapper enforces this). The first
     backward allocates ``.grad``; capture pins those buffers.
   * The step must not do a host sync (``.item()``/``.cpu()``) or change tensor shapes
     across steps. Dion2/NorDion2's selection *count* is fixed; only indices/values vary,
     which replay handles (it re-reads the live tensors).
+  * On the sharded path the graph holds the captured megabatch all-to-all, so the NCCL
+    ops outlive the step. ``dist.destroy_process_group()`` blocks while they are alive:
+    drop the wrapper (and any graph it holds) before tearing the process group down at
+    the end of a run, or shutdown hangs.
   * torch.compile is neither needed nor wanted under a graph (the graph already removes
     dispatch, and a fullgraph compile of the unrolled per-matrix loops is what makes the
     first step take minutes at many layers). Disable it for the wrapped optimizer.
@@ -44,10 +55,26 @@ import torch
 
 class CudaGraphOptimizer:
     def __init__(self, optimizer, warmup_steps: int = 10):
+        if warmup_steps < 1:
+            raise ValueError(
+                f"warmup_steps must be >= 1, got {warmup_steps}. Capture needs at least "
+                "one eager step to have allocated the optimizer state, cuBLAS workspaces "
+                "and NCCL buffers; capturing the first step instead allocates them inside "
+                "the graph and fails deep in the backend."
+            )
         self.optimizer = optimizer
         self.warmup_steps = warmup_steps
         self._step_count = 0
         self._graph: Optional[torch.cuda.CUDAGraph] = None
+
+    def __getattr__(self, name):
+        # Delegate the rest of the Optimizer API (state, defaults, add_param_group, ...).
+        # Only called for attributes not found normally, so the overrides below still win.
+        # ``optimizer`` is guarded because __getattr__ runs before __init__ assigns it
+        # (e.g. during unpickling), which would otherwise recurse forever.
+        if name == "optimizer":
+            raise AttributeError(name)
+        return getattr(self.optimizer, name)
 
     @property
     def param_groups(self):
@@ -96,7 +123,13 @@ class CudaGraphOptimizer:
         if self._step_count < self.warmup_steps:
             self.optimizer.step()
         elif self._graph is None:
+            # step() runs (and so does its host-side bookkeeping) while being traced.
             self._capture()
         else:
             self._graph.replay()
+            # Replay executes only the recorded device work, so any host-side per-step
+            # bookkeeping in step() has to be advanced here instead.
+            advance = getattr(self.optimizer, "_advance_host_step_counters", None)
+            if advance is not None:
+                advance()
         self._step_count += 1

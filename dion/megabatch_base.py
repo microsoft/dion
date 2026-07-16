@@ -18,6 +18,10 @@ from .polar_express import polar_express, polar_express_triton
 from .opt_utils import AsyncRuntime, AsyncTask, to_local
 from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
 
+# Param-group key holding the group's device LR tensor. Runtime scratch, not a
+# hyperparameter: state_dict() strips it and _group_lr_tensor() rebuilds it on demand.
+_LR_TENSOR_KEY = "_lr_dev"
+
 
 class DistributedOrthoBase(Optimizer):
     """
@@ -191,6 +195,17 @@ class DistributedOrthoBase(Optimizer):
             state["momentum"] = torch.zeros_like(param)
             if algo == "adamw":
                 state["variance"] = torch.zeros_like(param)
+        if algo == "adamw" and "step_dev" not in state:
+            # Device step counter for the capturable fused AdamW. The step has to live
+            # on-device for bias correction to advance under CUDA-graph replay, where
+            # step()'s host-side group["step"] increment does not run. Always fp32: the
+            # fused kernel requires it, and a param-dtype (bf16) counter would stop
+            # incrementing at 256. Initialized here rather than lazily at first use so it
+            # is present in state_dict() from construction, keeping the key set complete
+            # and rank-symmetric for distributed checkpointing (see __init__).
+            state["step_dev"] = torch.zeros(
+                (), dtype=torch.float32, device=to_local(param).device
+            )
         return state
 
     def _resolve_num_heads(self, group: dict) -> Optional[int]:
@@ -400,19 +415,76 @@ class DistributedOrthoBase(Optimizer):
         and the captured ops re-read it on every replay. float32 matches the dtype of the
         former ``torch.tensor(group["lr"])`` (so the update is unchanged) and is the dtype
         the fused AdamW kernel's ``tensor_lr`` overload requires."""
-        t = group.get("_lr_dev")
-        if t is None:
-            device = to_local(group["params"][0]).device
+        device = to_local(group["params"][0]).device
+        t = group.get(_LR_TENSOR_KEY)
+        # Rebuild on a device/dtype mismatch as well as on absence: a tensor restored from
+        # a checkpoint written by an older build lands on whatever device torch.load used,
+        # and a CPU LR is read once at capture and baked into the graph.
+        if t is None or t.device != device or t.dtype != dtype:
             t = torch.empty((), dtype=dtype, device=device)
             t.fill_(group["lr"])
-            group["_lr_dev"] = t
+            group[_LR_TENSOR_KEY] = t
         return t
 
     def _refresh_lr_tensors(self):
         for group in self.param_groups:
-            t = group.get("_lr_dev")
+            t = group.get(_LR_TENSOR_KEY)
             if t is not None:
                 t.fill_(group["lr"])
+
+    def _advance_host_step_counters(self):
+        """Advance the host-side ``group["step"]`` counters for a step that ran as a CUDA
+        graph replay. ``step()``'s python increment only runs when ``step()`` is actually
+        traced, so under replay the counter would otherwise freeze at its capture value and
+        be written stale into every subsequent checkpoint."""
+        for group in self.param_groups:
+            group["step"] += 1
+
+    def state_dict(self):
+        sd = super().state_dict()
+        # param_groups is serialized hyperparameter state; the cached device LR tensor is
+        # runtime scratch rebuilt from group["lr"], so keep it out of the checkpoint.
+        # Leaving it in writes a CUDA tensor into every checkpoint, and load_state_dict()
+        # copies the saved group dict over the live one -- resurrecting the LR tensor on
+        # whatever device torch.load() used (CPU, for the usual map_location="cpu" resume).
+        # A CPU LR tensor still trains eagerly, so the damage is silent: it is read once at
+        # capture and baked in, freezing a scheduled LR under replay.
+        for group in sd["param_groups"]:
+            group.pop(_LR_TENSOR_KEY, None)
+        return sd
+
+    def load_state_dict(self, state_dict):
+        super().load_state_dict(state_dict)
+        for group in self.param_groups:
+            # Drop any LR tensor a checkpoint from an older build carried in; the next
+            # _group_lr_tensor() call rebuilds it from the restored python group["lr"].
+            group.pop(_LR_TENSOR_KEY, None)
+            if group["algorithm"] != "adamw":
+                continue
+            for param in group["params"]:
+                state = self.state.get(param)
+                if state is not None:
+                    self._restore_step_tensor(state, param, group)
+
+    def _restore_step_tensor(self, state: dict, param: Tensor, group: dict) -> None:
+        """Repair a loaded AdamW device step counter.
+
+        Two ways ``Optimizer.load_state_dict()`` leaves it wrong. It casts state tensors to
+        the owning param's dtype (its ``step`` special case keys off the literal name, which
+        this is not), and a bf16 counter silently stops incrementing at 256 -- 256 + 1 == 256
+        in bf16. And a checkpoint written before the counter moved on-device has no entry at
+        all; there the host-side ``group["step"]`` is the value to resume from, since
+        restarting at 0 would replay AdamW's bias-correction warmup and spike the effective
+        LR on the first steps after every resume.
+        """
+        step = state.get("step_dev")
+        device = to_local(param).device
+        if step is None:
+            step = torch.empty((), dtype=torch.float32, device=device)
+            step.fill_(float(group["step"]))
+        elif step.dtype != torch.float32 or step.device != device:
+            step = step.to(dtype=torch.float32, device=device)
+        state["step_dev"] = step
 
     def _create_ortho_tasks(
         self, param_groups: List[dict]
@@ -457,15 +529,7 @@ class DistributedOrthoBase(Optimizer):
             states = [self._get_or_initialize_state(p, "adamw") for p in params]
             momentums = [s["momentum"] for s in states]
             variances = [s["variance"] for s in states]
-            # Per-param device step tensors for the capturable fused AdamW: the kernel
-            # increments each on-device and bias-corrects from it, so the step is not a
-            # host value baked into a CUDA graph at capture (which would freeze the bias
-            # correction under replay). Persisted in optimizer state.
-            step_tensors = []
-            for s, p in zip(states, params):
-                if "step_dev" not in s:
-                    s["step_dev"] = torch.zeros((), dtype=torch.float32, device=to_local(p).device)
-                step_tensors.append(s["step_dev"])
+            step_tensors = [s["step_dev"] for s in states]
 
             yield AsyncTask(
                 adamw_update_foreach_async(

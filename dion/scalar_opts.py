@@ -156,10 +156,21 @@ def adamw_update_foreach(
     where ``mask = (sign(M_new · X_orig) >= 0)``. We add back the decay that
     was over-applied on elements where momentum and param disagree in sign.
     """
+    if (step is None) == (state_steps is None):
+        raise ValueError(
+            "adamw_update_foreach takes exactly one of step (legacy, baked into the "
+            "kernel) or state_steps (device counters, CUDA-graph-capturable)."
+        )
+    if state_steps is not None and not isinstance(lr, Tensor):
+        raise TypeError(
+            "the capturable form requires lr as a device tensor; a python float is read "
+            "at capture time and baked into the graph, freezing a scheduled LR."
+        )
     if not X:
         return
     n = len(X)
     assert n == len(G) == len(M) == len(V)
+    assert state_steps is None or n == len(state_steps)
 
     beta1_f = float(beta1)
     beta2_f = float(beta2)
@@ -174,10 +185,10 @@ def adamw_update_foreach(
         # Capturable form. ``state_steps`` are per-param device tensors we increment
         # on-device here (``_fused_adamw_`` reads but does not increment them), so the
         # bias-correction step advances inside a CUDA graph instead of freezing at capture.
-        # grad_scale/found_inf MUST be passed (as None) with a Tensor ``lr``: they select
-        # the capturable ``tensor_lr`` overload; omitting them resolves to a different
-        # overload that misreads the step. Mirrors torch.optim's fused path
-        # (torch/optim/adam.py::_fused_adam).
+        # A Tensor ``lr`` selects the ``_fused_adamw_.tensor_lr`` overload, which reads the
+        # LR on-device; the float-lr overload bakes it in at capture. Mirrors torch.optim's
+        # fused path (torch/optim/adam.py::_fused_adam), including passing grad_scale and
+        # found_inf explicitly as None.
         torch._foreach_add_(state_steps, 1)
         torch._fused_adamw_(
             X, G, M, V, [],
@@ -210,10 +221,14 @@ def adamw_update_foreach(
         undo_masks = [(s < 0).to(x.dtype) for s, x in zip(signs, X_orig)]
         correction = torch._foreach_mul(X_orig, undo_masks)
         if state_steps is not None:
-            # Keep the LR scaling on-device (float(lr) would host-sync and bake the value).
+            # Keep the LR scaling on-device: float(lr) would host-sync and bake the value.
+            # _foreach_mul_ takes the 0-d tensor directly, so this stays one dispatch
+            # rather than one multiply (and one allocation) per param.
             torch._foreach_mul_(correction, wd_f)
-            correction = [c * lr for c in correction]
+            torch._foreach_mul_(correction, lr)
         else:
+            # Fold the scalars host-side, as before: (lr * wd) in one multiply is not
+            # bit-identical to scaling by wd then lr, and the legacy path must not move.
             torch._foreach_mul_(correction, float(lr) * wd_f)
         torch._foreach_add_(X, correction)
 
