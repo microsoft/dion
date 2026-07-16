@@ -151,6 +151,13 @@ class DistributedOrthoBase(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        # Push the (scheduler-updated) python LR into each group's persistent device LR
+        # tensor, so a CUDA-graph capture of this step reads a live LR under replay rather
+        # than baking the capture-time value. Skipped while capturing: the fill must stay
+        # OUTSIDE the graph, so CudaGraphOptimizer refreshes before each replay instead.
+        if not torch.cuda.is_current_stream_capturing():
+            self._refresh_lr_tensors()
+
         ortho_groups = []
         lion_groups = []
         adamw_groups = []
@@ -385,6 +392,28 @@ class DistributedOrthoBase(Optimizer):
 
         return is_batch_sharded, is_matrix_sharded, sharded_tensor_dim
 
+    def _group_lr_tensor(self, group: dict, dtype: torch.dtype = torch.float32) -> Tensor:
+        """Persistent device LR tensor for a group. Passing the LR as a device tensor the
+        optimizer reads (rather than a python float / CPU scalar baked into the kernels)
+        is what lets ``CudaGraphOptimizer`` capture the step under a scheduled LR: the
+        value is refreshed in place each step by ``_refresh_lr_tensors`` outside the graph,
+        and the captured ops re-read it on every replay. float32 matches the dtype of the
+        former ``torch.tensor(group["lr"])`` (so the update is unchanged) and is the dtype
+        the fused AdamW kernel's ``tensor_lr`` overload requires."""
+        t = group.get("_lr_dev")
+        if t is None:
+            device = to_local(group["params"][0]).device
+            t = torch.empty((), dtype=dtype, device=device)
+            t.fill_(group["lr"])
+            group["_lr_dev"] = t
+        return t
+
+    def _refresh_lr_tensors(self):
+        for group in self.param_groups:
+            t = group.get("_lr_dev")
+            if t is not None:
+                t.fill_(group["lr"])
+
     def _create_ortho_tasks(
         self, param_groups: List[dict]
     ) -> Generator["AsyncTask", None, None]:
@@ -408,7 +437,7 @@ class DistributedOrthoBase(Optimizer):
                     X=to_local(params),
                     G=to_local(gradients),
                     M=to_local(momentums),
-                    lr=torch.tensor(group["lr"]),
+                    lr=self._group_lr_tensor(group),
                     beta1=torch.tensor(group["beta1"]),
                     beta2=torch.tensor(group["beta2"]),
                     weight_decay=torch.tensor(group["weight_decay"]),
@@ -428,6 +457,15 @@ class DistributedOrthoBase(Optimizer):
             states = [self._get_or_initialize_state(p, "adamw") for p in params]
             momentums = [s["momentum"] for s in states]
             variances = [s["variance"] for s in states]
+            # Per-param device step tensors for the capturable fused AdamW: the kernel
+            # increments each on-device and bias-corrects from it, so the step is not a
+            # host value baked into a CUDA graph at capture (which would freeze the bias
+            # correction under replay). Persisted in optimizer state.
+            step_tensors = []
+            for s, p in zip(states, params):
+                if "step_dev" not in s:
+                    s["step_dev"] = torch.zeros((), dtype=torch.float32, device=to_local(p).device)
+                step_tensors.append(s["step_dev"])
 
             yield AsyncTask(
                 adamw_update_foreach_async(
@@ -435,11 +473,11 @@ class DistributedOrthoBase(Optimizer):
                     G=to_local(gradients),
                     M=to_local(momentums),
                     V=to_local(variances),
-                    lr=torch.tensor(group["lr"]),
+                    lr=self._group_lr_tensor(group, torch.float32),
                     beta1=torch.tensor(group["beta1"]),
                     beta2=torch.tensor(group["beta2"]),
                     weight_decay=torch.tensor(group["weight_decay"]),
-                    step=torch.tensor(group["step"]),
+                    state_steps=step_tensors,
                     epsilon=torch.tensor(group["epsilon"]),
                     cautious_wd=group.get("cautious_wd", False),
                 )

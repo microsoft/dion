@@ -125,7 +125,7 @@ class Muon(DistributedOrthoBase):
                 continue
 
             update_args = dict(
-                lr=torch.tensor(group["lr"]),
+                lr=self._group_lr_tensor(group),
                 momentum=torch.tensor(group["mu"]),
                 weight_decay=torch.tensor(group["weight_decay"]),
                 epsilon=torch.tensor(group["epsilon"]),

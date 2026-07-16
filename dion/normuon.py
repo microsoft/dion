@@ -148,7 +148,7 @@ class NorMuon(DistributedOrthoBase):
                 continue
 
             update_args = dict(
-                lr=torch.tensor(group["lr"]),
+                lr=self._group_lr_tensor(group),
                 momentum=torch.tensor(group["mu"]),
                 muon_beta2=torch.tensor(group["muon_beta2"]),
                 weight_decay=torch.tensor(group["weight_decay"]),
