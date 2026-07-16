@@ -314,6 +314,54 @@ class TestDion2:
         params = _make_params([(64, 128)] * 5)
         _run_steps(Dion2, params, dict(lr=0.01))
 
+    def test_post_orthogonalize_batched_matches_per_matrix(self):
+        """The batched write-back must be bit-exact with the per-matrix scatter_add
+        for fp32 params and a bf16 update -- the PR's core bit-exactness claim.
+
+        The existing determinism tests only compare the batched path against itself
+        (same seed), so nothing pins the batched compiled path to an independent
+        per-matrix fp32 reference. This does, across both select_dim orientations.
+        """
+        from dion.dion2 import dion2_post_orthogonalize
+
+        for select_dim in (-2, -1):
+            torch.manual_seed(7)
+            n, rows, cols, k = 5, 16, 12, 3
+            X0 = [
+                torch.randn(rows, cols, dtype=torch.float32, device=DEVICE)
+                for _ in range(n)
+            ]
+            if select_dim == -2:
+                U = [torch.randn(k, cols, dtype=torch.bfloat16, device=DEVICE) for _ in range(n)]
+                norm_len = rows
+            else:
+                U = [torch.randn(rows, k, dtype=torch.bfloat16, device=DEVICE) for _ in range(n)]
+                norm_len = cols
+            indices = [torch.randperm(norm_len, device=DEVICE)[:k] for _ in range(n)]
+            base_lr = torch.tensor(0.01, dtype=torch.float32, device=DEVICE)
+            adjusted_lr = torch.tensor(0.003, dtype=torch.float32, device=DEVICE)
+            weight_decay = torch.tensor(0.1, dtype=torch.float32, device=DEVICE)
+
+            # Per-matrix reference: weight decay, then cast U to the param dtype
+            # BEFORE scaling so the multiply runs in fp32.
+            X_ref = [x.clone() for x in X0]
+            torch._foreach_mul_(X_ref, 1 - base_lr * weight_decay)
+            neg_lr = -adjusted_lr
+            for x, u, idx in zip(X_ref, U, indices):
+                u_scaled = neg_lr * u.to(x.dtype)
+                if select_dim == -2:
+                    idx_exp = idx.unsqueeze(-1).expand_as(u_scaled)
+                else:
+                    idx_exp = idx.unsqueeze(-2).expand_as(u_scaled)
+                x.scatter_add_(dim=select_dim, index=idx_exp, src=u_scaled)
+
+            X_test = [x.clone() for x in X0]
+            dion2_post_orthogonalize(
+                X_test, U, indices, base_lr, adjusted_lr, weight_decay, select_dim
+            )
+            for xt, xr in zip(X_test, X_ref):
+                assert torch.equal(xt, xr)
+
     def test_select_dim_rows_vs_cols(self):
         """Tall matrices select columns, wide select rows."""
         from dion import Dion2

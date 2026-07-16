@@ -419,17 +419,34 @@ def dion2_update_megabatch_async(
         )
 
 
-# Workaround for a torch.compile bug in PyTorch ≤2.11's inductor backend:
-# the post-fusion loop reordering pass crashes when ForeachKernelSchedulerNode
-# appears inside a FusedSchedulerNode.  Only triggered by recompilation across
-# different tensor dimensionalities (e.g. 2D then 3D).
+# Workaround for a torch.compile bug in the inductor backend: a post-fusion pass
+# crashes with
+#   AttributeError: 'ForeachKernelSchedulerNode' object has no attribute '_body'
+# when a ForeachKernelSchedulerNode appears inside a FusedSchedulerNode.  Two
+# passes reach into node._body (which a ForeachKernelSchedulerNode lacks), so the
+# crash surfaces from whichever runs on a given torch: loop_ordering_after_fusion
+# on <=2.11, loop_index_inversion_in_fusion on 2.13.  It is triggered by
+# recompilation across tensor dimensionalities (the empty-shard 2D early-return
+# path then the stacked 3D batched path), which the batched pre/post scatter loops
+# hit via torch._foreach_copy_ over the unstacked result.  Disable both passes
+# (each is only a fusion-quality heuristic, so turning it off is safe) for any
+# version we don't know to be fixed.  The guard parses a (major, minor) tuple
+# because a plain string compare mis-orders multi-digit minors ("2.9" > "2.13")
+# and treats "2.13.0+cuXXX" as >= "2.13".
 # https://github.com/pytorch/pytorch/issues/176591
-# TODO: remove this decorator when pytorch/pytorch#176591 is fixed.
-_inductor_workaround = (
-    torch._inductor.config.patch(loop_ordering_after_fusion=False)
-    if torch.__version__ < "2.13"
-    else lambda fn: fn
-)
+# TODO: drop the decorator (and tighten the bound) once the fix lands upstream.
+_torch_major_minor = tuple(int(p) for p in torch.__version__.split("+")[0].split(".")[:2])
+if _torch_major_minor < (2, 14):
+    # Guard each flag with hasattr: loop_index_inversion_in_fusion is newer than
+    # loop_ordering_after_fusion, so an older torch in this range may not define it.
+    _foreach_fusion_flags = {
+        _name: False
+        for _name in ("loop_ordering_after_fusion", "loop_index_inversion_in_fusion")
+        if hasattr(torch._inductor.config, _name)
+    }
+    _inductor_workaround = torch._inductor.config.patch(**_foreach_fusion_flags)
+else:
+    _inductor_workaround = lambda fn: fn
 
 
 @_inductor_workaround
@@ -655,9 +672,11 @@ def dion2_post_orthogonalize_masked(
         x.add_((neg_lr * u).to(dtype))
 
 
-# NOTE: if this function starts failing with an InductorError on recompilation
-# across tensor ranks, apply the same _inductor_workaround used on
-# dion2_pre_orthogonalize above.  See pytorch/pytorch#176591.
+# Carries the same _inductor_workaround as dion2_pre_orthogonalize: the batched
+# write-back stacks X to 3D and copies back via torch._foreach_copy_, so on the
+# empty-shard path it recompiles across tensor dimensionalities and hits the
+# ForeachKernelSchedulerNode fusion crash (pytorch/pytorch#176591) without it.
+@_inductor_workaround
 @torch.compile(fullgraph=True)
 def dion2_post_orthogonalize(
     X: List[Tensor],
@@ -685,7 +704,13 @@ def dion2_post_orthogonalize(
     # unique per slice, so scatter_add is collision-free and this is bit-exact with the
     # per-tensor loop. scatter_add_ accumulates U into X at the selected positions.
     Xs = torch.stack(X, dim=0)
-    U_scaled = (neg_lr * torch.stack(U, dim=0)).to(dtype)
+    # Cast U up to the param dtype BEFORE scaling, matching the per-tensor loop
+    # (``u.to(dtype)`` then multiply). neg_lr is 0-dim, so in eager ``neg_lr * U``
+    # keeps U's bf16 dtype -- a same-category 0-dim operand does not upcast a
+    # dimensioned tensor -- and rounds the update to bf16; casting only after the
+    # multiply then relies on inductor fusing the cast to recover fp32. Casting
+    # first keeps the scaling in fp32 in both eager and compiled paths.
+    U_scaled = neg_lr * torch.stack(U, dim=0).to(dtype)
     idx = torch.stack(indices, dim=0)
     if select_dim == -2:
         idx_exp = idx.unsqueeze(-1).expand_as(U_scaled)
