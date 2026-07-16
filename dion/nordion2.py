@@ -168,7 +168,7 @@ class NorDion2(DistributedOrthoBase):
                 continue
 
             update_args = dict(
-                lr=self._group_lr_tensor(group),
+                lr=group["lr"],
                 fraction=group["fraction"],
                 momentum=torch.tensor(group["mu"]),
                 muon_beta2=torch.tensor(group["muon_beta2"]),

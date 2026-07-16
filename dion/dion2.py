@@ -142,7 +142,7 @@ class Dion2(DistributedOrthoBase):
                 continue
 
             update_args = dict(
-                lr=self._group_lr_tensor(group),
+                lr=group["lr"],
                 ef_decay=torch.tensor(group["ef_decay"]),
                 fraction=group["fraction"],
                 weight_decay=torch.tensor(group["weight_decay"]),

@@ -18,10 +18,6 @@ from .polar_express import polar_express, polar_express_triton
 from .opt_utils import AsyncRuntime, AsyncTask, to_local
 from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
 
-# Param-group key holding the group's device LR tensor. Runtime scratch, not a
-# hyperparameter: state_dict() strips it and _group_lr_tensor() rebuilds it on demand.
-_LR_TENSOR_KEY = "_lr_dev"
-
 
 class DistributedOrthoBase(Optimizer):
     """
@@ -130,6 +126,7 @@ class DistributedOrthoBase(Optimizer):
         # the (possibly overridden) _get_or_initialize_state.
         self._state_prepopulated = False
         for group in self.param_groups:
+            self._ensure_lr_tensor(group)
             self._prepopulate_group_state(group)
         self._state_prepopulated = True
 
@@ -145,6 +142,7 @@ class DistributedOrthoBase(Optimizer):
         # add_param_group calls that Optimizer.__init__ makes before this class
         # finishes setup; the __init__ loop above pre-populates those groups.
         if getattr(self, "_state_prepopulated", False):
+            self._ensure_lr_tensor(self.param_groups[-1])
             self._prepopulate_group_state(self.param_groups[-1])
 
     @torch.no_grad()
@@ -155,12 +153,14 @@ class DistributedOrthoBase(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        # Push the (scheduler-updated) python LR into each group's persistent device LR
-        # tensor, so a CUDA-graph capture of this step reads a live LR under replay rather
-        # than baking the capture-time value. Skipped while capturing: the fill must stay
-        # OUTSIDE the graph, so CudaGraphOptimizer refreshes before each replay instead.
+        # The LR is carried as a device tensor the kernels read directly (see
+        # _ensure_lr_tensor); a scheduler updates it in place outside the graph and every
+        # replay re-reads the live value. Re-materialize it here in case a caller assigned a
+        # python float since the last step. Skipped while capturing -- it must not allocate
+        # inside the graph, and warmup has already made it a tensor by then.
         if not torch.cuda.is_current_stream_capturing():
-            self._refresh_lr_tensors()
+            for group in self.param_groups:
+                self._ensure_lr_tensor(group)
 
         ortho_groups = []
         lion_groups = []
@@ -407,30 +407,27 @@ class DistributedOrthoBase(Optimizer):
 
         return is_batch_sharded, is_matrix_sharded, sharded_tensor_dim
 
-    def _group_lr_tensor(self, group: dict, dtype: torch.dtype = torch.float32) -> Tensor:
-        """Persistent device LR tensor for a group. Passing the LR as a device tensor the
-        optimizer reads (rather than a python float / CPU scalar baked into the kernels)
-        is what lets ``CudaGraphOptimizer`` capture the step under a scheduled LR: the
-        value is refreshed in place each step by ``_refresh_lr_tensors`` outside the graph,
-        and the captured ops re-read it on every replay. float32 matches the dtype of the
-        former ``torch.tensor(group["lr"])`` (so the update is unchanged) and is the dtype
-        the fused AdamW kernel's ``tensor_lr`` overload requires."""
-        device = to_local(group["params"][0]).device
-        t = group.get(_LR_TENSOR_KEY)
-        # Rebuild on a device/dtype mismatch as well as on absence: a tensor restored from
-        # a checkpoint written by an older build lands on whatever device torch.load used,
-        # and a CPU LR is read once at capture and baked into the graph.
-        if t is None or t.device != device or t.dtype != dtype:
-            t = torch.empty((), dtype=dtype, device=device)
-            t.fill_(group["lr"])
-            group[_LR_TENSOR_KEY] = t
-        return t
+    def _ensure_lr_tensor(self, group: dict) -> Tensor:
+        """Make ``group["lr"]`` a persistent 0-d device float32 tensor and return it.
 
-    def _refresh_lr_tensors(self):
-        for group in self.param_groups:
-            t = group.get(_LR_TENSOR_KEY)
-            if t is not None:
-                t.fill_(group["lr"])
+        The LR is carried as a device tensor the kernels read directly, so a ``torch.optim``
+        LR scheduler -- which updates a tensor ``lr`` in place -- drives a captured step
+        natively: the scheduler fills this tensor outside the graph and every replay re-reads
+        it, with no refresh plumbing. This is a no-op once the tensor exists on the right
+        device (the steady state, including right after a scheduler ``fill_``), so it adds no
+        per-step host sync. It rebuilds the tensor when the value is a python float (fresh
+        construction, or a caller assigning ``group["lr"] = 0.05``) or a wrong-device/dtype
+        tensor (restored from a checkpoint via ``map_location="cpu"``). float32 is what the
+        former ``torch.tensor(group["lr"])`` produced and the dtype the fused AdamW
+        ``tensor_lr`` overload requires. Construct any LR scheduler AFTER the optimizer (and
+        after ``load_state_dict``) so it binds to this tensor; a scheduler holding an earlier
+        reference would fill a tensor the kernels no longer read."""
+        device = to_local(group["params"][0]).device
+        lr = group["lr"]
+        if isinstance(lr, Tensor) and lr.device == device and lr.dtype == torch.float32:
+            return lr
+        group["lr"] = torch.full((), float(lr), dtype=torch.float32, device=device)
+        return group["lr"]
 
     def _advance_host_step_counters(self):
         """Advance the host-side ``group["step"]`` counters for a step that ran as a CUDA
@@ -442,23 +439,26 @@ class DistributedOrthoBase(Optimizer):
 
     def state_dict(self):
         sd = super().state_dict()
-        # param_groups is serialized hyperparameter state; the cached device LR tensor is
-        # runtime scratch rebuilt from group["lr"], so keep it out of the checkpoint.
-        # Leaving it in writes a CUDA tensor into every checkpoint, and load_state_dict()
-        # copies the saved group dict over the live one -- resurrecting the LR tensor on
-        # whatever device torch.load() used (CPU, for the usual map_location="cpu" resume).
-        # A CPU LR tensor still trains eagerly, so the damage is silent: it is read once at
-        # capture and baked in, freezing a scheduled LR under replay.
+        # lr is carried at runtime as a device tensor; serialize it as a plain float so
+        # checkpoints stay portable (no device baggage, human-readable, matches pre-feature
+        # checkpoints), and load_state_dict() rebuilds the device tensor. Serializing the
+        # tensor instead would ride a CUDA tensor into every checkpoint and come back on
+        # whatever device torch.load() used -- a CPU LR that still trains eagerly but is read
+        # once at capture and baked in, silently freezing a scheduled LR under replay.
+        # super().state_dict() copies each group dict, so replacing "lr" here does not touch
+        # the live optimizer.
         for group in sd["param_groups"]:
-            group.pop(_LR_TENSOR_KEY, None)
+            lr = group.get("lr")
+            if isinstance(lr, Tensor):
+                group["lr"] = float(lr)
         return sd
 
     def load_state_dict(self, state_dict):
         super().load_state_dict(state_dict)
         for group in self.param_groups:
-            # Drop any LR tensor a checkpoint from an older build carried in; the next
-            # _group_lr_tensor() call rebuilds it from the restored python group["lr"].
-            group.pop(_LR_TENSOR_KEY, None)
+            # Rebuild the device LR tensor from the loaded value (a float from a normal
+            # checkpoint, or a wrong-device tensor from one written by an earlier build).
+            self._ensure_lr_tensor(group)
             if group["algorithm"] != "adamw":
                 continue
             for param in group["params"]:
@@ -509,7 +509,7 @@ class DistributedOrthoBase(Optimizer):
                     X=to_local(params),
                     G=to_local(gradients),
                     M=to_local(momentums),
-                    lr=self._group_lr_tensor(group),
+                    lr=group["lr"],
                     beta1=torch.tensor(group["beta1"]),
                     beta2=torch.tensor(group["beta2"]),
                     weight_decay=torch.tensor(group["weight_decay"]),
@@ -537,7 +537,7 @@ class DistributedOrthoBase(Optimizer):
                     G=to_local(gradients),
                     M=to_local(momentums),
                     V=to_local(variances),
-                    lr=self._group_lr_tensor(group, torch.float32),
+                    lr=group["lr"],
                     beta1=torch.tensor(group["beta1"]),
                     beta2=torch.tensor(group["beta2"]),
                     weight_decay=torch.tensor(group["weight_decay"]),

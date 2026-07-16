@@ -53,8 +53,11 @@ def _run(params, opt, grad_seq, step_fn, lrs=None):
         p.grad = torch.zeros_like(p)
     for t, gs in enumerate(grad_seq):
         if lrs is not None:
+            # Update the LR *in place*, the way a torch LR scheduler does. group["lr"] is
+            # the device tensor the kernels read; reassigning a python float would swap the
+            # object out and leave the captured graph reading the stale one under replay.
             for g in opt.param_groups:
-                g["lr"] = lrs[t]
+                g["lr"].fill_(lrs[t])
         for p, g in zip(params, gs):
             p.grad.copy_(g)
         step_fn()
@@ -163,15 +166,62 @@ def test_scheduled_lr_tracks_after_resume(optimizer_cls):
     )
 
 
-def test_state_dict_carries_no_device_lr_tensor():
-    # param_groups is serialized hyperparameter state. A device tensor in there rides into
-    # every checkpoint and comes back as the wrong-device tensor on resume.
+def test_lr_is_device_tensor_but_checkpoints_as_float():
+    # Runtime: group["lr"] is the 0-d device fp32 tensor the kernels read (and a scheduler
+    # fills in place). Checkpoint: serialized as a plain float, so it stays portable and
+    # does not ride a CUDA tensor back onto the wrong device on resume.
     params, opt = _build(Dion2)
     _run(params, opt, _grad_seq(params)[:1], opt.step)
-    groups = opt.state_dict()["param_groups"]
-    assert all("_lr_dev" not in g for g in groups)
-    # ...and the live optimizer still has one, i.e. it was stripped, not disabled.
-    assert any("_lr_dev" in g for g in opt.param_groups)
+
+    for g in opt.param_groups:
+        lr = g["lr"]
+        assert torch.is_tensor(lr) and lr.is_cuda and lr.dtype == torch.float32 and lr.ndim == 0
+
+    for g in opt.state_dict()["param_groups"]:
+        assert type(g["lr"]) is float
+
+
+@pytest.mark.parametrize("optimizer_cls", OPTIMIZERS)
+def test_real_lr_scheduler_drives_captured_step(optimizer_cls):
+    # The elegance payoff: a stock torch LR scheduler on the inner optimizer drives the
+    # captured step with no wrapper LR plumbing, because it fills group["lr"] -- the exact
+    # device tensor the graph reads -- in place. Eager and captured runs must agree, and the
+    # captured run must actually move with the schedule (not freeze at the capture value).
+    grad_seq = _grad_seq(_build(optimizer_cls)[0])
+
+    def run(step_wrapped):
+        params, opt = _build(optimizer_cls)
+        # T_max small vs STEPS so the cosine sweeps a wide LR range across the run.
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=4, eta_min=1e-4)
+        step = CudaGraphOptimizer(opt, warmup_steps=WARMUP).step if step_wrapped else opt.step
+        for p in params:
+            p.grad = torch.zeros_like(p)
+        for gs in grad_seq:
+            for p, g in zip(params, gs):
+                p.grad.copy_(g)
+            step()
+            sched.step()
+        return [p.detach().clone() for p in params]
+
+    final_eager = run(step_wrapped=False)
+    final_graph = run(step_wrapped=True)
+    diff = max((a - b).abs().max().item() for a, b in zip(final_eager, final_graph))
+    assert diff <= 1e-5, f"{optimizer_cls.__name__}: scheduled capture-vs-eager diff {diff:.3e}"
+
+    # Guard against a frozen LR: rerun the graph at a constant LR and require it to differ.
+    params, opt = _build(optimizer_cls)
+    for p in params:
+        p.grad = torch.zeros_like(p)
+    wrap = CudaGraphOptimizer(opt, warmup_steps=WARMUP)
+    for gs in grad_seq:
+        for p, g in zip(params, gs):
+            p.grad.copy_(g)
+        wrap.step()
+    frozen = max((a - b).abs().max().item() for a, b in zip(final_graph, params))
+    assert frozen > 1e-3, (
+        f"{optimizer_cls.__name__}: scheduled and constant-LR captured runs agree to "
+        f"{frozen:.3e} -- the schedule looks frozen under replay"
+    )
 
 
 def test_resume_from_checkpoint_without_step_tensor():
@@ -275,7 +325,10 @@ def _dist_worker(rank, world_size, port, mode, out_path):
         for t, g in enumerate(grads):
             param.grad.copy_(g)
             for group in opt.param_groups:
-                group["lr"] = 0.1 * (0.25 + t / DIST_STEPS)  # scheduled, must track
+                # In place (as a scheduler does): group["lr"] is the device tensor the
+                # captured graph reads; reassigning a float would leave replay on the stale
+                # tensor.
+                group["lr"].fill_(0.1 * (0.25 + t / DIST_STEPS))  # scheduled, must track
             step_fn()
         torch.cuda.synchronize()
 

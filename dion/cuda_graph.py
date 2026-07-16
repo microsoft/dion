@@ -23,9 +23,13 @@ shapes, gradients living in stable ``.grad`` tensors):
 
 Requirements / caveats:
   * LR schedulers must be constructed on the *inner* optimizer: torch's ``LRScheduler``
-    rejects anything failing ``isinstance(opt, torch.optim.Optimizer)``, which this
-    wrapper is not. Scheduling still works -- the scheduler writes ``group["lr"]`` and the
-    wrapper pushes that into the device LR tensors before each replay.
+    rejects anything failing ``isinstance(opt, torch.optim.Optimizer)``, which this wrapper
+    is not. Scheduling still works with no wrapper plumbing -- ``group["lr"]`` is the device
+    tensor the captured graph reads, and the scheduler (bound to the inner optimizer, which
+    shares the same param_groups) fills it in place outside the graph, so every replay
+    re-reads the live value. A *scheduled* LR takes effect under replay only through such an
+    in-place update; reassigning a python float (``group["lr"] = 0.05``) swaps the tensor
+    out and leaves replay reading the stale one until the next eager step.
   * ``loss.backward()`` must accumulate into the same ``p.grad`` tensors each step, so
     call ``zero_grad(set_to_none=False)`` (the wrapper enforces this). The first
     backward allocates ``.grad``; capture pins those buffers.
@@ -41,12 +45,14 @@ Requirements / caveats:
     first step take minutes at many layers). Disable it for the wrapped optimizer.
   * Both the matrix (Muon/NorMuon/Dion2/NorDion2) path and the AdamW *scalar* path
     (embeddings / 1-D params) are capturable. Each group carries its learning rate as a
-    device tensor (``megabatch_base._group_lr_tensor``) that the wrapper refreshes before
-    each replay, so a *scheduled* LR takes effect under replay instead of freezing at the
-    capture value; and ``scalar_opts.adamw_update_foreach``'s capturable form keeps each
-    AdamW param's step as a device tensor and increments it on-device before the fused
-    kernel, so bias correction advances inside the graph. Verified bit-exact eager-vs-
-    replay for both a constant and a per-step-scheduled LR (``tests/test_cuda_graph.py``).
+    device tensor -- ``group["lr"]`` *is* that tensor -- which the kernels read directly, so
+    a ``torch.optim`` LR scheduler drives a captured step natively: it fills the tensor in
+    place outside the graph and every replay re-reads the live value, no refresh plumbing.
+    (Build the scheduler on the *inner* optimizer; ``group["lr"]`` is shared, so it updates
+    the exact tensor the captured graph reads.) The AdamW step is likewise a device tensor,
+    incremented on-device before the fused kernel so bias correction advances inside the
+    graph. Verified bit-exact eager-vs-replay for a constant and a per-step-scheduled LR,
+    including under a real ``CosineAnnealingLR`` (``tests/test_cuda_graph.py``).
 """
 
 from typing import Optional
@@ -113,13 +119,9 @@ class CudaGraphOptimizer:
         self._graph.replay()
 
     def step(self):
-        # Push the current (possibly scheduled) LR into the wrapped optimizer's device LR
-        # tensors here, OUTSIDE the graph, so the captured step reads the live value on
-        # every replay. The optimizer's own in-step refresh is skipped while capturing, so
-        # this is the only refresh the replay path gets.
-        refresh = getattr(self.optimizer, "_refresh_lr_tensors", None)
-        if refresh is not None:
-            refresh()
+        # No LR plumbing here: the wrapped optimizer carries each group's LR as the device
+        # tensor ``group["lr"]`` that the kernels read, and a scheduler fills it in place
+        # outside the graph, so every replay already re-reads the live value.
         if self._step_count < self.warmup_steps:
             self.optimizer.step()
         elif self._graph is None:
