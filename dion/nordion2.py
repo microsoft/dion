@@ -382,7 +382,7 @@ def nordion2_update_megabatch_async(
     U_stacked, V_stacked = nordion2_normalize_selected_stacked(
         U_stacked, V_stacked, indices, muon_beta2
     )
-    U_normed = [U_stacked[i] for i in range(N)]
+    U_normed = list(U_stacked.unbind(0))
     torch._foreach_copy_(V_local, list(V_stacked.unbind(0)))
 
     # Compute scaled learning rate

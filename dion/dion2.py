@@ -527,17 +527,15 @@ def dion2_pre_orthogonalize(
         )
         selected_stacked = torch.gather(M_stacked, dim=-1, index=indices_expanded)
 
-    # Apply error feedback decay to selected slices in the original M tensors.
-    # We reuse the already-gathered slices and write them back (scaled) using
-    # scatter_, which places values into positions specified by the index tensor.
+    # Apply error-feedback decay to the selected slices, batched over the whole shape
+    # group: one scatter into the stacked momentum plus a foreach copy-back, instead of
+    # one ``scatter_`` per matrix. The per-matrix loop was a large share of the opt-step
+    # host dispatch (~one scatter kernel per weight matrix per step); ``indices_expanded``
+    # already has the batched (N, k, cols)/(N, rows, k) shape, and the selected slices are
+    # unique per row/column, so this is bit-exact with the per-tensor loop.
+    M_stacked.scatter_(dim=select_dim, index=indices_expanded, src=selected_stacked * ef_decay)
+    torch._foreach_copy_(M, list(M_stacked.unbind(dim=0)))
     indices_list = list(indices.unbind(dim=0))
-    selected_list = list(selected_stacked.unbind(dim=0))
-    for m, idx, selected in zip(M, indices_list, selected_list):
-        if select_dim == -2:
-            idx_exp = idx.unsqueeze(-1).expand(*idx.shape, m.size(-1))
-        else:
-            idx_exp = idx.unsqueeze(-2).expand(*idx.shape[:-1], m.size(-2), idx.shape[-1])
-        m.scatter_(dim=select_dim, index=idx_exp, src=selected * ef_decay)
 
     # Convert to bf16 and unstack for communication
     U_selected = list(selected_stacked.to(dtype=torch.bfloat16).unbind(dim=0))
@@ -679,20 +677,22 @@ def dion2_post_orthogonalize(
 
     # Convert U to match parameter dtype
     dtype = X[0].dtype
-    U = [u.to(dtype=dtype) for u in U]
-    # Apply weight update
     neg_lr = -adjusted_lr
-    U_scaled = [neg_lr * u for u in U]
-    # Apply the orthogonalized update to only the selected rows/columns.
-    # scatter_add_ accumulates values into positions specified by the index tensor:
-    #   x[..., idx_exp[..., i, j], j] += u_scaled[..., i, j]  (for select_dim == -2)
-    # where i ranges over the k selected rows and j over all columns.
-    for x, u_scaled, idx in zip(X, U_scaled, indices):
-        if select_dim == -2:
-            idx_exp = idx.unsqueeze(-1).expand_as(u_scaled)
-        else:
-            idx_exp = idx.unsqueeze(-2).expand_as(u_scaled)
-        x.scatter_add_(dim=select_dim, index=idx_exp, src=u_scaled)
+    # Apply the orthogonalized update to the selected rows/columns, batched over the
+    # whole shape group: stack X/U/indices and do one scatter_add over the batch instead
+    # of one scatter_add_ per weight matrix (the per-matrix loop was ~one kernel per
+    # matrix per step, a large share of the opt-step host dispatch). Selected indices are
+    # unique per slice, so scatter_add is collision-free and this is bit-exact with the
+    # per-tensor loop. scatter_add_ accumulates U into X at the selected positions.
+    Xs = torch.stack(X, dim=0)
+    U_scaled = (neg_lr * torch.stack(U, dim=0)).to(dtype)
+    idx = torch.stack(indices, dim=0)
+    if select_dim == -2:
+        idx_exp = idx.unsqueeze(-1).expand_as(U_scaled)
+    else:
+        idx_exp = idx.unsqueeze(-2).expand_as(U_scaled)
+    Xs.scatter_add_(dim=select_dim, index=idx_exp, src=U_scaled)
+    torch._foreach_copy_(X, list(Xs.unbind(dim=0)))
 
 
 @torch.compile(fullgraph=True)
