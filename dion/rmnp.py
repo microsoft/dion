@@ -23,10 +23,11 @@ def row_normalize(X: Tensor, epsilon: float = 1e-8) -> Tensor:
 
         row_normalize(X)[i, :] = X[i, :] / (‖X[i, :]‖₂ + epsilon)
 
-    which is exactly ``(diag(X Xᵀ))^{-1/2} X``: Muon's orthogonalization
-    replaces the full ``(X Xᵀ)^{-1/2}`` by its diagonal, and the two coincide
-    when ``X Xᵀ`` is (block-)diagonally dominant -- the empirically observed
-    structure of the Transformer layerwise Hessian that motivates RMNP.
+    which is exactly ``(diag(X Xᵀ))^{-1/2} X``. RMNP thus replaces Muon's full
+    orthogonalization factor ``(X Xᵀ)^{-1/2}`` with its diagonal
+    ``(diag(X Xᵀ))^{-1/2}``, and the two coincide when ``X Xᵀ`` is
+    (block-)diagonally dominant -- the empirically observed structure of the
+    Transformer layerwise Hessian that motivates RMNP.
 
     Batched inputs of shape ``(..., d_out, d_in)`` are normalized along the
     last axis, matching the ``func(input, epsilon) -> Tensor`` contract of the
