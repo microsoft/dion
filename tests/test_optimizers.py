@@ -152,6 +152,70 @@ class TestNorMuon:
 
 
 # ---------------------------------------------------------------------------
+# RMNP
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA required")
+class TestRMNP:
+    def test_basic(self):
+        from dion import RMNP
+        params = _make_params([(64, 128), (128, 64)])
+        _run_steps(RMNP, params, dict(lr=0.01))
+
+    def test_determinism(self):
+        from dion import RMNP
+        p1 = _make_params([(64, 128)])
+        r1 = _run_steps(RMNP, p1, dict(lr=0.01))
+        p2 = _make_params([(64, 128)])
+        r2 = _run_steps(RMNP, p2, dict(lr=0.01))
+        assert torch.equal(r1[0], r2[0])
+
+    def test_params_change(self):
+        from dion import RMNP
+        params = _make_params([(64, 128)])
+        before = params[0].data.clone()
+        _run_steps(RMNP, params, dict(lr=0.01), n_steps=1)
+        assert not torch.equal(params[0].data, before)
+
+    def test_nesterov(self):
+        from dion import RMNP
+        params = _make_params([(64, 128)])
+        _run_steps(RMNP, params, dict(lr=0.01, nesterov=True))
+
+    def test_cautious_wd(self):
+        from dion import RMNP
+        params = _make_params([(64, 128)])
+        _run_steps(RMNP, params, dict(lr=0.01, cautious_wd=True))
+
+    def test_adjust_lr_options(self):
+        from dion import RMNP
+        for adjust_lr in ["spectral_norm", "rms_norm", None]:
+            params = _make_params([(64, 128)])
+            _run_steps(RMNP, params, dict(lr=0.01, adjust_lr=adjust_lr))
+
+    def test_megabatch_same_shape(self):
+        """Multiple same-shape params should be megabatched."""
+        from dion import RMNP
+        params = _make_params([(64, 128)] * 5)
+        _run_steps(RMNP, params, dict(lr=0.01))
+
+    def test_mixed_shapes(self):
+        """Different shapes go to different shape groups."""
+        from dion import RMNP
+        params = _make_params([(64, 128), (128, 64), (32, 32)])
+        _run_steps(RMNP, params, dict(lr=0.01))
+
+    def test_only_momentum_state(self):
+        """RMNP keeps no preconditioner state beyond momentum (no NS/variance buffers)."""
+        from dion import RMNP
+        params = _make_params([(64, 128)])
+        opt = RMNP(params, lr=0.01)
+        params[0].grad = torch.randn_like(params[0])
+        opt.step()
+        assert list(opt.state[params[0]].keys()) == ["momentum"]
+
+
+# ---------------------------------------------------------------------------
 # NorDion2
 # ---------------------------------------------------------------------------
 
@@ -407,6 +471,10 @@ class TestNumHeads:
         from dion import NorMuon
         self._run_parity(NorMuon, dict(lr=0.01))
 
+    def test_rmnp_matches_3d(self):
+        from dion import RMNP
+        self._run_parity(RMNP, dict(lr=0.01))
+
     def test_nordion2_matches_3d(self):
         from dion import NorDion2
         self._run_parity(NorDion2, dict(lr=0.01, fraction=0.5))
@@ -560,6 +628,13 @@ class TestSplitSizes:
         from dion import Muon
         self._run_parity(Muon, dict(lr=0.01), split_sizes=(16, 16, 16, 16))
 
+    def test_rmnp_matches_separate(self):
+        # RMNP row-normalizes each row independently, so per-block splitting is
+        # a no-op relative to normalizing the fused matrix (adjust_lr=None gives
+        # no per-block scaling); fused and separate updates coincide exactly.
+        from dion import RMNP
+        self._run_parity(RMNP, dict(lr=0.01))
+
     def test_normuon_matches_separate(self):
         from dion import NorMuon
         self._run_parity(NorMuon, dict(lr=0.01))
@@ -697,6 +772,18 @@ class TestMixedParamGroups:
                 p.grad = torch.randn_like(p)
             opt.step()
 
+    def test_rmnp_with_adamw_scalars(self):
+        from dion import RMNP
+        weights, biases = self._make_model_params()
+        opt = RMNP([
+            {"params": weights},
+            {"params": biases, "algorithm": "adamw"},
+        ], lr=0.01)
+        for step in range(3):
+            for p in weights + biases:
+                p.grad = torch.randn_like(p)
+            opt.step()
+
 
 # ---------------------------------------------------------------------------
 # Hyperparameter validation
@@ -725,6 +812,16 @@ class TestValidation:
         from dion import Muon
         with pytest.raises(ValueError):
             Muon(_make_params([(32, 64)]), adjust_lr="invalid")
+
+    def test_rmnp_invalid_mu(self):
+        from dion import RMNP
+        with pytest.raises(ValueError):
+            RMNP(_make_params([(32, 64)]), mu=-1.0)
+
+    def test_rmnp_invalid_adjust_lr(self):
+        from dion import RMNP
+        with pytest.raises(ValueError):
+            RMNP(_make_params([(32, 64)]), adjust_lr="invalid")
 
     def test_1d_param_rejected(self):
         """Ortho optimizers should reject 1D parameters."""

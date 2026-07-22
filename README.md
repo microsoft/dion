@@ -5,6 +5,7 @@ You can find the following optimizers:
 * [Muon](https://kellerjordan.github.io/posts/muon/)
 * [Dion2](https://arxiv.org/abs/2512.16928) and [Dion](https://arxiv.org/pdf/2504.05295) (Dion is a legacy optimizer; we recommend using Dion2)
 * [NorMuon](https://arxiv.org/abs/2510.05491) 
+* [RMNP](https://arxiv.org/abs/2603.20527) 
 
 
 ## Table of Contents
@@ -149,12 +150,12 @@ The practical effectiveness of orthonormal optimizers was first demonstrated by 
 
 Our current implementations support the following parallelization techniques:
 
-| Parallelization    | Dion | Dion2 | Muon | NorMuon |
-|--------------------|------|-------|------|---------| 
-| Single device      | Yes  |  Yes  | Yes  |   Yes   |
-| PyTorch DDP        | Yes  |  Yes  | Yes  |   Yes   |
-| PyTorch FSDP2      | Yes  |  Yes  | Yes  |   Yes   |
-| PyTorch FSDP2 + TP | Yes  |  No   | No   |   No    |
+| Parallelization    | Dion | Dion2 | Muon | NorMuon | RMNP |
+|--------------------|------|-------|------|---------|------|
+| Single device      | Yes  |  Yes  | Yes  |   Yes   | Yes  |
+| PyTorch DDP        | Yes  |  Yes  | Yes  |   Yes   | Yes  |
+| PyTorch FSDP2      | Yes  |  Yes  | Yes  |   Yes   | Yes  |
+| PyTorch FSDP2 + TP | Yes  |  No   | No   |   No    | No   |
 
 For faster performance, these optimizers will process parameters in batches and interleave multiple batches to overlap compute with communication.
 
@@ -164,6 +165,7 @@ We include optimizer implementations in the `dion/` directory of this repo.
 * `muon.py`: High-performance version of Muon. For sharded matrices, all-to-all communication is used to simultaneously unshard and distribute a batch of matrices. For replicated matrices, Muon will distribute work across all devices and all-gather final results.
 * **`dion2.py`**: High-performance implementation of Dion2, using a similar all-to-all communication pattern for distributed orthonormalization. Only an α-fraction of the momentum matrix is communicated and orthonormalized, significantly reducing both communication overhead and computation cost.
 * `normuon.py`: A variant of the Muon optimizer that introduces neuron-wise normalization to improve stability and convergence efficiency, modified to take similar arguments as `muon.py`. See [the paper](https://arxiv.org/abs/2510.05491) for more details.
+* `rmnp.py`: RMNP (Row-Momentum Normalized Preconditioning) replaces Muon's Newton-Schulz iteration with a single row-wise (input-dimension) ℓ₂ normalization of the momentum update, cutting the per-iteration cost from `O(mn·min(m,n))` to `O(mn)` for an `m×n` weight. It reuses Muon's momentum, distributed assembly, and weight update, so it takes the same arguments as `muon.py` (minus the Newton-Schulz-specific options). See [the paper](https://arxiv.org/abs/2603.20527) for more details.
 
 We also provide some reference implementations:
 
@@ -284,9 +286,9 @@ Requirements: the parameter must be 2D, `split_sizes` must sum to dim 0, and wit
 
 For our efficient distributed optimizers to work correctly, they need information about the model's parallelization scheme. This is provided by passing `DeviceMesh` objects during optimizer construction.
 
-### 1D Sharding Configuration (Dion2, Muon, NorMuon)
+### 1D Sharding Configuration (Dion2, Muon, NorMuon, RMNP)
 
-Most optimizers in this codebase (Dion2, Muon, NorMuon) currently support only 1D sharding. They accept a single 1D device mesh via the `distributed_mesh` argument and adapt their behavior based on how this mesh is used:
+Most optimizers in this codebase (Dion2, Muon, NorMuon, RMNP) currently support only 1D sharding. They accept a single 1D device mesh via the `distributed_mesh` argument and adapt their behavior based on how this mesh is used:
 
 - **If the mesh is used for parameter sharding**: The optimizer efficiently unshards parameters using all-to-all communication
 - **If the mesh is not used for sharding**: The optimizer distributes work across devices and all-gathers the final results
