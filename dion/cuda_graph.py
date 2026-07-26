@@ -29,18 +29,23 @@ Requirements / caveats:
   * The wrapper is a ``torch.optim.Optimizer`` subclass (so ``isinstance`` holds for
     Lightning and torch's ``LRScheduler``) that delegates all state to the inner optimizer;
     a scheduler may bind to either, since they share ``param_groups``. Scheduling works with
-    no wrapper plumbing -- ``group["lr"]`` is the device
-    tensor the captured graph reads, and the scheduler (bound to the inner optimizer, which
-    shares the same param_groups) fills it in place outside the graph, so every replay
-    re-reads the live value. A *scheduled* LR takes effect under replay only through such an
-    in-place update; reassigning a python float (``group["lr"] = 0.05``) swaps the tensor
-    out and leaves replay reading the stale one until the next eager step.
+    no wrapper plumbing -- ``group["lr"]`` is the device tensor the captured graph reads,
+    and a stock ``torch.optim`` scheduler fills it in place outside the graph, so every
+    replay re-reads the live value. Assigning a plain float (``group["lr"] = 0.05``, the
+    idiom of a hand-rolled schedule) also works: before capturing or replaying, the wrapper
+    asks the inner optimizer to push any such value back into the persistent tensor.
+    Optimizers outside this family have no such hook, so any hyperparameter they read as a
+    host-side python value -- an LR included -- is baked in at capture and stops changing.
   * ``loss.backward()`` must accumulate into the same ``p.grad`` tensors each step, so
     call ``zero_grad(set_to_none=False)`` (the wrapper enforces this). The first
     backward allocates ``.grad``; capture pins those buffers.
   * The step must not do a host sync (``.item()``/``.cpu()``) or change tensor shapes
     across steps. Dion2/NorDion2's selection *count* is fixed; only indices/values vary,
     which replay handles (it re-reads the live tensors).
+  * Which parameters take part is fixed at capture time: the step skips params whose
+    ``.grad`` is None, so a param that is frozen (or gets no tokens) during the warmup
+    steps is left out of the graph and stops being updated for the rest of the run, with
+    no error. Wrap only a step whose set of grad-carrying params is stable.
   * On the sharded path the graph holds the captured megabatch all-to-all, so the NCCL
     ops outlive the step. ``dist.destroy_process_group()`` blocks while they are alive:
     drop the wrapper (and any graph it holds) before tearing the process group down at
@@ -68,7 +73,12 @@ import torch
 
 
 class CudaGraphOptimizer(torch.optim.Optimizer):
-    def __init__(self, optimizer: torch.optim.Optimizer, warmup_steps: int = 10):
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        warmup_steps: int = 10,
+        capture_error_mode: str = "thread_local",
+    ):
         if warmup_steps < 1:
             raise ValueError(
                 f"warmup_steps must be >= 1, got {warmup_steps}. Capture needs at least "
@@ -84,6 +94,13 @@ class CudaGraphOptimizer(torch.optim.Optimizer):
         # on state_dict()/step().
         self.optimizer = optimizer
         self.warmup_steps = warmup_steps
+        # torch's cudaStreamCaptureMode. torch defaults to "global", which errors when
+        # *any* thread makes a capture-unsafe CUDA call while capture is underway -- and in
+        # a distributed run the ProcessGroupNCCL watchdog thread polls cudaEventQuery,
+        # which is exactly such a call. "thread_local" is what inductor uses for all of its
+        # own captures, for the same reason; it still catches unsafe calls made by the
+        # capturing thread, i.e. by the step itself.
+        self.capture_error_mode = capture_error_mode
         self._step_count = 0
         self._graph: Optional[torch.cuda.CUDAGraph] = None
         self._warned_set_to_none = False
@@ -115,7 +132,12 @@ class CudaGraphOptimizer(torch.optim.Optimizer):
         # torch.optim.Optimizer defines add_param_group, so (unlike state/defaults) it is
         # found on the base class and __getattr__ never delegates it -- override explicitly.
         # A new group is not in the captured graph; drop it so the next step re-captures.
+        # Restart the warmup as well: the new group's state, workspaces and comm buffers
+        # have never been touched by an eager step, and re-capturing straight away would
+        # allocate (or recompile) them inside the graph -- the failure warmup_steps exists
+        # to prevent.
         self._graph = None
+        self._step_count = 0
         return self.optimizer.add_param_group(param_group)
 
     def state_dict(self):
@@ -148,10 +170,25 @@ class CudaGraphOptimizer(torch.optim.Optimizer):
         # that replay the trajectory would be one step short (params/state/step frozen at
         # their pre-capture values for this call).
         torch.cuda.synchronize()
-        self._graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self._graph):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, capture_error_mode=self.capture_error_mode):
             self.optimizer.step()
-        self._graph.replay()
+        # Publish only once capture has succeeded. A graph left over from a failed capture
+        # is not replayable, and holding it here would turn one loud capture error into
+        # every later step silently replaying garbage.
+        self._graph = graph
+        graph.replay()
+
+    def _sync_host_hyperparams(self):
+        # The captured graph reads each group's LR from the device tensor that was live at
+        # capture time. A stock LR scheduler fills that tensor in place, so it needs
+        # nothing from us -- but the equally common `group["lr"] = 0.05` assignment
+        # replaces it with a float the graph will never see. step() reconciles that on the
+        # eager path; under capture/replay it either does not run at all (replay) or runs
+        # with capture already underway (capture), so do it here, before either.
+        sync = getattr(self.optimizer, "_sync_lr_tensors", None)
+        if sync is not None:
+            sync()
 
     def step(self, closure: Optional[Callable] = None):
         # Automatic-optimization frameworks (Lightning) call step(closure); the closure runs
@@ -159,21 +196,23 @@ class CudaGraphOptimizer(torch.optim.Optimizer):
         # first, then apply the captured update and return its loss. replay() launches on the
         # current stream -- where the closure's backward ran -- so the update is ordered after
         # the fresh gradients.
-        # No LR plumbing here: the wrapped optimizer carries each group's LR as the device
-        # tensor ``group["lr"]`` that the kernels read, and a scheduler fills it in place
-        # outside the graph, so every replay already re-reads the live value.
-        loss = closure() if closure is not None else None
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
         if self._step_count < self.warmup_steps:
             self.optimizer.step()
-        elif self._graph is None:
-            # step() runs (and so does its host-side bookkeeping) while being traced.
-            self._capture()
         else:
-            self._graph.replay()
-            # Replay executes only the recorded device work, so any host-side per-step
-            # bookkeeping in step() has to be advanced here instead.
-            advance = getattr(self.optimizer, "_advance_host_step_counters", None)
-            if advance is not None:
-                advance()
+            self._sync_host_hyperparams()
+            if self._graph is None:
+                # step() runs (and so does its host-side bookkeeping) while being traced.
+                self._capture()
+            else:
+                self._graph.replay()
+                # Replay executes only the recorded device work, so any host-side per-step
+                # bookkeeping in step() has to be advanced here instead.
+                advance = getattr(self.optimizer, "_advance_host_step_counters", None)
+                if advance is not None:
+                    advance()
         self._step_count += 1
         return loss

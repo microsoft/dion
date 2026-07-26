@@ -222,13 +222,11 @@ def adamw_update_foreach(
         correction = torch._foreach_mul(X_orig, undo_masks)
         if state_steps is not None:
             # Keep the LR scaling on-device: float(lr) would host-sync and bake the value.
-            # _foreach_mul_ takes the 0-d tensor directly, so this stays one dispatch
-            # rather than one multiply (and one allocation) per param.
-            torch._foreach_mul_(correction, wd_f)
-            torch._foreach_mul_(correction, lr)
+            # Fold (lr * wd) into one 0-d device scalar first, so the correction is a
+            # single foreach pass and the multiply order matches the legacy branch below
+            # -- scaling by wd and then by lr is not bit-identical to scaling by (lr*wd).
+            torch._foreach_mul_(correction, lr * wd_f)
         else:
-            # Fold the scalars host-side, as before: (lr * wd) in one multiply is not
-            # bit-identical to scaling by wd then lr, and the legacy path must not move.
             torch._foreach_mul_(correction, float(lr) * wd_f)
         torch._foreach_add_(X, correction)
 

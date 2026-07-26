@@ -47,17 +47,21 @@ def _grad_seq(params):
             for _ in range(STEPS)]
 
 
-def _run(params, opt, grad_seq, step_fn, lrs=None):
+def _run(params, opt, grad_seq, step_fn, lrs=None, assign_float_lr=False):
     # Stable .grad buffers (the graph pins them); refill in place, never reallocate.
     for p in params:
         p.grad = torch.zeros_like(p)
     for t, gs in enumerate(grad_seq):
         if lrs is not None:
-            # Update the LR *in place*, the way a torch LR scheduler does. group["lr"] is
-            # the device tensor the kernels read; reassigning a python float would swap the
-            # object out and leave the captured graph reading the stale one under replay.
+            # Two ways a caller sets the LR, both of which must reach the captured graph:
+            # in place (what a torch LR scheduler does to a tensor lr), or by assigning a
+            # plain float (the idiom of a hand-rolled schedule), which replaces the tensor
+            # the graph reads and so has to be pushed back into it before the next replay.
             for g in opt.param_groups:
-                g["lr"].fill_(lrs[t])
+                if assign_float_lr:
+                    g["lr"] = lrs[t]
+                else:
+                    g["lr"].fill_(lrs[t])
         for p, g in zip(params, gs):
             p.grad.copy_(g)
         step_fn()
@@ -130,6 +134,143 @@ def test_cudagraph_tracks_scheduled_lr(optimizer_cls):
         f"{optimizer_cls.__name__}: schedule looks frozen -- scheduled and constant runs "
         f"agree to {nontrivial:.3e}, so the test would pass even if the LR were baked"
     )
+
+
+@pytest.mark.parametrize("optimizer_cls", OPTIMIZERS)
+def test_cudagraph_tracks_lr_assigned_as_python_float(optimizer_cls):
+    # The other half of the LR contract: `for g in opt.param_groups: g["lr"] = x` -- how
+    # every hand-rolled warmup/decay sets the rate, and what torch's own scheduler does
+    # when the group's lr is not a tensor. It replaces the device tensor the graph reads
+    # with a float, so the wrapper has to push the value back into the persistent tensor
+    # before capturing and before each replay. Regression: it did not, and the assignment
+    # landing on the capture step left group["lr"] a float inside the capture, which
+    # recompiled the compiled update under an active capture and aborted it outright.
+    p0, o0 = _build(optimizer_cls)
+    base = float(o0.param_groups[0]["lr"])
+    grad_seq = _grad_seq(p0)
+    sched = [base * (0.25 + 1.5 * (t + 1) / STEPS) for t in range(STEPS)]
+    const = [base] * STEPS
+
+    pe, oe = _build(optimizer_cls)
+    final_eager = _run(pe, oe, grad_seq, oe.step, lrs=sched, assign_float_lr=True)
+
+    pg, og = _build(optimizer_cls)
+    wrap = CudaGraphOptimizer(og, warmup_steps=WARMUP)
+    final_graph = _run(pg, og, grad_seq, wrap.step, lrs=sched, assign_float_lr=True)
+
+    pc, oc = _build(optimizer_cls)
+    wrapc = CudaGraphOptimizer(oc, warmup_steps=WARMUP)
+    final_const = _run(pc, oc, grad_seq, wrapc.step, lrs=const, assign_float_lr=True)
+
+    tracks = max((a - b).abs().max().item() for a, b in zip(final_eager, final_graph))
+    nontrivial = max((a - b).abs().max().item() for a, b in zip(final_graph, final_const))
+    assert tracks <= 1e-5, (
+        f"{optimizer_cls.__name__}: graph did not track a float-assigned LR "
+        f"(diff {tracks:.3e})"
+    )
+    assert nontrivial > 1e-3, (
+        f"{optimizer_cls.__name__}: schedule looks frozen -- scheduled and constant runs "
+        f"agree to {nontrivial:.3e}, so the test would pass even if the LR were baked"
+    )
+    # The float must have been folded back into the one tensor the graph reads, not left
+    # sitting in the group where the next replay would ignore it.
+    assert all(torch.is_tensor(g["lr"]) for g in og.param_groups)
+
+
+def test_lr_tensor_identity_is_stable_across_reassignment():
+    # What makes replay correct is that the group keeps handing the kernels the *same*
+    # tensor object the graph recorded. Rebuilding it on each reassignment would leave
+    # every later replay reading a tensor nobody writes to any more.
+    params, opt = _build(Dion2)
+    _run(params, opt, _grad_seq(params)[:1], opt.step)
+    before = [g["lr"] for g in opt.param_groups]
+
+    for g in opt.param_groups:
+        g["lr"] = 0.007
+    opt._sync_lr_tensors()
+
+    for g, t in zip(opt.param_groups, before):
+        assert g["lr"] is t, "LR tensor was replaced instead of filled in place"
+        assert t.item() == pytest.approx(0.007)
+
+
+def test_empty_param_group_is_allowed():
+    # An empty group has no device to put an LR tensor on and no kernel to read it.
+    # It is legal in torch and was legal here before the LR moved on-device; keep it so.
+    torch.manual_seed(SEED)
+    weights = [torch.nn.Parameter(torch.randn(64, 128, device=DEVICE))]
+    opt = Dion2(
+        [{"params": weights}, {"params": [], "algorithm": "adamw"}],
+        distributed_mesh=None, lr=0.02,
+    )
+    weights[0].grad = torch.zeros_like(weights[0])
+    opt.step()
+    assert torch.is_tensor(opt.param_groups[0]["lr"])
+
+
+def test_add_param_group_rewarms_before_recapturing():
+    # A group added after capture has never been through an eager step, so its state,
+    # workspaces and compiled kernels are not warm. Re-capturing immediately allocates (or
+    # recompiles) inside the graph and fails; the wrapper must redo the warmup first.
+    params, opt = _build(Dion2)
+    wrap = CudaGraphOptimizer(opt, warmup_steps=2)
+    grad_seq = _grad_seq(params)
+    _run(params, opt, grad_seq[:5], wrap.step)
+    assert wrap._graph is not None
+
+    extra = torch.nn.Parameter(torch.randn(32, 32, device=DEVICE))
+    extra.grad = torch.zeros_like(extra)
+    wrap.add_param_group({"params": [extra]})
+    assert wrap._graph is None and wrap._step_count == 0
+
+    before = extra.detach().clone()
+    for gs in grad_seq[:4]:
+        for p, g in zip(params, gs):
+            p.grad.copy_(g)
+        extra.grad.normal_()
+        wrap.step()
+    assert not torch.equal(before, extra.detach()), "added param never got updated"
+
+
+def test_failed_capture_does_not_leave_a_replayable_graph():
+    # If capture dies (an allocation, a recompile, a host sync inside the step), the
+    # half-built graph must not be kept: replaying it later would apply garbage on every
+    # subsequent step, turning one loud error into silent corruption.
+    params, opt = _build(Dion2)
+    wrap = CudaGraphOptimizer(opt, warmup_steps=1)
+    for p in params:
+        p.grad = torch.zeros_like(p)
+    opt.step()
+
+    def boom(closure=None):
+        torch.zeros(4, device=DEVICE).add_(1)  # get some way into the capture first
+        raise RuntimeError("capture blew up")
+
+    opt.step = boom
+    with pytest.raises(RuntimeError, match="capture blew up"):
+        wrap.step()
+    assert wrap._graph is None
+
+
+def test_lr_sync_under_active_capture_is_an_error():
+    # _sync_lr_tensors writes to the device, so recording it into a graph would re-apply
+    # the capture-time LR on every replay and silently overwrite the scheduler. It must
+    # say so rather than do that.
+    params, opt = _build(Dion2)
+    for p in params:
+        p.grad = torch.zeros_like(p)
+    opt.step()
+
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+        torch.zeros(4, device=DEVICE).add_(1)  # keep the capture non-empty
+        for g in opt.param_groups:
+            g["lr"] = 0.5
+        with pytest.raises(RuntimeError, match="capture"):
+            opt._sync_lr_tensors()
+    del graph
+    torch.cuda.synchronize()
 
 
 @pytest.mark.parametrize("optimizer_cls", OPTIMIZERS)
