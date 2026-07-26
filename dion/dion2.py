@@ -430,13 +430,13 @@ def dion2_update_megabatch_async(
 # path then the stacked 3D batched path), which the batched pre/post scatter loops
 # hit via torch._foreach_copy_ over the unstacked result.  Disable both passes
 # (each is only a fusion-quality heuristic, so turning it off is safe) for any
-# version we don't know to be fixed.  The guard parses a (major, minor) tuple
-# because a plain string compare mis-orders multi-digit minors ("2.9" > "2.13")
-# and treats "2.13.0+cuXXX" as >= "2.13".
+# version we don't know to be fixed.  torch.__version__ is a TorchVersion, whose
+# comparisons are semantic rather than lexicographic: "2.9.0" < "2.14" is True and
+# a local build "2.14.0+cuXXX" is not < "2.14".  A "2.14.0.dev" nightly still is
+# (pre-releases sort first), which errs on the side of keeping the workaround.
 # https://github.com/pytorch/pytorch/issues/176591
 # TODO: drop the decorator (and tighten the bound) once the fix lands upstream.
-_torch_major_minor = tuple(int(p) for p in torch.__version__.split("+")[0].split(".")[:2])
-if _torch_major_minor < (2, 14):
+if torch.__version__ < "2.14":
     # Guard each flag with hasattr: loop_index_inversion_in_fusion is newer than
     # loop_ordering_after_fusion, so an older torch in this range may not define it.
     _foreach_fusion_flags = {
@@ -515,7 +515,14 @@ def dion2_pre_orthogonalize(
     # torch.compile-safe.
     if num_select == 0:
         U_selected = [m.to(dtype=torch.bfloat16) for m in M]
-        indices_list = [torch.empty(0, dtype=torch.long, device=M[0].device) for _ in M]
+        # Shape the empty index tensors like the real ones: (*batch_dims, k) with
+        # k == 0, where batch_dims are M's leading dims (empty for a 2-D param, the
+        # head dim for a 3-D one). The batched post-orthogonalize stacks these and
+        # expands the result against U, so a flat (0,) index would be rank-short by
+        # one for every 3-D+ param and raise on the expand.
+        indices_list = [
+            torch.empty(*m.shape[:-2], 0, dtype=torch.long, device=m.device) for m in M
+        ]
         return U_selected, indices_list
 
     M_stacked = torch.stack(M, dim=0)
@@ -703,6 +710,13 @@ def dion2_post_orthogonalize(
     # matrix per step, a large share of the opt-step host dispatch). Selected indices are
     # unique per slice, so scatter_add is collision-free and this is bit-exact with the
     # per-tensor loop. scatter_add_ accumulates U into X at the selected positions.
+    #
+    # NOTE: batching trades memory traffic for kernel count. The per-matrix loop touched
+    # only the k selected slices of each param; this reads and rewrites the whole shape
+    # group (stack in, foreach_copy_ back). Measured on one H100 (bf16 params, compiled,
+    # no capture): 256x(1024,1024) f=1/4 2.41 -> 1.69 ms, but 128x(2048,2048) f=1/2
+    # 2.69 -> 3.60 ms. Folding the weight decay into the stack to save a pass was tried
+    # and is slower still (inductor does not fuse the multiply into the stack lowering).
     Xs = torch.stack(X, dim=0)
     # Cast U up to the param dtype BEFORE scaling, matching the per-tensor loop
     # (``u.to(dtype)`` then multiply). neg_lr is 0-dim, so in eager ``neg_lr * U``

@@ -9,6 +9,7 @@ Tests cover:
 - Step timing: optimizer step takes measurable wall-clock time
 """
 
+import math
 import os
 import pytest
 import time
@@ -361,6 +362,76 @@ class TestDion2:
             )
             for xt, xr in zip(X_test, X_ref):
                 assert torch.equal(xt, xr)
+
+    def test_pre_orthogonalize_batched_ef_decay_matches_per_matrix(self):
+        """The batched error-feedback scatter must be bit-exact with the per-matrix
+        one, the other half of the PR's bit-exactness claim.
+
+        Only the post-orthogonalize write-back had a reference test; the momentum
+        decay is a separate scatter (into the stacked momentum, then copied back)
+        with its own index-expansion logic per select_dim.
+        """
+        from dion.dion2 import dion2_pre_orthogonalize
+
+        for select_dim in (-2, -1):
+            torch.manual_seed(11)
+            n, rows, cols, fraction = 5, 16, 12, 0.25
+            M0 = [torch.randn(rows, cols, device=DEVICE) for _ in range(n)]
+            G = [torch.randn(rows, cols, device=DEVICE) for _ in range(n)]
+            ef_decay = torch.tensor(0.9, dtype=torch.float32, device=DEVICE)
+
+            # Per-matrix reference, mirroring the loop the batched scatter replaced.
+            M_ref = [m.clone() for m in M0]
+            torch._foreach_add_(M_ref, G)
+            norm_dim = -1 if select_dim == -2 else -2
+            num_select = M_ref[0].size(select_dim)
+            k = max(1, int(math.ceil(fraction * num_select)))
+            U_ref = []
+            for m in M_ref:
+                _, idx = torch.topk(m.norm(p=1, dim=norm_dim), k, dim=-1, sorted=False)
+                if select_dim == -2:
+                    idx_exp = idx.unsqueeze(-1).expand(*idx.shape, m.size(-1))
+                else:
+                    idx_exp = idx.unsqueeze(-2).expand(*idx.shape[:-1], m.size(-2), k)
+                selected = torch.gather(m, dim=select_dim, index=idx_exp)
+                U_ref.append(selected.to(torch.bfloat16))
+                m.scatter_(dim=select_dim, index=idx_exp, src=selected * ef_decay)
+
+            M_test = [m.clone() for m in M0]
+            U_test, _ = dion2_pre_orthogonalize(
+                G, M_test, fraction, ef_decay, select_dim
+            )
+            for mt, mr in zip(M_test, M_ref):
+                assert torch.equal(mt, mr)
+            for ut, ur in zip(U_test, U_ref):
+                assert torch.equal(ut, ur)
+
+    def test_empty_shard_indices_keep_batch_dims_for_3d_params(self):
+        """An empty local shard of a 3D+ param must produce (*batch, 0) indices.
+
+        The batched post-orthogonalize stacks the index tensors and expands the
+        result against U, so a flat (0,) index -- correct only for 2D params -- is
+        rank-short by one for a 3D param and raises on the expand. The per-matrix
+        loop it replaced tolerated the short rank by accident, so nothing else
+        covers this combination.
+        """
+        from dion.dion2 import dion2_pre_orthogonalize, dion2_post_orthogonalize
+
+        n, heads, cols = 3, 4, 16
+        # Row-sharded 3D param whose local shard has zero rows (world_size > rows).
+        M = [torch.randn(heads, 0, cols, device=DEVICE) for _ in range(n)]
+        G = [torch.randn(heads, 0, cols, device=DEVICE) for _ in range(n)]
+        X = [torch.randn(heads, 0, cols, device=DEVICE) for _ in range(n)]
+        ef_decay = torch.tensor(0.9, dtype=torch.float32, device=DEVICE)
+
+        U, indices = dion2_pre_orthogonalize(G, M, 0.25, ef_decay, -2)
+        assert all(idx.shape == (heads, 0) for idx in indices), (
+            f"expected (heads, 0) index tensors, got {[tuple(i.shape) for i in indices]}"
+        )
+
+        lr = torch.tensor(0.01, dtype=torch.float32, device=DEVICE)
+        wd = torch.tensor(0.0, dtype=torch.float32, device=DEVICE)
+        dion2_post_orthogonalize(X, U, indices, lr, lr, wd, -2)
 
     def test_select_dim_rows_vs_cols(self):
         """Tall matrices select columns, wide select rows."""
