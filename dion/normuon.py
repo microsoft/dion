@@ -13,7 +13,7 @@ from .megabatch_base import (
     adjust_lr_rms_norm,
     compute_split_lr_scales,
 )
-from .opt_utils import AsyncTask, to_local
+from .opt_utils import AsyncTask, as_scalar_tensor, to_local
 from .muon import muon_update_pre_orthogonalize, muon_update_post_orthogonalize
 
 
@@ -30,7 +30,9 @@ class NorMuon(DistributedOrthoBase):
         mu: Momentum factor for NorMuon algorithm.
         muon_beta2: Second beta parameter for NorMuon algorithm's adaptive updates.
         betas: Tuple of (beta1, beta2) for AdamW and Lion algorithms.
-        weight_decay: Weight decay factor.
+        weight_decay: Weight decay factor. Pass a Tensor to carry it as a persistent
+            device tensor the kernels read live, so filling it in place drives a
+            CUDA-graph-captured step (see dion.cuda_graph); a float is baked at capture.
         cautious_wd: Whether to apply weight decay only where update and parameter signs align.
         epsilon: Small value to avoid division by zero.
         nesterov: Whether to use Nesterov momentum.
@@ -67,7 +69,7 @@ class NorMuon(DistributedOrthoBase):
         mu: float = 0.95,
         muon_beta2: float = 0.95,
         betas: Tuple[float, float] = (0.9, 0.95),
-        weight_decay: float = 0.01,
+        weight_decay: Union[float, Tensor] = 0.01,
         cautious_wd: bool = False,
         epsilon: float = 1e-8,
         nesterov: bool = False,
@@ -151,7 +153,7 @@ class NorMuon(DistributedOrthoBase):
                 lr=group["lr"],
                 momentum=torch.tensor(group["mu"]),
                 muon_beta2=torch.tensor(group["muon_beta2"]),
-                weight_decay=torch.tensor(group["weight_decay"]),
+                weight_decay=as_scalar_tensor(group["weight_decay"]),
                 epsilon=torch.tensor(group["epsilon"]),
                 nesterov=group["nesterov"],
                 flatten=group["flatten"],

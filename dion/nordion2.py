@@ -13,7 +13,7 @@ from .megabatch_base import (
     adjust_lr_spectral_norm,
     adjust_lr_rms_norm,
 )
-from .opt_utils import AsyncTask, to_local
+from .opt_utils import AsyncTask, as_scalar_tensor, to_local
 from .dion2 import (
     dion2_pre_orthogonalize,
     dion2_post_orthogonalize,
@@ -37,7 +37,9 @@ class NorDion2(DistributedOrthoBase):
         mu: Momentum factor for NorDion2 algorithm.
         muon_beta2: Second beta parameter for NorDion2 algorithm's adaptive updates.
         betas: Tuple of (beta1, beta2) for AdamW and Lion algorithms.
-        weight_decay: Weight decay factor.
+        weight_decay: Weight decay factor. Pass a Tensor to carry it as a persistent
+            device tensor the kernels read live, so filling it in place drives a
+            CUDA-graph-captured step (see dion.cuda_graph); a float is baked at capture.
         epsilon: Small value to avoid division by zero.
         adjust_lr: How to adjust the learning rate for Muon updates ("spectral_norm" or "rms_norm" or None).
             "spectral_norm": Adjust based on spectral norm, for learning rate transfer across model scale.
@@ -71,7 +73,7 @@ class NorDion2(DistributedOrthoBase):
         mu: float = 0.95,
         muon_beta2: float = 0.95,
         betas: Tuple[float, float] = (0.9, 0.95),
-        weight_decay: float = 0.01,
+        weight_decay: Union[float, Tensor] = 0.01,
         epsilon: float = 1e-8,
         adjust_lr: Optional[str] = "spectral_norm",
         flatten: bool = False,
@@ -172,7 +174,7 @@ class NorDion2(DistributedOrthoBase):
                 fraction=group["fraction"],
                 momentum=torch.tensor(group["mu"]),
                 muon_beta2=torch.tensor(group["muon_beta2"]),
-                weight_decay=torch.tensor(group["weight_decay"]),
+                weight_decay=as_scalar_tensor(group["weight_decay"]),
                 epsilon=torch.tensor(group["epsilon"]),
                 flatten=group["flatten"],
                 adjust_lr=group["adjust_lr"],

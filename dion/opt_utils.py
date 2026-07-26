@@ -11,6 +11,18 @@ def lm_head_lr_scale(scalar_opt: str, model_dim: int) -> float:
     return 1 / math.sqrt(model_dim) if scalar_opt == "lion" else 1.0
 
 
+def as_scalar_tensor(value: Union[Tensor, float]) -> Tensor:
+    """Wrap a group hyperparameter for the kernels, leaving an existing tensor alone.
+
+    A group whose hyperparameter is carried as a persistent device tensor
+    (``DistributedOrthoBase._ensure_hyperparam_tensor``) must reach the kernels as *that*
+    tensor, so a captured CUDA graph re-reads the live value on every replay. Re-wrapping it
+    with ``torch.tensor()`` would copy, and a copy made during capture freezes the value.
+    A plain float still becomes a host scalar tensor, exactly as before.
+    """
+    return value if isinstance(value, Tensor) else torch.tensor(value)
+
+
 def to_local(tensor: Union[Tensor, List[Tensor]]) -> Union[Tensor, List[Tensor]]:
     """
     Convert a single DTensor or list of DTensors to local tensors.

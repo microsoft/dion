@@ -23,6 +23,12 @@ from dion.cuda_graph import CudaGraphOptimizer
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 pytestmark = pytest.mark.skipif(DEVICE == "cpu", reason="requires CUDA")
 
+# Bump torch.compile cache size to avoid recompilation failures when the same compiled
+# function sees different input shapes and hyperparameter types across tests (matching
+# test_optimizers.py). Exhausting it here is not a soft fallback: a recompile attempted
+# under an active capture aborts the capture outright.
+torch._dynamo.config.cache_size_limit = 64
+
 STEPS, WARMUP, SEED = 12, 3, 0
 DIST_STEPS = 6
 OPTIMIZERS = [Muon, NorMuon, Dion2, NorDion2]
@@ -187,7 +193,7 @@ def test_lr_tensor_identity_is_stable_across_reassignment():
 
     for g in opt.param_groups:
         g["lr"] = 0.007
-    opt._sync_lr_tensors()
+    opt._sync_hyperparam_tensors()
 
     for g, t in zip(opt.param_groups, before):
         assert g["lr"] is t, "LR tensor was replaced instead of filled in place"
@@ -268,7 +274,7 @@ def test_lr_sync_under_active_capture_is_an_error():
         for g in opt.param_groups:
             g["lr"] = 0.5
         with pytest.raises(RuntimeError, match="capture"):
-            opt._sync_lr_tensors()
+            opt._sync_hyperparam_tensors()
     del graph
     torch.cuda.synchronize()
 
@@ -484,7 +490,12 @@ def _dist_worker(rank, world_size, port, mode, out_path):
             torch.save(full.cpu(), out_path)
     finally:
         # Release the captured graph before tearing the process group down: it holds the
-        # captured NCCL ops, and destroy_process_group() blocks while they are alive.
+        # captured NCCL ops, and destroy_process_group() blocks while they are alive. This
+        # is the scenario release() exists for, and the only place it runs against a real
+        # sharded graph -- dropping the reference and hoping for a collection is the idiom
+        # it replaced. A release() that failed to drop the ops hangs the spawn here.
+        if wrap is not None:
+            wrap.release()
         step_fn = wrap = None
         torch.cuda.synchronize()
         dist.destroy_process_group()
@@ -564,3 +575,240 @@ def test_cudagraph_matches_eager_filtered_triton(optimizer_cls):
 
     diff = max((a - b).abs().max().item() for a, b in zip(final_eager, final_graph))
     assert diff <= 1e-5, f"{optimizer_cls.__name__} filtered+triton: capture-vs-eager diff {diff:.3e}"
+
+
+def _build_live_wd(optimizer_cls, weight_decay=0.03):
+    # A Tensor weight_decay is the opt-in: the group then carries it as a persistent device
+    # tensor the kernels read, so filling it in place drives a captured step the way a
+    # scheduled LR does. A plain float stays baked at capture.
+    torch.manual_seed(SEED)
+    weights = [torch.nn.Parameter(torch.randn(64, 128, device=DEVICE)),
+               torch.nn.Parameter(torch.randn(128, 64, device=DEVICE))]
+    biases = [torch.nn.Parameter(torch.randn(64, device=DEVICE)),
+              torch.nn.Parameter(torch.randn(128, device=DEVICE))]
+    opt = optimizer_cls([
+        {"params": weights},
+        {"params": biases, "algorithm": "adamw"},
+    ], distributed_mesh=None, lr=0.02, weight_decay=torch.tensor(weight_decay))
+    return weights + biases, opt
+
+
+def _run_wds(params, opt, grad_seq, step_fn, wds):
+    for p in params:
+        p.grad = torch.zeros_like(p)
+    for t, gs in enumerate(grad_seq):
+        for group in opt.param_groups:
+            group["weight_decay"].fill_(wds[t])
+        for p, g in zip(params, gs):
+            p.grad.copy_(g)
+        step_fn()
+    return [p.detach().clone() for p in params]
+
+
+@pytest.mark.parametrize("optimizer_cls", OPTIMIZERS)
+def test_tensor_weight_decay_is_a_persistent_device_tensor(optimizer_cls):
+    _, opt = _build_live_wd(optimizer_cls)
+
+    for group in opt.param_groups:
+        assert isinstance(group["weight_decay"], torch.Tensor)
+        assert group["weight_decay"].device.type == "cuda"
+
+    # Identity is what replay depends on: a float assignment must refill the tensor the
+    # captured graph reads, never swap in a new one.
+    before = [group["weight_decay"] for group in opt.param_groups]
+    for group in opt.param_groups:
+        group["weight_decay"] = 0.05
+    opt._sync_hyperparam_tensors()
+
+    for group, tensor in zip(opt.param_groups, before):
+        assert group["weight_decay"] is tensor
+        assert tensor.item() == pytest.approx(0.05)
+
+
+@pytest.mark.parametrize("optimizer_cls", OPTIMIZERS)
+def test_cudagraph_tracks_scheduled_weight_decay(optimizer_cls):
+    # Schedule-coupled weight decay (Defazio 2506.02285) rewrites weight_decay every step.
+    # Under replay that must track, not freeze at whatever the capture step happened to see.
+    sched = [0.3 - 0.025 * t for t in range(STEPS)]
+    frozen = [sched[WARMUP]] * STEPS
+
+    p0, _ = _build_live_wd(optimizer_cls)
+    grad_seq = _grad_seq(p0)
+
+    pe, oe = _build_live_wd(optimizer_cls)
+    final_eager = _run_wds(pe, oe, grad_seq, oe.step, sched)
+
+    pg, og = _build_live_wd(optimizer_cls)
+    wrap = CudaGraphOptimizer(og, warmup_steps=WARMUP)
+    final_graph = _run_wds(pg, og, grad_seq, wrap.step, sched)
+
+    pc, oc = _build_live_wd(optimizer_cls)
+    wrapc = CudaGraphOptimizer(oc, warmup_steps=WARMUP)
+    final_frozen = _run_wds(pc, oc, grad_seq, wrapc.step, frozen)
+
+    tracks = max((a - b).abs().max().item() for a, b in zip(final_eager, final_graph))
+    nontrivial = max((a - b).abs().max().item() for a, b in zip(final_graph, final_frozen))
+    assert tracks <= 1e-5, (
+        f"{optimizer_cls.__name__}: graph did not track the weight-decay schedule (diff {tracks:.3e})"
+    )
+    assert nontrivial > 1e-3, (
+        f"{optimizer_cls.__name__}: weight decay looks frozen -- scheduled and capture-step-constant "
+        f"runs agree to {nontrivial:.3e}, so the test would pass even if wd were baked"
+    )
+
+
+def test_float_weight_decay_stays_baked_and_is_not_tensorized():
+    # The default path must be untouched: no device tensor, no extra decay pass.
+    _, opt = _build(Dion2)
+    opt._sync_hyperparam_tensors()
+
+    for group in opt.param_groups:
+        assert not isinstance(group["weight_decay"], torch.Tensor)
+    assert all(name != "weight_decay" for _, name in opt._hyperparam_tensors)
+
+
+def test_weight_decay_opt_in_latches_after_construction():
+    # The opt-in is the Tensor, not the moment it is supplied: a group constructed with a
+    # float still opts in if a Tensor is assigned before the graph is captured. Without the
+    # latch the assignment looks like it worked (the group holds a Tensor) while the group
+    # is not tracked, so the kernels read whatever tensor the caller last handed over --
+    # not the one a captured graph recorded.
+    _, opt = _build(Dion2)
+    for group in opt.param_groups:
+        group["weight_decay"] = torch.tensor(0.03, device=DEVICE)
+    opt._sync_hyperparam_tensors()
+
+    for index, group in enumerate(opt.param_groups):
+        assert "weight_decay" in opt._live_hyperparams(index)
+        assert group["weight_decay"] is opt._hyperparam_tensors[(index, "weight_decay")]
+
+    # Latched: a later float assignment refills that tensor rather than turning the group
+    # back into a baked one, which under replay would silently stop tracking.
+    before = [group["weight_decay"] for group in opt.param_groups]
+    for group in opt.param_groups:
+        group["weight_decay"] = 0.01
+    opt._sync_hyperparam_tensors()
+
+    for group, tensor in zip(opt.param_groups, before):
+        assert group["weight_decay"] is tensor
+        assert tensor.item() == pytest.approx(0.01)
+
+
+def test_live_weight_decay_survives_a_resume():
+    # state_dict() serializes every 0-d group tensor as a plain float for portability, so
+    # the resumed groups come back holding floats. The opt-in has to outlive that: a run
+    # resumed onto a baked weight decay would silently stop tracking its schedule.
+    presteps, sched = 3, [0.3 - 0.025 * t for t in range(STEPS)]
+    params, opt = _build_live_wd(Dion2)
+    grad_seq = _grad_seq(params)
+    _run_wds(params, opt, grad_seq[:presteps], opt.step, sched)
+    sd = _roundtrip(opt)
+    assert not isinstance(sd["param_groups"][0]["weight_decay"], torch.Tensor)
+
+    def resume():
+        p, o = _build_live_wd(Dion2)
+        o.load_state_dict(_roundtrip(opt))
+        return p, o
+
+    pg, og = resume()
+    for index, group in enumerate(og.param_groups):
+        assert "weight_decay" in og._live_hyperparams(index)
+        assert group["weight_decay"] is og._hyperparam_tensors[(index, "weight_decay")]
+    wrap = CudaGraphOptimizer(og, warmup_steps=WARMUP)
+    final_graph = _run_wds(pg, og, grad_seq[presteps:], wrap.step, sched[presteps:])
+
+    pe, oe = resume()
+    final_eager = _run_wds(pe, oe, grad_seq[presteps:], oe.step, sched[presteps:])
+
+    diff = max((a - b).abs().max().item() for a, b in zip(final_eager, final_graph))
+    assert diff <= 1e-5, f"resumed graph did not track the weight-decay schedule ({diff:.3e})"
+
+
+def test_opting_in_to_a_live_weight_decay_after_capture_is_an_error():
+    # Too late to honor: the graph baked the float. Raise rather than let the caller's
+    # schedule quietly drive a tensor no replay ever reads.
+    params, opt = _build(Dion2)
+    wrap = CudaGraphOptimizer(opt, warmup_steps=1)
+    for p in params:
+        p.grad = torch.zeros_like(p)
+
+    wrap.step()
+    wrap.step()
+    assert wrap._graph is not None
+
+    opt.param_groups[0]["weight_decay"] = torch.tensor(0.03, device=DEVICE)
+    with pytest.raises(RuntimeError, match="after the CUDA graph was captured"):
+        wrap.step()
+
+    # release() is the documented way through: re-warm, re-capture, and it tracks.
+    wrap.release()
+    wrap.step()
+    wrap.step()
+    assert wrap._graph is not None
+    assert opt.param_groups[0]["weight_decay"] is opt._hyperparam_tensors[(0, "weight_decay")]
+
+
+def test_capture_refuses_a_parameter_without_a_gradient():
+    params, opt = _build(Dion2)
+    wrap = CudaGraphOptimizer(opt, warmup_steps=1)
+    for p in params:
+        p.grad = torch.zeros_like(p)
+
+    wrap.step()
+    params[0].grad = None
+
+    with pytest.raises(RuntimeError, match="never update them"):
+        wrap.step()
+
+
+def test_capture_allows_a_parameter_that_is_frozen_on_purpose():
+    params, opt = _build(Dion2)
+    wrap = CudaGraphOptimizer(opt, warmup_steps=1)
+    for p in params:
+        p.grad = torch.zeros_like(p)
+
+    wrap.step()
+    params[0].grad = None
+    params[0].requires_grad_(False)
+
+    wrap.step()
+    assert wrap._graph is not None
+
+
+def test_release_drops_the_graph_and_rewarms():
+    params, opt = _build(Dion2)
+    wrap = CudaGraphOptimizer(opt, warmup_steps=1)
+    for p in params:
+        p.grad = torch.zeros_like(p)
+
+    wrap.step()
+    wrap.step()
+    assert wrap._graph is not None
+
+    wrap.release()
+    assert wrap._graph is None
+    assert wrap._step_count == 0
+
+    # Releasing twice is a no-op, and the next steps warm up before capturing again.
+    wrap.release()
+    wrap.step()
+    assert wrap._graph is None
+    wrap.step()
+    assert wrap._graph is not None
+
+
+def test_release_restarts_the_warmup_before_any_capture():
+    # Documented contract is "drops the graph and restarts the warmup"; with no graph yet
+    # only the second half applies, and skipping it would let the next step capture on a
+    # warmup the caller just invalidated.
+    params, opt = _build(Dion2)
+    wrap = CudaGraphOptimizer(opt, warmup_steps=3)
+    for p in params:
+        p.grad = torch.zeros_like(p)
+
+    wrap.step()
+    wrap.step()
+    assert wrap._graph is None and wrap._step_count == 2
+
+    wrap.release()
+    assert wrap._step_count == 0

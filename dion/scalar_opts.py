@@ -146,6 +146,12 @@ def adamw_update_foreach(
       fused kernel's ``tensor_lr`` overload, so both advance inside a CUDA graph. This is
       the form ``megabatch_base`` passes so a wrapped step is graph-capturable.
 
+    ``weight_decay`` as a *device* tensor selects a third variation, orthogonal to the two
+    above: the fused kernel's ``weight_decay`` is a float in every overload, so the decoupled
+    decay is applied as its own ``_foreach_mul_`` pass and the kernel is handed ``wd=0``. That
+    keeps a scheduled weight decay live under CUDA-graph replay, at the cost of one extra pass
+    and one extra rounding of ``X``. A float (or CPU scalar tensor) keeps the fused path.
+
     Cautious weight decay (https://arxiv.org/pdf/2510.12402) is applied as a
     post-step correction rather than inside the kernel:
 
@@ -174,12 +180,24 @@ def adamw_update_foreach(
 
     beta1_f = float(beta1)
     beta2_f = float(beta2)
-    wd_f = float(weight_decay)
     eps_f = float(epsilon)
 
-    do_cwd_correction = cautious_wd and wd_f > 0.0
+    # ``_fused_adamw_`` takes weight_decay as a float in every overload (unlike lr, which has
+    # a tensor_lr overload), so a device-tensor weight decay cannot be read by the kernel.
+    # Apply the decoupled decay as its own pass and hand the kernel wd=0. Costs one extra
+    # foreach pass and one extra rounding of X, which is why a tensor weight decay is opt-in
+    # rather than the default -- see DistributedOrthoBase._live_hyperparams.
+    decay_outside = isinstance(weight_decay, Tensor) and weight_decay.device.type != "cpu"
+    wd_f = 0.0 if decay_outside else float(weight_decay)
+
+    # A device-tensor wd is taken as non-zero without checking: reading it would host-sync,
+    # which capture forbids. Costs a wasted correction pass in the wd=0 case.
+    do_cwd_correction = cautious_wd and (decay_outside or wd_f > 0.0)
     if do_cwd_correction:
         X_orig = [x.clone() for x in X]
+
+    if decay_outside:
+        torch._foreach_mul_(X, 1 - lr * weight_decay)
 
     if state_steps is not None:
         # Capturable form. ``state_steps`` are per-param device tensors we increment
@@ -220,14 +238,20 @@ def adamw_update_foreach(
         signs = torch._foreach_mul(M, X_orig)
         undo_masks = [(s < 0).to(x.dtype) for s, x in zip(signs, X_orig)]
         correction = torch._foreach_mul(X_orig, undo_masks)
-        if state_steps is not None:
+        # Fold (lr * wd) into one scalar first, so the correction is a single foreach pass
+        # and the multiply order is the same in every branch -- scaling by wd and then by
+        # lr is not bit-identical to scaling by (lr*wd).
+        if decay_outside:
+            # ``wd_f`` is 0 here (the kernel was handed no decay), so the coefficient has
+            # to come off the device tensor -- on the legacy path too, where using wd_f
+            # would zero the correction and silently degrade CWD to plain weight decay.
+            coeff = lr * weight_decay
+        elif state_steps is not None:
             # Keep the LR scaling on-device: float(lr) would host-sync and bake the value.
-            # Fold (lr * wd) into one 0-d device scalar first, so the correction is a
-            # single foreach pass and the multiply order matches the legacy branch below
-            # -- scaling by wd and then by lr is not bit-identical to scaling by (lr*wd).
-            torch._foreach_mul_(correction, lr * wd_f)
+            coeff = lr * wd_f
         else:
-            torch._foreach_mul_(correction, float(lr) * wd_f)
+            coeff = float(lr) * wd_f
+        torch._foreach_mul_(correction, coeff)
         torch._foreach_add_(X, correction)
 
 

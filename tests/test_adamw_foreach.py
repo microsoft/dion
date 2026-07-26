@@ -290,6 +290,67 @@ def test_cwd_zero_wd_skips_correction():
     assert torch.equal(X1[0], X2[0])
 
 
+@pytest.mark.parametrize("cautious_wd", [False, True])
+@pytest.mark.parametrize("capturable", [False, True])
+def test_device_tensor_weight_decay_matches_the_float_path(cautious_wd, capturable):
+    """A *device* tensor weight decay takes the decoupled decay off ``_fused_adamw_`` (whose
+    weight_decay is a float in every overload) and applies it as its own pass, so a captured
+    graph re-reads it. Same update either way -- one extra rounding of X apart. The CWD
+    correction has to follow the decay onto the device tensor: reading the (now zero) float
+    scalar instead silently degrades cautious weight decay to plain weight decay."""
+    from dion.scalar_opts import adamw_update_foreach
+
+    def run(wd):
+        torch.manual_seed(0)
+        X = [torch.randn(64, 32, device=DEVICE), torch.randn(16, device=DEVICE)]
+        G = [torch.randn_like(x) * 0.1 for x in X]
+        M = [torch.randn_like(x) * 0.01 for x in X]
+        V = [torch.rand_like(x).abs() * 0.01 for x in X]
+        kw = dict(beta1=torch.tensor(0.9), beta2=torch.tensor(0.999),
+                  weight_decay=wd, epsilon=1e-8, cautious_wd=cautious_wd)
+        if capturable:
+            steps = [torch.ones((), dtype=torch.float32, device=DEVICE) for _ in X]
+            adamw_update_foreach(X, G, M, V, lr=torch.full((), 0.1, device=DEVICE),
+                                 state_steps=steps, **kw)
+        else:
+            adamw_update_foreach(X, G, M, V, lr=0.1, step=2, **kw)
+        return X
+
+    wd = 0.3
+    baked = run(wd)
+    live = run(torch.full((), wd, device=DEVICE))
+    for b, l in zip(baked, live):
+        torch.testing.assert_close(b, l, rtol=0, atol=1e-6)
+
+
+def test_cwd_on_the_live_weight_decay_path_is_not_plain_decay():
+    """Regression: with a device-tensor wd the kernel is handed wd=0, so a correction scaled
+    by that float is identically zero and CWD collapses into plain weight decay."""
+    from dion.scalar_opts import adamw_update_foreach
+
+    def run(cautious, capturable):
+        torch.manual_seed(0)
+        X = [torch.randn(64, 32, device=DEVICE)]
+        G = [torch.randn_like(X[0]) * 0.1]
+        M = [torch.randn_like(X[0]) * 0.01]
+        V = [torch.rand_like(X[0]).abs() * 0.01]
+        kw = dict(beta1=torch.tensor(0.9), beta2=torch.tensor(0.999),
+                  weight_decay=torch.full((), 0.3, device=DEVICE),
+                  epsilon=1e-8, cautious_wd=cautious)
+        if capturable:
+            adamw_update_foreach(X, G, M, V, lr=torch.full((), 0.1, device=DEVICE),
+                                 state_steps=[torch.ones((), dtype=torch.float32,
+                                                         device=DEVICE)], **kw)
+        else:
+            adamw_update_foreach(X, G, M, V, lr=0.1, step=2, **kw)
+        return X[0]
+
+    for capturable in (False, True):
+        gap = (run(True, capturable) - run(False, capturable)).abs().max().item()
+        form = "capturable" if capturable else "legacy"
+        assert gap > 1e-3, f"{form}: CWD is indistinguishable from plain decay (gap {gap:.3e})"
+
+
 class TestIntegration:
     def test_normuon_with_adamw_scalars(self):
         from dion import NorMuon
