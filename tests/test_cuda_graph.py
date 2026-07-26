@@ -34,8 +34,12 @@ def _build(optimizer_cls):
                torch.nn.Parameter(torch.randn(128, 64, device=DEVICE))]
     biases = [torch.nn.Parameter(torch.randn(64, device=DEVICE)),
               torch.nn.Parameter(torch.randn(128, device=DEVICE))]
+    # Pin fraction < 1 for the filtered optimizers rather than leaning on the class
+    # default: filtering is what puts the selection/scatter path in the captured
+    # region, so a default change to 1.0 would silently drop that coverage.
+    filtered = {"fraction": 0.25} if optimizer_cls in (Dion2, NorDion2) else {}
     opt = optimizer_cls([
-        {"params": weights},
+        {"params": weights, **filtered},
         {"params": biases, "algorithm": "adamw"},
     ], distributed_mesh=None, lr=0.02)
     return weights + biases, opt
