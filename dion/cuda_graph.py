@@ -21,10 +21,15 @@ shapes, gradients living in stable ``.grad`` tensors):
         opt.zero_grad(set_to_none=False)   # MUST keep .grad tensors stable for replay
         sched.step()
 
+Under a framework that drives automatic optimization with a closure (Lightning calls
+``opt.step(closure)``, the closure running forward+backward), ``step`` runs the closure
+first, then replays the captured update and returns its loss.
+
 Requirements / caveats:
-  * LR schedulers must be constructed on the *inner* optimizer: torch's ``LRScheduler``
-    rejects anything failing ``isinstance(opt, torch.optim.Optimizer)``, which this wrapper
-    is not. Scheduling still works with no wrapper plumbing -- ``group["lr"]`` is the device
+  * The wrapper is a ``torch.optim.Optimizer`` subclass (so ``isinstance`` holds for
+    Lightning and torch's ``LRScheduler``) that delegates all state to the inner optimizer;
+    a scheduler may bind to either, since they share ``param_groups``. Scheduling works with
+    no wrapper plumbing -- ``group["lr"]`` is the device
     tensor the captured graph reads, and the scheduler (bound to the inner optimizer, which
     shares the same param_groups) fills it in place outside the graph, so every replay
     re-reads the live value. A *scheduled* LR takes effect under replay only through such an
@@ -55,12 +60,15 @@ Requirements / caveats:
     including under a real ``CosineAnnealingLR`` (``tests/test_cuda_graph.py``).
 """
 
-from typing import Optional
+import warnings
+from collections import OrderedDict
+from typing import Callable, Optional
+
 import torch
 
 
-class CudaGraphOptimizer:
-    def __init__(self, optimizer, warmup_steps: int = 10):
+class CudaGraphOptimizer(torch.optim.Optimizer):
+    def __init__(self, optimizer: torch.optim.Optimizer, warmup_steps: int = 10):
         if warmup_steps < 1:
             raise ValueError(
                 f"warmup_steps must be >= 1, got {warmup_steps}. Capture needs at least "
@@ -68,10 +76,23 @@ class CudaGraphOptimizer:
                 "and NCCL buffers; capturing the first step instead allocates them inside "
                 "the graph and fails deep in the backend."
             )
+        # We deliberately do NOT call Optimizer.__init__: it would build a second, empty
+        # param_groups/state on this object. Subclassing is only so isinstance(self,
+        # Optimizer) holds (Lightning, torch's LRScheduler); every Optimizer attribute
+        # delegates to the wrapped optimizer via the overrides below and __getattr__. We
+        # still create the hook registries Optimizer.__init__ would, since torch reads them
+        # on state_dict()/step().
         self.optimizer = optimizer
         self.warmup_steps = warmup_steps
         self._step_count = 0
         self._graph: Optional[torch.cuda.CUDAGraph] = None
+        self._warned_set_to_none = False
+        self._optimizer_step_pre_hooks = OrderedDict()
+        self._optimizer_step_post_hooks = OrderedDict()
+        self._optimizer_state_dict_pre_hooks = OrderedDict()
+        self._optimizer_state_dict_post_hooks = OrderedDict()
+        self._optimizer_load_state_dict_pre_hooks = OrderedDict()
+        self._optimizer_load_state_dict_post_hooks = OrderedDict()
 
     def __getattr__(self, name):
         # Delegate the rest of the Optimizer API (state, defaults, add_param_group, ...).
@@ -86,6 +107,17 @@ class CudaGraphOptimizer:
     def param_groups(self):
         return self.optimizer.param_groups
 
+    @param_groups.setter
+    def param_groups(self, value):
+        self.optimizer.param_groups = value
+
+    def add_param_group(self, param_group):
+        # torch.optim.Optimizer defines add_param_group, so (unlike state/defaults) it is
+        # found on the base class and __getattr__ never delegates it -- override explicitly.
+        # A new group is not in the captured graph; drop it so the next step re-captures.
+        self._graph = None
+        return self.optimizer.add_param_group(param_group)
+
     def state_dict(self):
         return self.optimizer.state_dict()
 
@@ -97,11 +129,14 @@ class CudaGraphOptimizer:
 
     def zero_grad(self, set_to_none: bool = False):
         # set_to_none=True would swap .grad for a fresh tensor each step, breaking the
-        # graph's pinned grad buffers. Force the stable-buffer path.
-        if set_to_none:
-            raise ValueError(
-                "CudaGraphOptimizer requires stable .grad buffers; call "
-                "zero_grad(set_to_none=False)."
+        # graph's pinned grad buffers. Force the stable-buffer path; a framework that
+        # defaults to True (e.g. Lightning) gets a one-time warning, not a hard failure.
+        if set_to_none and not self._warned_set_to_none:
+            self._warned_set_to_none = True
+            warnings.warn(
+                "CudaGraphOptimizer needs stable .grad buffers for graph replay; "
+                "ignoring set_to_none=True and zeroing in place.",
+                RuntimeWarning,
             )
         self.optimizer.zero_grad(set_to_none=False)
 
@@ -118,10 +153,16 @@ class CudaGraphOptimizer:
             self.optimizer.step()
         self._graph.replay()
 
-    def step(self):
+    def step(self, closure: Optional[Callable] = None):
+        # Automatic-optimization frameworks (Lightning) call step(closure); the closure runs
+        # forward+backward, filling the stable .grad buffers the capture reads. Run it eagerly
+        # first, then apply the captured update and return its loss. replay() launches on the
+        # current stream -- where the closure's backward ran -- so the update is ordered after
+        # the fresh gradients.
         # No LR plumbing here: the wrapped optimizer carries each group's LR as the device
         # tensor ``group["lr"]`` that the kernels read, and a scheduler fills it in place
         # outside the graph, so every replay already re-reads the live value.
+        loss = closure() if closure is not None else None
         if self._step_count < self.warmup_steps:
             self.optimizer.step()
         elif self._graph is None:
@@ -135,3 +176,4 @@ class CudaGraphOptimizer:
             if advance is not None:
                 advance()
         self._step_count += 1
+        return loss

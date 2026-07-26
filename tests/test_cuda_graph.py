@@ -91,6 +91,10 @@ def test_cudagraph_matches_eager(optimizer_cls):
 
     pg, og = _build(optimizer_cls)
     wrap = CudaGraphOptimizer(og, warmup_steps=WARMUP)
+    # A framework (Lightning) both isinstance-checks the optimizer and reads its groups
+    # through the wrapper; the wrapper is-a Optimizer and shares the wrapped groups/state.
+    assert isinstance(wrap, torch.optim.Optimizer)
+    assert wrap.param_groups is og.param_groups and wrap.state is og.state
     final_graph = _run(pg, og, grad_seq, wrap.step)
 
     diff = max((a - b).abs().max().item() for a, b in zip(final_eager, final_graph))
@@ -357,3 +361,32 @@ def test_cudagraph_matches_eager_on_sharded_megabatch(tmp_path):
 
     diff = (out["eager"] - out["graph"]).abs().max().item()
     assert diff <= 1e-5, f"sharded capture-vs-eager diff {diff:.3e}"
+
+
+@pytest.mark.parametrize("optimizer_cls", OPTIMIZERS)
+def test_cudagraph_step_with_closure(optimizer_cls):
+    # Lightning's automatic optimization calls step(closure); the closure runs
+    # forward+backward (here it fills .grad in place) and returns the loss. The wrapped
+    # step must run the closure, apply the captured update, and hand back the loss.
+    p0, _ = _build(optimizer_cls)
+    grad_seq = _grad_seq(p0)
+
+    pe, oe = _build(optimizer_cls)
+    final_eager = _run(pe, oe, grad_seq, oe.step)
+
+    pg, og = _build(optimizer_cls)
+    wrap = CudaGraphOptimizer(og, warmup_steps=WARMUP)
+    for p in pg:
+        p.grad = torch.zeros_like(p)
+    losses = []
+    for gs in grad_seq:
+        def closure(gs=gs):
+            for p, g in zip(pg, gs):
+                p.grad.copy_(g)
+            return torch.full((), 0.5, device=DEVICE)
+        losses.append(wrap.step(closure))
+    final_graph = [p.detach().clone() for p in pg]
+
+    diff = max((a - b).abs().max().item() for a, b in zip(final_eager, final_graph))
+    assert diff <= 1e-5, f"{optimizer_cls.__name__}: closure step-vs-eager diff {diff:.3e}"
+    assert all(l is not None for l in losses)
