@@ -11,6 +11,7 @@ from .megabatch_base import (
     megabatch_orthogonalize_async,
     muon_update_newton_schulz,
     adjust_lr_spectral_norm,
+    adjust_lr_spectral_norm_clip,
     adjust_lr_rms_norm,
     compute_split_lr_scales,
 )
@@ -262,6 +263,8 @@ def muon_update_megabatch_async(
         adjusted_lr = lr
     elif adjust_lr == "spectral_norm":
         adjusted_lr = adjust_lr_spectral_norm(lr, X[0].shape, flatten=flatten)
+    elif adjust_lr == "spectral_norm_clip":
+        adjusted_lr = adjust_lr_spectral_norm_clip(lr, X[0].shape, flatten=flatten)
     elif adjust_lr == "rms_norm":
         adjusted_lr = adjust_lr_rms_norm(lr, X[0].shape, flatten=flatten)
     else:

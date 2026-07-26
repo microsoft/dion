@@ -4,6 +4,27 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- New `RMNP` optimizer (Row-Momentum Normalized Preconditioning,
+  [arXiv:2603.20527](https://arxiv.org/abs/2603.20527)). RMNP replaces Muon's
+  Newton-Schulz orthogonalization with a single row-wise (input-dimension) ℓ₂
+  normalization of the momentum update, `row_normalize(V) = (diag(V Vᵀ))^{-1/2} V`,
+  dropping the per-iteration cost from `O(mn·min(m,n))` to `O(mn)` for an `m×n`
+  weight while, in the paper's experiments, matching Muon-level quality
+  (orthogonalization and row-wise ℓ₂ normalization are asymptotically equivalent
+  for the Transformer). It reuses Muon's momentum, distributed assembly, and
+  weight update, so it inherits the same FSDP2/DDP sharding support. Following
+  the paper, the learning rate is scaled by the original Muon adjustment
+  `max(1, sqrt(d_out / d_in))` by default (a new `adjust_lr="spectral_norm_clip"`
+  mode). Unlike orthogonalization, RMNP's row normalization is also well-defined
+  on the embedding and LM-head matrices, which can be routed to it.
+
+- New `adjust_lr="spectral_norm_clip"` learning-rate adjustment
+  (`lr * max(1, sqrt(fan_out / fan_in))`) -- the original Muon scaling
+  (`spectral_norm` clamped at 1). It is RMNP's default; the other orthogonalizing
+  optimizers keep their existing defaults.
+
 ### Changed
 
 - The FSDP2 row-sharded `selection_scope` default (both `Dion2` and `NorDion2`)

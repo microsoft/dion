@@ -930,6 +930,8 @@ def compute_split_lr_scales(
         return None
     elif adjust_lr == "spectral_norm":
         adjust_fn = adjust_lr_spectral_norm
+    elif adjust_lr == "spectral_norm_clip":
+        adjust_fn = adjust_lr_spectral_norm_clip
     elif adjust_lr == "rms_norm":
         adjust_fn = adjust_lr_rms_norm
     else:
@@ -962,3 +964,21 @@ def adjust_lr_spectral_norm(lr, param_shape, flatten):
     else:
         fan_out, fan_in = param_shape[-2:]
     return lr * math.sqrt(fan_out / fan_in)
+
+
+def adjust_lr_spectral_norm_clip(lr, param_shape, flatten):
+    """Original-Muon LR scaling: the spectral-norm adjustment clamped below at 1.
+
+    Multiplies the learning rate by ``max(1, sqrt(fan_out / fan_in))``, i.e. the
+    ``adjust_lr_spectral_norm`` ratio floored at 1. This is the learning-rate
+    scaling RMNP uses (arXiv:2603.20527), matching the original Muon adjustment;
+    it coincides with ``spectral_norm`` for square/tall matrices and differs only
+    for wide matrices (``fan_out < fan_in``), where it holds the ratio at 1
+    instead of shrinking the update below the base learning rate.
+    """
+    if flatten:
+        fan_out = param_shape[0]
+        fan_in = math.prod(param_shape[1:])
+    else:
+        fan_out, fan_in = param_shape[-2:]
+    return lr * max(1.0, math.sqrt(fan_out / fan_in))
