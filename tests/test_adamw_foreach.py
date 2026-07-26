@@ -225,6 +225,53 @@ def test_empty_list():
     )
 
 
+@pytest.mark.parametrize("cautious_wd", [False, True])
+def test_capturable_form_matches_legacy_form(cautious_wd):
+    """The capturable form (device step counters + a device-tensor lr) must compute the
+    same update as the legacy form (baked step + float lr). Covers the CWD correction,
+    whose lr*wd scaling is folded differently on the two paths."""
+    from dion.scalar_opts import adamw_update_foreach
+    torch.manual_seed(0)
+    shapes = [(128,), (64, 32), (1,)]
+    X_leg = [torch.randn(*s, device=DEVICE) for s in shapes]
+    X_cap = [x.clone() for x in X_leg]
+    M_leg, V_leg = [torch.zeros_like(x) for x in X_leg], [torch.zeros_like(x) for x in X_leg]
+    M_cap, V_cap = [torch.zeros_like(x) for x in X_cap], [torch.zeros_like(x) for x in X_cap]
+    steps = [torch.zeros((), dtype=torch.float32, device=DEVICE) for _ in X_cap]
+
+    kw = dict(beta1=torch.tensor(0.9), beta2=torch.tensor(0.999),
+              weight_decay=torch.tensor(0.1), epsilon=1e-8, cautious_wd=cautious_wd)
+    for step in range(1, 6):
+        G = [torch.randn(*s, device=DEVICE) * 0.1 for s in shapes]
+        adamw_update_foreach(X_leg, G, M_leg, V_leg, lr=torch.tensor(1e-2),
+                             step=step, **kw)
+        adamw_update_foreach(X_cap, G, M_cap, V_cap,
+                             lr=torch.full((), 1e-2, device=DEVICE),
+                             state_steps=steps, **kw)
+        assert all(s.item() == step for s in steps), "device step counters out of sync"
+        for i, (a, b) in enumerate(zip(X_leg, X_cap)):
+            diff = (a - b).abs().max().item()
+            assert diff <= 1e-6, f"param {i} diverged at step {step}: {diff:.3e}"
+
+
+def test_step_form_arguments_are_mutually_exclusive():
+    from dion.scalar_opts import adamw_update_foreach
+    X = [torch.randn(8, device=DEVICE)]
+    kw = dict(G=[torch.randn(8, device=DEVICE)], M=[torch.zeros(8, device=DEVICE)],
+              V=[torch.zeros(8, device=DEVICE)], beta1=torch.tensor(0.9),
+              beta2=torch.tensor(0.999), weight_decay=torch.tensor(0.0), epsilon=1e-8)
+    lr_t = torch.full((), 1e-2, device=DEVICE)
+    steps = [torch.zeros((), dtype=torch.float32, device=DEVICE)]
+
+    with pytest.raises(ValueError, match="exactly one"):
+        adamw_update_foreach(X, lr=lr_t, **kw)
+    with pytest.raises(ValueError, match="exactly one"):
+        adamw_update_foreach(X, lr=lr_t, step=1, state_steps=steps, **kw)
+    # A float lr on the capturable path is read at capture time and baked into the graph.
+    with pytest.raises(TypeError, match="device tensor"):
+        adamw_update_foreach(X, lr=1e-2, state_steps=steps, **kw)
+
+
 def test_cwd_zero_wd_skips_correction():
     """With wd=0, CWD must be a no-op vs non-CWD (nothing to undo)."""
     from dion.scalar_opts import adamw_update_foreach

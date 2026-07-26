@@ -58,8 +58,8 @@ def _dion2_post_ortho_kernel(
     X_ptr,
     U_ptr,
     map_ptr,
-    a,
-    b,
+    a_ptr,
+    b_ptr,
     M,
     N,
     x_stride_b,
@@ -82,7 +82,14 @@ def _dion2_post_ortho_kernel(
 
     The masked load returns 0.0 for unselected entries, so the single
     expression ``a*x - b*u`` handles both cases with one FP rounding.
+
+    ``a`` and ``b`` are passed as 0-d device tensors (loaded here) rather than host
+    scalars so the step is CUDA-graph capturable: a ``.item()`` on the caller side is a
+    host sync that CUDA graph capture forbids, and it would also freeze a scheduled LR at
+    the capture-time value under replay. Loading them in-kernel reads the live values.
     """
+    a = tl.load(a_ptr)
+    b = tl.load(b_ptr)
     pid = tl.program_id(0)
 
     num_blocks_m = tl.cdiv(M, BLOCK_M)
@@ -186,8 +193,10 @@ def dion2_post_orthogonalize_triton(
     if not TRITON_AVAILABLE:
         raise RuntimeError("Triton is required for dion2_post_orthogonalize_triton")
 
-    a = (1 - base_lr * weight_decay).item()
-    b = adjusted_lr.item()
+    # 0-d device tensors, not host scalars: the kernel loads them, so no .item() host sync
+    # (forbidden mid graph-capture) and a scheduled LR is read live under replay.
+    a = (1 - base_lr * weight_decay).to(torch.float32)
+    b = adjusted_lr.to(torch.float32)
     SELECT_ROWS = select_dim == -2
 
     for x, u, idx in zip(X, U, indices):

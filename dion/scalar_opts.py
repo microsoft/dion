@@ -1,6 +1,6 @@
 import torch
 from torch import Tensor
-from typing import Generator, List
+from typing import Generator, List, Optional
 
 
 @torch.compile(fullgraph=True)
@@ -127,15 +127,24 @@ def adamw_update_foreach(
     beta1: Tensor,  # Beta 1 (scalar tensor or float)
     beta2: Tensor,  # Beta 2 (scalar tensor or float)
     weight_decay: Tensor,  # Weight decay (scalar tensor or float)
-    step: int,
-    epsilon: float,
+    step: Optional[int] = None,  # legacy scalar step (baked; not CUDA-graph-capturable)
+    epsilon: float = 1e-8,
     cautious_wd: bool = False,
+    state_steps: Optional[List[Tensor]] = None,  # per-param device step tensors (capturable)
 ):
-    """AdamW update for a list of tensors.
+    """AdamW update for a list of tensors, dispatched through ``torch._fused_adamw_``
+    (a multi-tensor-apply kernel, avoiding the ~6-call ``torch._foreach_*`` chain that
+    otherwise dispatches one aten op per tensor on the CPU side).
 
-    Dispatches through ``torch._fused_adamw_``, which is already a
-    multi-tensor-apply kernel; avoids the ~6-call ``torch._foreach_*`` chain
-    that otherwise dispatches one aten op per tensor on the CPU side.
+    Two forms, selected by which step argument is given:
+
+    * **Legacy** (``step`` = python int): the bias-correction step is baked into a cached
+      0-d device tensor at call time, and ``lr`` is passed as a float. Simple, but NOT
+      CUDA-graph-capturable -- both freeze at the capture-time value under replay.
+    * **Capturable** (``state_steps`` = list of per-param device step tensors, and ``lr``
+      a device tensor): the step is incremented on-device and ``lr`` is read through the
+      fused kernel's ``tensor_lr`` overload, so both advance inside a CUDA graph. This is
+      the form ``megabatch_base`` passes so a wrapped step is graph-capturable.
 
     Cautious weight decay (https://arxiv.org/pdf/2510.12402) is applied as a
     post-step correction rather than inside the kernel:
@@ -147,12 +156,22 @@ def adamw_update_foreach(
     where ``mask = (sign(M_new · X_orig) >= 0)``. We add back the decay that
     was over-applied on elements where momentum and param disagree in sign.
     """
+    if (step is None) == (state_steps is None):
+        raise ValueError(
+            "adamw_update_foreach takes exactly one of step (legacy, baked into the "
+            "kernel) or state_steps (device counters, CUDA-graph-capturable)."
+        )
+    if state_steps is not None and not isinstance(lr, Tensor):
+        raise TypeError(
+            "the capturable form requires lr as a device tensor; a python float is read "
+            "at capture time and baked into the graph, freezing a scheduled LR."
+        )
     if not X:
         return
     n = len(X)
     assert n == len(G) == len(M) == len(V)
+    assert state_steps is None or n == len(state_steps)
 
-    lr_f = float(lr)
     beta1_f = float(beta1)
     beta2_f = float(beta2)
     wd_f = float(weight_decay)
@@ -162,27 +181,53 @@ def adamw_update_foreach(
     if do_cwd_correction:
         X_orig = [x.clone() for x in X]
 
-    # Cache the step scalar per device. ``torch.tensor(x, device="cuda")``
-    # from a Python float stages through pageable CPU memory and issues a
-    # blocking ``cudaMemcpy``, which defeats the point of going fused.
-    # ``fill_`` on a cached 0-d CUDA tensor is a kernel launch — async.
-    step_t = _get_step_tensor(X[0].device)
-    step_t.fill_(float(step))
-    torch._fused_adamw_(
-        X, G, M, V, [],
-        [step_t] * n,
-        amsgrad=False,
-        beta1=beta1_f, beta2=beta2_f,
-        lr=lr_f, weight_decay=wd_f, eps=eps_f,
-        maximize=False,
-    )
+    if state_steps is not None:
+        # Capturable form. ``state_steps`` are per-param device tensors we increment
+        # on-device here (``_fused_adamw_`` reads but does not increment them), so the
+        # bias-correction step advances inside a CUDA graph instead of freezing at capture.
+        # A Tensor ``lr`` selects the ``_fused_adamw_.tensor_lr`` overload, which reads the
+        # LR on-device; the float-lr overload bakes it in at capture. Mirrors torch.optim's
+        # fused path (torch/optim/adam.py::_fused_adam), including passing grad_scale and
+        # found_inf explicitly as None.
+        torch._foreach_add_(state_steps, 1)
+        torch._fused_adamw_(
+            X, G, M, V, [],
+            state_steps,
+            amsgrad=False,
+            beta1=beta1_f, beta2=beta2_f,
+            lr=lr, weight_decay=wd_f, eps=eps_f,
+            maximize=False,
+            grad_scale=None, found_inf=None,
+        )
+    else:
+        # Legacy form. Cache the step scalar per device: ``torch.tensor(x, device="cuda")``
+        # from a Python float stages through pageable CPU memory and issues a blocking
+        # ``cudaMemcpy``; ``fill_`` on a cached 0-d CUDA tensor is an async kernel launch.
+        lr_f = float(lr)
+        step_t = _get_step_tensor(X[0].device)
+        step_t.fill_(float(step))
+        torch._fused_adamw_(
+            X, G, M, V, [],
+            [step_t] * n,
+            amsgrad=False,
+            beta1=beta1_f, beta2=beta2_f,
+            lr=lr_f, weight_decay=wd_f, eps=eps_f,
+            maximize=False,
+        )
 
     if do_cwd_correction:
         # mask == 0  <=>  sign(M_new) * sign(X_orig) < 0  (over-decayed).
         signs = torch._foreach_mul(M, X_orig)
         undo_masks = [(s < 0).to(x.dtype) for s, x in zip(signs, X_orig)]
         correction = torch._foreach_mul(X_orig, undo_masks)
-        torch._foreach_mul_(correction, lr_f * wd_f)
+        if state_steps is not None:
+            # Keep the LR scaling on-device: float(lr) would host-sync and bake the value.
+            # Fold (lr * wd) into one 0-d device scalar first, so the correction is a
+            # single foreach pass and the multiply order matches the legacy branch below
+            # -- scaling by wd and then by lr is not bit-identical to scaling by (lr*wd).
+            torch._foreach_mul_(correction, lr * wd_f)
+        else:
+            torch._foreach_mul_(correction, float(lr) * wd_f)
         torch._foreach_add_(X, correction)
 
 
@@ -248,12 +293,13 @@ def adamw_update_foreach_async(
     beta1: Tensor,
     beta2: Tensor,
     weight_decay: Tensor,
-    step: int,
-    epsilon: float,
+    step: Optional[int] = None,
+    epsilon: float = 1e-8,
     cautious_wd: bool = False,
+    state_steps: Optional[List[Tensor]] = None,
 ) -> Generator[None, None, None]:
     adamw_update_foreach(
-        X, G, M, V, lr, beta1, beta2, weight_decay, step, epsilon, cautious_wd
+        X, G, M, V, lr, beta1, beta2, weight_decay, step, epsilon, cautious_wd, state_steps
     )
     yield
 
