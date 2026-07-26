@@ -128,11 +128,10 @@ class DistributedOrthoBase(Optimizer):
         # Persistent per-group hyperparameter device tensors, keyed by (group index, name).
         # Held here (not only in the group) so the tensor identity survives a caller
         # reassigning group["lr"]; see _ensure_hyperparam_tensor. Which names are carried
-        # this way is decided once per group, before any reassignment can hide the opt-in.
+        # this way is per group and latching; see _live_hyperparams.
         self._hyperparam_tensors: dict = {}
         self._live_hyperparams_by_group: dict = {}
-        for index, group in enumerate(self.param_groups):
-            self._live_hyperparams(index)
+        for group in self.param_groups:
             self._prepopulate_group_state(group)
         self._sync_hyperparam_tensors()
         self._state_prepopulated = True
@@ -422,19 +421,29 @@ class DistributedOrthoBase(Optimizer):
         ``lr`` is always live -- carrying it as a tensor is what lets a ``torch.optim``
         scheduler drive a captured step. ``weight_decay`` is live only when the caller
         supplied a Tensor for it (at construction, ``weight_decay=torch.tensor(0.01)``, or
-        by assigning one to the group before the first step). That opt-in keeps the default
-        float path bit-identical to before: on the AdamW scalar path a live weight decay
-        cannot ride ``torch._fused_adamw_``, whose ``weight_decay`` argument is a float in
-        every overload, so it has to be applied as a separate pass and rounds once more.
+        by assigning one to the group any time before the graph is captured). That opt-in
+        keeps the default float path bit-identical to before: on the AdamW scalar path a
+        live weight decay cannot ride ``torch._fused_adamw_``, whose ``weight_decay``
+        argument is a float in every overload, so it has to be applied as a separate pass
+        and rounds once more.
+
+        The opt-in *latches*: the check re-runs until a Tensor is seen, and never after.
+        So an opt-in made after construction still takes effect, while a later
+        ``group["weight_decay"] = 0.05`` refills the persistent tensor (as it does for the
+        LR) instead of quietly dropping the group back to a value baked in at capture.
+        Opting in after a graph exists is too late to be honored -- the graph already baked
+        the float -- and ``CudaGraphOptimizer`` raises rather than let that pass silently.
 
         Every *other* group scalar (``mu``, ``beta1``, ``epsilon``, ...) reaches the kernels
         as a host value and is baked in at capture. Nothing schedules those today; if
         something does, add it here rather than mutating it behind a captured graph.
         """
         live = self._live_hyperparams_by_group.get(index)
-        if live is None:
-            opted_in = isinstance(self.param_groups[index].get("weight_decay"), Tensor)
-            live = ("lr", "weight_decay") if opted_in else ("lr",)
+        if live is None or "weight_decay" not in live:
+            if isinstance(self.param_groups[index].get("weight_decay"), Tensor):
+                live = ("lr", "weight_decay")
+            elif live is None:
+                live = ("lr",)
             self._live_hyperparams_by_group[index] = live
         return live
 
@@ -500,7 +509,6 @@ class DistributedOrthoBase(Optimizer):
         for index in range(len(self.param_groups)):
             for name in self._live_hyperparams(index):
                 self._ensure_hyperparam_tensor(index, name)
-
 
     def _advance_host_step_counters(self):
         """Advance the host-side ``group["step"]`` counters for a step that ran as a CUDA

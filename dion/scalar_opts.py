@@ -238,14 +238,20 @@ def adamw_update_foreach(
         signs = torch._foreach_mul(M, X_orig)
         undo_masks = [(s < 0).to(x.dtype) for s, x in zip(signs, X_orig)]
         correction = torch._foreach_mul(X_orig, undo_masks)
-        if state_steps is not None:
+        # Fold (lr * wd) into one scalar first, so the correction is a single foreach pass
+        # and the multiply order is the same in every branch -- scaling by wd and then by
+        # lr is not bit-identical to scaling by (lr*wd).
+        if decay_outside:
+            # ``wd_f`` is 0 here (the kernel was handed no decay), so the coefficient has
+            # to come off the device tensor -- on the legacy path too, where using wd_f
+            # would zero the correction and silently degrade CWD to plain weight decay.
+            coeff = lr * weight_decay
+        elif state_steps is not None:
             # Keep the LR scaling on-device: float(lr) would host-sync and bake the value.
-            # Fold (lr * wd) into one 0-d device scalar first, so the correction is a
-            # single foreach pass and the multiply order matches the legacy branch below
-            # -- scaling by wd and then by lr is not bit-identical to scaling by (lr*wd).
-            torch._foreach_mul_(correction, lr * (weight_decay if decay_outside else wd_f))
+            coeff = lr * wd_f
         else:
-            torch._foreach_mul_(correction, float(lr) * wd_f)
+            coeff = float(lr) * wd_f
+        torch._foreach_mul_(correction, coeff)
         torch._foreach_add_(X, correction)
 
 

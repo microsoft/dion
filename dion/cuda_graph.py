@@ -45,7 +45,9 @@ Requirements / caveats:
     tensor like the LR, so filling it in place drives a captured step. That is opt-in
     because on the AdamW scalar path it cannot ride ``torch._fused_adamw_``, whose
     ``weight_decay`` is a float in every overload, so it is applied as a separate pass and
-    rounds ``X`` once more than the default.
+    rounds ``X`` once more than the default. Opt in before the first capture -- afterwards
+    the graph has already baked the host value, and the wrapper raises rather than let a
+    late opt-in look like it took effect.
   * ``loss.backward()`` must accumulate into the same ``p.grad`` tensors each step, so
     call ``zero_grad(set_to_none=False)`` (the wrapper enforces this). The first
     backward allocates ``.grad``; capture pins those buffers.
@@ -114,6 +116,9 @@ class CudaGraphOptimizer(torch.optim.Optimizer):
         self.capture_error_mode = capture_error_mode
         self._step_count = 0
         self._graph: Optional[torch.cuda.CUDAGraph] = None
+        # How many persistent hyperparameter tensors the inner optimizer held when the
+        # graph was captured; see _check_live_hyperparams_unchanged.
+        self._captured_hyperparam_count = 0
         self._warned_set_to_none = False
         self._optimizer_step_pre_hooks = OrderedDict()
         self._optimizer_step_post_hooks = OrderedDict()
@@ -143,12 +148,11 @@ class CudaGraphOptimizer(torch.optim.Optimizer):
         # torch.optim.Optimizer defines add_param_group, so (unlike state/defaults) it is
         # found on the base class and __getattr__ never delegates it -- override explicitly.
         # A new group is not in the captured graph; drop it so the next step re-captures.
-        # Restart the warmup as well: the new group's state, workspaces and comm buffers
-        # have never been touched by an eager step, and re-capturing straight away would
-        # allocate (or recompile) them inside the graph -- the failure warmup_steps exists
-        # to prevent.
-        self._graph = None
-        self._step_count = 0
+        # release() restarts the warmup as well: the new group's state, workspaces and comm
+        # buffers have never been touched by an eager step, and re-capturing straight away
+        # would allocate (or recompile) them inside the graph -- the failure warmup_steps
+        # exists to prevent.
+        self.release()
         return self.optimizer.add_param_group(param_group)
 
     def state_dict(self):
@@ -156,8 +160,7 @@ class CudaGraphOptimizer(torch.optim.Optimizer):
 
     def load_state_dict(self, sd):
         # Loading new state invalidates any captured graph (buffers may move).
-        self._graph = None
-        self._step_count = 0
+        self.release()
         return self.optimizer.load_state_dict(sd)
 
     def zero_grad(self, set_to_none: bool = False):
@@ -181,15 +184,45 @@ class CudaGraphOptimizer(torch.optim.Optimizer):
         NCCL ops are alive. A framework that keeps optimizers alive past the end of training
         (Lightning's ``Strategy.teardown`` only moves their state to CPU, and the process group
         is then destroyed from an ``atexit`` handler) hangs at exit without this.
+
+        Also the single place a captured graph is dropped: ``add_param_group`` and
+        ``load_state_dict`` invalidate the graph and go through here too, so they get the
+        same synchronize-and-destroy instead of leaving live NCCL ops to a refcount.
         """
-        if self._graph is None:
+        graph, self._graph = self._graph, None
+        self._captured_hyperparam_count = 0
+        # The next capture needs its own warmup: whatever made the caller release may also
+        # have invalidated the buffers and workspaces the previous warmup had touched.
+        # Unconditional, so a release() during the warmup restarts it as documented.
+        self._step_count = 0
+        if graph is None:
             return
         # Do not tear a graph down underneath an in-flight replay.
         torch.cuda.synchronize()
-        self._graph = None
-        # The next capture needs its own warmup: whatever made the caller release may also
-        # have invalidated the buffers and workspaces the previous warmup had touched.
-        self._step_count = 0
+        # Destroy the graph here rather than leaving it to refcounting. The whole point of
+        # release() is that the captured NCCL ops are gone before destroy_process_group(),
+        # and any stray reference -- an exception traceback holding the capturing frame, a
+        # debugger, a profiler -- would otherwise keep them alive past this call.
+        graph.reset()
+
+    def _live_hyperparam_count(self) -> int:
+        tensors = getattr(self.optimizer, "_hyperparam_tensors", None)
+        return len(tensors) if tensors is not None else 0
+
+    def _check_live_hyperparams_unchanged(self):
+        # A group hyperparameter opted into being carried live (weight_decay=Tensor is the
+        # way in) gets a fresh persistent device tensor the moment it opts in. Doing that
+        # after capture is too late: the graph baked the old host value and never reads the
+        # new tensor, so the schedule the caller just wired up would silently do nothing.
+        # The count only ever grows, so comparing it is enough -- and it is an int compare
+        # per replay rather than a host-side walk of the param groups.
+        if self._live_hyperparam_count() != self._captured_hyperparam_count:
+            raise RuntimeError(
+                "a param group started carrying a hyperparameter as a live device tensor "
+                "after the CUDA graph was captured (weight_decay=Tensor is the way in). "
+                "The captured graph baked the previous host value and cannot read the new "
+                "tensor. Opt in before the first capture, or call release() to re-capture."
+            )
 
     def _check_params_have_grads(self):
         # The step only touches params with a gradient, so capture freezes the participating
@@ -197,19 +230,24 @@ class CudaGraphOptimizer(torch.optim.Optimizer):
         # stops being updated for the rest of the run. Catching that is worth one host-side
         # pass over the param groups, once, at capture. Params excluded on purpose
         # (requires_grad=False) are not the failure this guards against.
-        missing = sum(
-            1
-            for group in self.param_groups
-            for param in group["params"]
+        missing = [
+            f"group {index}[{position}] shape {tuple(param.shape)}"
+            for index, group in enumerate(self.param_groups)
+            for position, param in enumerate(group["params"])
             if param.requires_grad and param.grad is None
-        )
+        ]
         if missing:
+            # Params carry no names here, so point at where they sit in the groups -- enough
+            # to find them again in whatever built the groups.
+            shown = ", ".join(missing[:5])
+            if len(missing) > 5:
+                shown += f", ... (+{len(missing) - 5} more)"
             raise RuntimeError(
-                f"{missing} parameter(s) require a gradient but have .grad=None at CUDA graph "
-                "capture, so replay would never update them. Capture after every parameter has "
-                "taken part in a backward pass -- raise warmup_steps past whatever schedule "
-                "(modality cadence, expert routing) starves them -- or set requires_grad=False "
-                "on the ones that are meant to be frozen."
+                f"{len(missing)} parameter(s) require a gradient but have .grad=None at CUDA "
+                f"graph capture, so replay would never update them: {shown}. Capture after "
+                "every parameter has taken part in a backward pass -- raise warmup_steps past "
+                "whatever schedule (modality cadence, expert routing) starves them -- or set "
+                "requires_grad=False on the ones that are meant to be frozen."
             )
 
     def _capture(self):
@@ -228,6 +266,7 @@ class CudaGraphOptimizer(torch.optim.Optimizer):
         # is not replayable, and holding it here would turn one loud capture error into
         # every later step silently replaying garbage.
         self._graph = graph
+        self._captured_hyperparam_count = self._live_hyperparam_count()
         graph.replay()
 
     def _sync_host_hyperparams(self):
@@ -259,6 +298,7 @@ class CudaGraphOptimizer(torch.optim.Optimizer):
                 # step() runs (and so does its host-side bookkeeping) while being traced.
                 self._capture()
             else:
+                self._check_live_hyperparams_unchanged()
                 self._graph.replay()
                 # Replay executes only the recorded device work, so any host-side per-step
                 # bookkeeping in step() has to be advanced here instead.

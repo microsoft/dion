@@ -11,7 +11,9 @@ All notable changes to this project are documented in this file.
   holds the captured megabatch all-to-all, and `dist.destroy_process_group()` blocks
   while those NCCL ops are alive, so a framework that keeps optimizers alive past the
   end of training otherwise hangs at process exit. Previously the only ways to drop a
-  graph were `add_param_group` / `load_state_dict`, both with side effects.
+  graph were `add_param_group` / `load_state_dict`, both with side effects. Those two
+  now route through `release()` as well, so they also synchronize and destroy the
+  graph rather than dropping a reference and leaving the NCCL ops to a refcount.
 
 - A per-group `weight_decay` supplied as a Tensor (`weight_decay=torch.tensor(0.01)`)
   is carried as a persistent device tensor like the learning rate, so filling it in
@@ -21,9 +23,18 @@ All notable changes to this project are documented in this file.
   Opt-in via the Tensor: on the AdamW scalar path a live weight decay cannot ride
   `torch._fused_adamw_`, whose `weight_decay` is a float in every overload, so it is
   applied as a separate pass and rounds `X` once more. A float `weight_decay` keeps
-  the previous fused path unchanged.
+  the previous fused path unchanged. The opt-in latches, so it also works when the
+  Tensor is assigned to the group after construction, and a later float assignment
+  refills the tensor instead of dropping the group back to a baked value. Opting in
+  after the graph exists is too late to honor, and `CudaGraphOptimizer` raises instead
+  of letting the schedule silently do nothing.
 
 ### Fixed
+
+- `adamw_update_foreach` dropped the cautious-weight-decay correction entirely when it
+  was given a device-tensor `weight_decay` on the legacy (`step=`) path: the kernel is
+  handed `weight_decay=0` there, and the correction was scaled by that float, so
+  `cautious_wd=True` silently degraded to plain weight decay.
 
 - CUDA-graph capture now refuses to run while any `requires_grad` parameter still has
   `.grad=None`. The step only touches parameters with a gradient, so capture freezes

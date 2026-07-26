@@ -29,7 +29,9 @@ class Muon(DistributedOrthoBase):
             For element-wise update rules, this is the actual learning rate and no additional scaling is done.
         mu: Momentum factor for Muon algorithm.
         betas: Tuple of (beta1, beta2) for AdamW and Lion algorithms.
-        weight_decay: Weight decay factor.
+        weight_decay: Weight decay factor. Pass a Tensor to carry it as a persistent
+            device tensor the kernels read live, so filling it in place drives a
+            CUDA-graph-captured step (see dion.cuda_graph); a float is baked at capture.
         cautious_wd: Whether to apply weight decay only where update and parameter signs align.
         epsilon: Small value to avoid division by zero.
         nesterov: Whether to use Nesterov momentum.
@@ -63,7 +65,7 @@ class Muon(DistributedOrthoBase):
         lr: float = 0.01,
         mu: float = 0.95,
         betas: Tuple[float, float] = (0.9, 0.95),
-        weight_decay: float = 0.01,
+        weight_decay: Union[float, Tensor] = 0.01,
         cautious_wd: bool = False,
         epsilon: float = 1e-8,
         nesterov: bool = False,

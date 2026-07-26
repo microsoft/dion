@@ -29,7 +29,9 @@ class Dion2(DistributedOrthoBase):
         fraction: Fraction of submatrix to orthogonalize per update (0 < fraction <= 1).
         ef_decay: Error-feedback decay factor applied to selected submatrix.
         betas: Tuple of (beta1, beta2) for AdamW and Lion algorithms.
-        weight_decay: Weight decay factor.
+        weight_decay: Weight decay factor. Pass a Tensor to carry it as a persistent
+            device tensor the kernels read live, so filling it in place drives a
+            CUDA-graph-captured step (see dion.cuda_graph); a float is baked at capture.
         epsilon: Small value to avoid division by zero.
         adjust_lr: How to adjust the learning rate for Muon updates ("spectral_norm" or "rms_norm" or None).
             "spectral_norm": Adjust based on spectral norm, for learning rate transfer across model scale.
@@ -63,7 +65,7 @@ class Dion2(DistributedOrthoBase):
         fraction: float = 0.25,
         ef_decay: float = 0.95,
         betas: Tuple[float, float] = (0.9, 0.95),
-        weight_decay: float = 0.01,
+        weight_decay: Union[float, Tensor] = 0.01,
         epsilon: float = 1e-8,
         adjust_lr: Optional[str] = "spectral_norm",
         flatten: bool = False,
