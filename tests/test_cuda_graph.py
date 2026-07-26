@@ -531,3 +531,36 @@ def test_cudagraph_step_with_closure(optimizer_cls):
     diff = max((a - b).abs().max().item() for a, b in zip(final_eager, final_graph))
     assert diff <= 1e-5, f"{optimizer_cls.__name__}: closure step-vs-eager diff {diff:.3e}"
     assert all(l is not None for l in losses)
+
+
+@pytest.mark.parametrize("optimizer_cls", [Dion2, NorDion2])
+def test_cudagraph_matches_eager_filtered_triton(optimizer_cls):
+    # The filtered (fraction<1) + triton post-orthogonalize path -- the configuration we
+    # train with. Regression: dion2_post_orthogonalize_triton did a .item() on the device
+    # LR to pass the weight-decay/step scalars to the kernel, which is a host sync CUDA
+    # graph capture forbids (and would freeze a scheduled LR under replay). The scalars are
+    # now 0-d device tensors the kernel loads. Small tensors still exercise the kernel.
+    def build_filtered():
+        torch.manual_seed(SEED)
+        weights = [torch.nn.Parameter(torch.randn(64, 128, device=DEVICE)),
+                   torch.nn.Parameter(torch.randn(128, 64, device=DEVICE))]
+        biases = [torch.nn.Parameter(torch.randn(64, device=DEVICE)),
+                  torch.nn.Parameter(torch.randn(128, device=DEVICE))]
+        opt = optimizer_cls([
+            {"params": weights},
+            {"params": biases, "algorithm": "adamw"},
+        ], distributed_mesh=None, lr=0.02, fraction=0.25, triton_post_ortho=True)
+        return weights + biases, opt
+
+    p0, _ = build_filtered()
+    grad_seq = _grad_seq(p0)
+
+    pe, oe = build_filtered()
+    final_eager = _run(pe, oe, grad_seq, oe.step)
+
+    pg, og = build_filtered()
+    wrap = CudaGraphOptimizer(og, warmup_steps=WARMUP)
+    final_graph = _run(pg, og, grad_seq, wrap.step)
+
+    diff = max((a - b).abs().max().item() for a, b in zip(final_eager, final_graph))
+    assert diff <= 1e-5, f"{optimizer_cls.__name__} filtered+triton: capture-vs-eager diff {diff:.3e}"
