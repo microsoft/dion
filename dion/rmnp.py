@@ -57,28 +57,34 @@ class RMNP(DistributedOrthoBase):
         params: Parameters for the optimizer.
         distributed_mesh: DeviceMesh or ProcessGroup for distributed training.
             Use DeviceMesh for FSDP2 and ProcessGroup for DistributedDataParallel.
-        lr: Base learning rate. With ``adjust_lr`` set, this is scaled based on
-            the matrix dimensions; with ``adjust_lr=None`` (the RMNP default) it
-            is used as-is, matching the paper's ``W ← W − η·row_normalize(V)``.
-            For element-wise update rules, this is the actual learning rate and
-            no additional scaling is done.
+        lr: Base learning rate, scaled per matrix by ``adjust_lr`` (see below).
+            The paper uses a matrix learning rate set slightly larger than the
+            AdamW rate used for 1D parameters.
         mu: Momentum factor for RMNP algorithm.
         betas: Tuple of (beta1, beta2) for AdamW and Lion algorithms.
         weight_decay: Weight decay factor.
         cautious_wd: Whether to apply weight decay only where update and parameter signs align.
         epsilon: Small value added to each row norm to avoid division by zero.
         nesterov: Whether to use Nesterov momentum. Off by default, matching the paper.
-        adjust_lr: How to adjust the learning rate ("spectral_norm" or "rms_norm" or None).
-            "spectral_norm": Adjust based on spectral norm, for learning rate transfer across model scale.
+        adjust_lr: How to adjust the learning rate ("spectral_norm_clip",
+            "spectral_norm", "rms_norm", or None).
+            "spectral_norm_clip": Multiply by ``max(1, sqrt(d_out / d_in))`` --
+            the original Muon LR scaling. This is the RMNP default and matches
+            the paper (arXiv:2603.20527), which uses Muon's learning-rate
+            adjustment on the normalized update.
+            "spectral_norm": Multiply by ``sqrt(d_out / d_in)`` (the same ratio
+            without the clamp at 1); for learning-rate transfer across model scale.
             "rms_norm": Adjust based on RMS norm, for learning rate compatibility with Adam/AdamW.
-            None: Do not adjust the learning rate. This is the RMNP default and
-            matches the paper, which tunes the matrix learning rate directly and
-            applies no post-normalization rescaling; the other options are
-            offered for consistency with the rest of the family but were not
-            studied in the RMNP paper.
+            None: Do not adjust the learning rate (raw ``W ← W − η·row_normalize(V)``).
         flatten: Whether to flatten 3D+ tensors to 2D for RMNP updates.
             True: Tensors with 3+ dimensions are flattened to 2D. Use this for convolutional layers.
             False: Tensors are not flattened. 3D+ tensors are treated as batches of 2D matrices.
+
+    Unlike orthogonalization, row-wise ℓ₂ normalization is cheap (O(mn)) and
+    well-defined on any 2D weight, so RMNP can additionally optimize the
+    embedding and LM-head matrices -- not just the hidden weights -- by routing
+    them to it via a parameter group (per arXiv:2603.20527). Muon and the other
+    orthogonalizing optimizers typically leave those to a scalar optimizer.
 
     Because row normalization is scale-invariant, the paper's momentum EMA
     ``V ← β·V + (1−β)·G`` and Muon's ``M ← μ·M + G`` produce the same normalized
@@ -105,7 +111,7 @@ class RMNP(DistributedOrthoBase):
         cautious_wd: bool = False,
         epsilon: float = 1e-8,
         nesterov: bool = False,
-        adjust_lr: Optional[str] = None,
+        adjust_lr: Optional[str] = "spectral_norm_clip",
         flatten: bool = False,
     ):
         if lr < 0.0:
@@ -114,9 +120,10 @@ class RMNP(DistributedOrthoBase):
             raise ValueError(f"Invalid momentum factor (mu): {mu}")
         if len(betas) != 2 or betas[0] < 0.0 or betas[1] < 0.0:
             raise ValueError(f"Invalid betas: {betas}")
-        if adjust_lr not in ("spectral_norm", "rms_norm", None):
+        if adjust_lr not in ("spectral_norm_clip", "spectral_norm", "rms_norm", None):
             raise ValueError(
-                f"Invalid adjust_lr value: {adjust_lr}. Must be 'spectral_norm', 'rms_norm', or None."
+                f"Invalid adjust_lr value: {adjust_lr}. Must be 'spectral_norm_clip', "
+                f"'spectral_norm', 'rms_norm', or None."
             )
 
         defaults = dict(

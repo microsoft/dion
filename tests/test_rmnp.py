@@ -91,6 +91,37 @@ class TestRowNormalize:
 
 
 # ---------------------------------------------------------------------------
+# LR scaling: original-Muon clamped spectral adjustment (the paper's default)
+# ---------------------------------------------------------------------------
+
+class TestSpectralNormClip:
+    """RMNP's default LR scaling is ``max(1, sqrt(d_out / d_in))`` (arXiv:2603.20527),
+    the original Muon adjustment -- spectral_norm floored at 1."""
+
+    def test_matches_muon_formula(self):
+        from dion.megabatch_base import adjust_lr_spectral_norm_clip
+        import math
+        for d_out, d_in in [(64, 16), (16, 64), (32, 32), (2048, 512), (512, 2048)]:
+            got = adjust_lr_spectral_norm_clip(1.0, (d_out, d_in), flatten=False)
+            assert got == pytest.approx(max(1.0, math.sqrt(d_out / d_in)))
+
+    def test_clamps_wide_matrices_but_not_tall(self):
+        """Wide (d_out < d_in) is held at 1; tall/square matches spectral_norm."""
+        from dion.megabatch_base import (
+            adjust_lr_spectral_norm,
+            adjust_lr_spectral_norm_clip,
+        )
+        # Wide: spectral_norm shrinks below 1, clip holds at 1.
+        assert adjust_lr_spectral_norm(1.0, (16, 64), flatten=False) < 1.0
+        assert adjust_lr_spectral_norm_clip(1.0, (16, 64), flatten=False) == 1.0
+        # Tall: clip == spectral_norm (both > 1, no clamp).
+        tall = (256, 64)
+        assert adjust_lr_spectral_norm_clip(1.0, tall, flatten=False) == pytest.approx(
+            adjust_lr_spectral_norm(1.0, tall, flatten=False)
+        )
+
+
+# ---------------------------------------------------------------------------
 # Asymptotic equivalence to orthogonalization (the paper's core claim)
 # ---------------------------------------------------------------------------
 

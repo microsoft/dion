@@ -189,9 +189,16 @@ class TestRMNP:
 
     def test_adjust_lr_options(self):
         from dion import RMNP
-        for adjust_lr in ["spectral_norm", "rms_norm", None]:
+        for adjust_lr in ["spectral_norm_clip", "spectral_norm", "rms_norm", None]:
             params = _make_params([(64, 128)])
             _run_steps(RMNP, params, dict(lr=0.01, adjust_lr=adjust_lr))
+
+    def test_default_adjust_lr_is_muon_clip(self):
+        """RMNP defaults to the original-Muon clamped spectral scaling (the
+        paper's LR adjustment), not None."""
+        from dion import RMNP
+        opt = RMNP(_make_params([(64, 128)]))
+        assert opt.param_groups[0]["adjust_lr"] == "spectral_norm_clip"
 
     def test_megabatch_same_shape(self):
         """Multiple same-shape params should be megabatched."""
@@ -629,9 +636,10 @@ class TestSplitSizes:
         self._run_parity(Muon, dict(lr=0.01), split_sizes=(16, 16, 16, 16))
 
     def test_rmnp_matches_separate(self):
-        # RMNP row-normalizes each row independently, so per-block splitting is
-        # a no-op relative to normalizing the fused matrix (adjust_lr=None gives
-        # no per-block scaling); fused and separate updates coincide exactly.
+        # RMNP row-normalizes each row independently; the default
+        # adjust_lr="spectral_norm_clip" gives each block the per-block LR
+        # scaling (via split_scales) it would receive as a separate parameter,
+        # so the fused and separate updates match.
         from dion import RMNP
         self._run_parity(RMNP, dict(lr=0.01))
 

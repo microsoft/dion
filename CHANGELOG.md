@@ -14,8 +14,16 @@ All notable changes to this project are documented in this file.
   weight while, in the paper's experiments, matching Muon-level quality
   (orthogonalization and row-wise ℓ₂ normalization are asymptotically equivalent
   for the Transformer). It reuses Muon's momentum, distributed assembly, and
-  weight update, so it inherits the same FSDP2/DDP sharding support. Learning
-  rate is not rescaled by default (`adjust_lr=None`), matching the paper.
+  weight update, so it inherits the same FSDP2/DDP sharding support. Following
+  the paper, the learning rate is scaled by the original Muon adjustment
+  `max(1, sqrt(d_out / d_in))` by default (a new `adjust_lr="spectral_norm_clip"`
+  mode). Unlike orthogonalization, RMNP's row normalization is also well-defined
+  on the embedding and LM-head matrices, which can be routed to it.
+
+- New `adjust_lr="spectral_norm_clip"` learning-rate adjustment
+  (`lr * max(1, sqrt(fan_out / fan_in))`) -- the original Muon scaling
+  (`spectral_norm` clamped at 1). It is RMNP's default; the other orthogonalizing
+  optimizers keep their existing defaults.
 
 ### Changed
 
