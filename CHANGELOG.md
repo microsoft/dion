@@ -4,6 +4,35 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `CudaGraphOptimizer.release()` drops the captured graph (and restarts the warmup,
+  so a later capture is not taken with cold buffers). On the sharded path the graph
+  holds the captured megabatch all-to-all, and `dist.destroy_process_group()` blocks
+  while those NCCL ops are alive, so a framework that keeps optimizers alive past the
+  end of training otherwise hangs at process exit. Previously the only ways to drop a
+  graph were `add_param_group` / `load_state_dict`, both with side effects.
+
+- A per-group `weight_decay` supplied as a Tensor (`weight_decay=torch.tensor(0.01)`)
+  is carried as a persistent device tensor like the learning rate, so filling it in
+  place drives a CUDA-graph-captured step. This makes schedule-coupled weight decay
+  (Defazio 2506.02285, AdamC / Muon-C), which rescales `weight_decay` every step,
+  usable under capture — previously it was silently frozen at its capture-step value.
+  Opt-in via the Tensor: on the AdamW scalar path a live weight decay cannot ride
+  `torch._fused_adamw_`, whose `weight_decay` is a float in every overload, so it is
+  applied as a separate pass and rounds `X` once more. A float `weight_decay` keeps
+  the previous fused path unchanged.
+
+### Fixed
+
+- CUDA-graph capture now refuses to run while any `requires_grad` parameter still has
+  `.grad=None`. The step only touches parameters with a gradient, so capture freezes
+  the participating set: a parameter starved of gradients through the warmup steps (a
+  modality cadence that runs text-only batches, expert routing that skips an expert)
+  was left out of the graph and silently stopped being updated for the rest of the
+  run. Freeze such parameters explicitly with `requires_grad=False`, or raise
+  `warmup_steps` past the schedule that starves them.
+
 ### Changed
 
 - The FSDP2 row-sharded `selection_scope` default (both `Dion2` and `NorDion2`)

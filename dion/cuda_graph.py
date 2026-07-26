@@ -36,6 +36,16 @@ Requirements / caveats:
     asks the inner optimizer to push any such value back into the persistent tensor.
     Optimizers outside this family have no such hook, so any hyperparameter they read as a
     host-side python value -- an LR included -- is baked in at capture and stops changing.
+  * ``lr`` is the only group hyperparameter carried live by default. Every other scalar
+    (``weight_decay``, ``mu``, ``beta1``, ``epsilon``, ...) reaches the kernels as a host
+    value and is baked in at capture, so a callback that rewrites one per step -- e.g.
+    schedule-coupled weight decay, which scales ``weight_decay`` with the LR -- would freeze
+    it at its capture-step value with no error. ``weight_decay`` can opt in: pass a Tensor
+    for it (``weight_decay=torch.tensor(0.01)``) and it is carried as a persistent device
+    tensor like the LR, so filling it in place drives a captured step. That is opt-in
+    because on the AdamW scalar path it cannot ride ``torch._fused_adamw_``, whose
+    ``weight_decay`` is a float in every overload, so it is applied as a separate pass and
+    rounds ``X`` once more than the default.
   * ``loss.backward()`` must accumulate into the same ``p.grad`` tensors each step, so
     call ``zero_grad(set_to_none=False)`` (the wrapper enforces this). The first
     backward allocates ``.grad``; capture pins those buffers.
@@ -43,13 +53,14 @@ Requirements / caveats:
     across steps. Dion2/NorDion2's selection *count* is fixed; only indices/values vary,
     which replay handles (it re-reads the live tensors).
   * Which parameters take part is fixed at capture time: the step skips params whose
-    ``.grad`` is None, so a param that is frozen (or gets no tokens) during the warmup
-    steps is left out of the graph and stops being updated for the rest of the run, with
-    no error. Wrap only a step whose set of grad-carrying params is stable.
+    ``.grad`` is None, so a param that gets no tokens during the warmup steps would be left
+    out of the graph and stop being updated for the rest of the run. Capture refuses to run
+    while any ``requires_grad`` param still has ``.grad=None``, so this fails loudly instead;
+    raise ``warmup_steps`` past whatever schedule starves the param, or freeze it explicitly.
   * On the sharded path the graph holds the captured megabatch all-to-all, so the NCCL
     ops outlive the step. ``dist.destroy_process_group()`` blocks while they are alive:
-    drop the wrapper (and any graph it holds) before tearing the process group down at
-    the end of a run, or shutdown hangs.
+    call ``release()`` before tearing the process group down at the end of a run, or
+    shutdown hangs.
   * torch.compile is neither needed nor wanted under a graph (the graph already removes
     dispatch, and a fullgraph compile of the unrolled per-matrix loops is what makes the
     first step take minutes at many layers). Disable it for the wrapped optimizer.
@@ -162,6 +173,45 @@ class CudaGraphOptimizer(torch.optim.Optimizer):
             )
         self.optimizer.zero_grad(set_to_none=False)
 
+    def release(self) -> None:
+        """Drop the captured graph, so the next step captures afresh after a new warmup.
+
+        Call this before ``dist.destroy_process_group()``: on the sharded path the graph holds
+        the captured megabatch all-to-all, and destroying the process group blocks while those
+        NCCL ops are alive. A framework that keeps optimizers alive past the end of training
+        (Lightning's ``Strategy.teardown`` only moves their state to CPU, and the process group
+        is then destroyed from an ``atexit`` handler) hangs at exit without this.
+        """
+        if self._graph is None:
+            return
+        # Do not tear a graph down underneath an in-flight replay.
+        torch.cuda.synchronize()
+        self._graph = None
+        # The next capture needs its own warmup: whatever made the caller release may also
+        # have invalidated the buffers and workspaces the previous warmup had touched.
+        self._step_count = 0
+
+    def _check_params_have_grads(self):
+        # The step only touches params with a gradient, so capture freezes the participating
+        # set: a param whose .grad is still None here is left out of the graph and silently
+        # stops being updated for the rest of the run. Catching that is worth one host-side
+        # pass over the param groups, once, at capture. Params excluded on purpose
+        # (requires_grad=False) are not the failure this guards against.
+        missing = sum(
+            1
+            for group in self.param_groups
+            for param in group["params"]
+            if param.requires_grad and param.grad is None
+        )
+        if missing:
+            raise RuntimeError(
+                f"{missing} parameter(s) require a gradient but have .grad=None at CUDA graph "
+                "capture, so replay would never update them. Capture after every parameter has "
+                "taken part in a backward pass -- raise warmup_steps past whatever schedule "
+                "(modality cadence, expert routing) starves them -- or set requires_grad=False "
+                "on the ones that are meant to be frozen."
+            )
+
     def _capture(self):
         # Capture exactly ONE step. Lazy allocations, cuBLAS workspaces and NCCL setup are
         # already done by the warmup_steps eager steps, so nothing allocates inside the
@@ -169,6 +219,7 @@ class CudaGraphOptimizer(torch.optim.Optimizer):
         # so we replay once immediately to actually perform this step's update. Without
         # that replay the trajectory would be one step short (params/state/step frozen at
         # their pre-capture values for this call).
+        self._check_params_have_grads()
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, capture_error_mode=self.capture_error_mode):
@@ -186,7 +237,7 @@ class CudaGraphOptimizer(torch.optim.Optimizer):
         # replaces it with a float the graph will never see. step() reconciles that on the
         # eager path; under capture/replay it either does not run at all (replay) or runs
         # with capture already underway (capture), so do it here, before either.
-        sync = getattr(self.optimizer, "_sync_lr_tensors", None)
+        sync = getattr(self.optimizer, "_sync_hyperparam_tensors", None)
         if sync is not None:
             sync()
 

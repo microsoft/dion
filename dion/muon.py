@@ -14,7 +14,7 @@ from .megabatch_base import (
     adjust_lr_rms_norm,
     compute_split_lr_scales,
 )
-from .opt_utils import AsyncTask, to_local
+from .opt_utils import AsyncTask, as_scalar_tensor, to_local
 
 
 class Muon(DistributedOrthoBase):
@@ -127,7 +127,7 @@ class Muon(DistributedOrthoBase):
             update_args = dict(
                 lr=group["lr"],
                 momentum=torch.tensor(group["mu"]),
-                weight_decay=torch.tensor(group["weight_decay"]),
+                weight_decay=as_scalar_tensor(group["weight_decay"]),
                 epsilon=torch.tensor(group["epsilon"]),
                 nesterov=group["nesterov"],
                 flatten=group["flatten"],

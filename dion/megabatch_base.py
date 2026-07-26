@@ -15,7 +15,7 @@ from .newton_schulz_triton import (
     zeropower_via_newtonschulz5,
 )
 from .polar_express import polar_express, polar_express_triton
-from .opt_utils import AsyncRuntime, AsyncTask, to_local
+from .opt_utils import AsyncRuntime, AsyncTask, as_scalar_tensor, to_local
 from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
 
 
@@ -125,13 +125,16 @@ class DistributedOrthoBase(Optimizer):
         # loop), generalized here to the whole DistributedOrthoBase family via
         # the (possibly overridden) _get_or_initialize_state.
         self._state_prepopulated = False
-        # Persistent per-group LR device tensors, keyed by param group index. Held here
-        # (not only in group["lr"]) so the tensor identity survives a caller reassigning
-        # group["lr"]; see _ensure_lr_tensor.
-        self._lr_tensors: dict = {}
+        # Persistent per-group hyperparameter device tensors, keyed by (group index, name).
+        # Held here (not only in the group) so the tensor identity survives a caller
+        # reassigning group["lr"]; see _ensure_hyperparam_tensor. Which names are carried
+        # this way is decided once per group, before any reassignment can hide the opt-in.
+        self._hyperparam_tensors: dict = {}
+        self._live_hyperparams_by_group: dict = {}
         for index, group in enumerate(self.param_groups):
-            self._ensure_lr_tensor(index)
+            self._live_hyperparams(index)
             self._prepopulate_group_state(group)
+        self._sync_hyperparam_tensors()
         self._state_prepopulated = True
 
     def _prepopulate_group_state(self, group: dict) -> None:
@@ -146,7 +149,9 @@ class DistributedOrthoBase(Optimizer):
         # add_param_group calls that Optimizer.__init__ makes before this class
         # finishes setup; the __init__ loop above pre-populates those groups.
         if getattr(self, "_state_prepopulated", False):
-            self._ensure_lr_tensor(len(self.param_groups) - 1)
+            index = len(self.param_groups) - 1
+            for name in self._live_hyperparams(index):
+                self._ensure_hyperparam_tensor(index, name)
             self._prepopulate_group_state(self.param_groups[-1])
 
     @torch.no_grad()
@@ -158,12 +163,12 @@ class DistributedOrthoBase(Optimizer):
                 loss = closure()
 
         # The LR is carried as a device tensor the kernels read directly (see
-        # _ensure_lr_tensor); a scheduler updates it in place outside the graph and every
+        # _ensure_hyperparam_tensor); a scheduler updates it in place outside the graph and every
         # replay re-reads the live value. Push in anything a caller assigned to
         # group["lr"] as a plain float since the last step. A no-op (and so safe under
         # graph capture) once the tensor is in place, which the wrapper guarantees by
         # calling this itself before capturing.
-        self._sync_lr_tensors()
+        self._sync_hyperparam_tensors()
 
         ortho_groups = []
         lion_groups = []
@@ -410,21 +415,44 @@ class DistributedOrthoBase(Optimizer):
 
         return is_batch_sharded, is_matrix_sharded, sharded_tensor_dim
 
-    def _ensure_lr_tensor(self, index: int) -> Optional[Tensor]:
-        """Make ``param_groups[index]["lr"]`` this group's persistent 0-d device float32
+    def _live_hyperparams(self, index: int) -> Tuple[str, ...]:
+        """Names of ``param_groups[index]``'s hyperparameters carried as persistent device
+        tensors, so a captured graph re-reads them on every replay instead of baking them in.
+
+        ``lr`` is always live -- carrying it as a tensor is what lets a ``torch.optim``
+        scheduler drive a captured step. ``weight_decay`` is live only when the caller
+        supplied a Tensor for it (at construction, ``weight_decay=torch.tensor(0.01)``, or
+        by assigning one to the group before the first step). That opt-in keeps the default
+        float path bit-identical to before: on the AdamW scalar path a live weight decay
+        cannot ride ``torch._fused_adamw_``, whose ``weight_decay`` argument is a float in
+        every overload, so it has to be applied as a separate pass and rounds once more.
+
+        Every *other* group scalar (``mu``, ``beta1``, ``epsilon``, ...) reaches the kernels
+        as a host value and is baked in at capture. Nothing schedules those today; if
+        something does, add it here rather than mutating it behind a captured graph.
+        """
+        live = self._live_hyperparams_by_group.get(index)
+        if live is None:
+            opted_in = isinstance(self.param_groups[index].get("weight_decay"), Tensor)
+            live = ("lr", "weight_decay") if opted_in else ("lr",)
+            self._live_hyperparams_by_group[index] = live
+        return live
+
+    def _ensure_hyperparam_tensor(self, index: int, name: str) -> Optional[Tensor]:
+        """Make ``param_groups[index][name]`` this group's persistent 0-d device float32
         tensor and return it (``None`` for a group with no parameters, which has no device
         to put it on and no kernel to read it).
 
-        The LR is carried as a device tensor the kernels read directly, so a ``torch.optim``
+        The value is carried as a device tensor the kernels read directly, so a ``torch.optim``
         LR scheduler -- which updates a tensor ``lr`` in place -- drives a captured step
         natively: the scheduler fills this tensor outside the graph and every replay re-reads
-        it, with no refresh plumbing. float32 is what the former ``torch.tensor(group["lr"])``
+        it, with no refresh plumbing. float32 is what the former ``torch.tensor(group[name])``
         produced and the dtype the fused AdamW ``tensor_lr`` overload requires.
 
         The tensor is allocated once per group and thereafter only ever filled, never
         replaced. That identity is what makes replay correct: a captured graph reads the
         tensor recorded at capture time, so handing the group a *different* tensor would
-        leave every later replay on the stale one. Anything else found under ``lr`` -- a
+        leave every later replay on the stale one. Anything else found under ``name`` -- a
         python float from construction or from the ``group["lr"] = 0.05`` idiom of a
         hand-rolled schedule, or a wrong-device tensor restored from a checkpoint via
         ``map_location="cpu"`` -- is copied into the persistent tensor and the tensor put
@@ -436,41 +464,43 @@ class DistributedOrthoBase(Optimizer):
         if not params:
             return None
 
-        lr = group["lr"]
-        tensor = self._lr_tensors.get(index)
-        if lr is tensor:
+        value = group[name]
+        tensor = self._hyperparam_tensors.get((index, name))
+        if value is tensor:
             return tensor
 
         # Everything below writes to the device, so it must not run under graph capture:
-        # a recorded fill_ would re-apply the capture-time LR on every replay, silently
+        # a recorded fill_ would re-apply the capture-time value on every replay, silently
         # overwriting whatever the scheduler had set.
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                f"param group {index} has a learning rate that is not its persistent "
-                f"device tensor ({type(lr).__name__}), and CUDA graph capture is already "
-                "underway so it cannot be refreshed. Sync the learning rate before "
+                f"param group {index} has a {name} that is not its persistent "
+                f"device tensor ({type(value).__name__}), and CUDA graph capture is already "
+                f"underway so it cannot be refreshed. Sync {name} before "
                 "capturing (CudaGraphOptimizer does this for you)."
             )
 
         device = to_local(params[0]).device
         if tensor is None or tensor.device != device:
             tensor = torch.empty((), dtype=torch.float32, device=device)
-            self._lr_tensors[index] = tensor
-        if isinstance(lr, Tensor):
-            tensor.copy_(lr)
+            self._hyperparam_tensors[(index, name)] = tensor
+        if isinstance(value, Tensor):
+            tensor.copy_(value)
         else:
-            tensor.fill_(lr)
-        group["lr"] = tensor
+            tensor.fill_(value)
+        group[name] = tensor
         return tensor
 
-    def _sync_lr_tensors(self) -> None:
-        """Push each group's host-side ``lr`` into the persistent device tensor the kernels
-        (and any captured CUDA graph) read. Called at the top of ``step()``, and by
+    def _sync_hyperparam_tensors(self) -> None:
+        """Push each group's host-side hyperparameters into the persistent device tensors the
+        kernels (and any captured CUDA graph) read. Called at the top of ``step()``, and by
         ``CudaGraphOptimizer`` before it captures or replays -- under replay ``step()``
         never runs, so this is the only thing that carries a ``group["lr"] = 0.05``
         assignment through to the graph."""
         for index in range(len(self.param_groups)):
-            self._ensure_lr_tensor(index)
+            for name in self._live_hyperparams(index):
+                self._ensure_hyperparam_tensor(index, name)
+
 
     def _advance_host_step_counters(self):
         """Advance the host-side ``group["step"]`` counters for a step that ran as a CUDA
@@ -501,9 +531,9 @@ class DistributedOrthoBase(Optimizer):
 
     def load_state_dict(self, state_dict):
         super().load_state_dict(state_dict)
-        # Refill the device LR tensors from the loaded values (a float from a normal
+        # Refill the device hyperparameter tensors from the loaded values (a float from a normal
         # checkpoint, or a wrong-device tensor from one written by an earlier build).
-        self._sync_lr_tensors()
+        self._sync_hyperparam_tensors()
         for group in self.param_groups:
             if group["algorithm"] != "adamw":
                 continue
@@ -558,7 +588,7 @@ class DistributedOrthoBase(Optimizer):
                     lr=group["lr"],
                     beta1=torch.tensor(group["beta1"]),
                     beta2=torch.tensor(group["beta2"]),
-                    weight_decay=torch.tensor(group["weight_decay"]),
+                    weight_decay=as_scalar_tensor(group["weight_decay"]),
                     cautious_wd=group.get("cautious_wd", False),
                 )
             )
@@ -586,7 +616,7 @@ class DistributedOrthoBase(Optimizer):
                     lr=group["lr"],
                     beta1=torch.tensor(group["beta1"]),
                     beta2=torch.tensor(group["beta2"]),
-                    weight_decay=torch.tensor(group["weight_decay"]),
+                    weight_decay=as_scalar_tensor(group["weight_decay"]),
                     state_steps=step_tensors,
                     epsilon=torch.tensor(group["epsilon"]),
                     cautious_wd=group.get("cautious_wd", False),

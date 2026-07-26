@@ -13,7 +13,7 @@ from .megabatch_base import (
     adjust_lr_spectral_norm,
     adjust_lr_rms_norm,
 )
-from .opt_utils import AsyncTask, to_local
+from .opt_utils import AsyncTask, as_scalar_tensor, to_local
 from .dion2 import (
     dion2_pre_orthogonalize,
     dion2_post_orthogonalize,
@@ -172,7 +172,7 @@ class NorDion2(DistributedOrthoBase):
                 fraction=group["fraction"],
                 momentum=torch.tensor(group["mu"]),
                 muon_beta2=torch.tensor(group["muon_beta2"]),
-                weight_decay=torch.tensor(group["weight_decay"]),
+                weight_decay=as_scalar_tensor(group["weight_decay"]),
                 epsilon=torch.tensor(group["epsilon"]),
                 flatten=group["flatten"],
                 adjust_lr=group["adjust_lr"],

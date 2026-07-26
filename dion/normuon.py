@@ -13,7 +13,7 @@ from .megabatch_base import (
     adjust_lr_rms_norm,
     compute_split_lr_scales,
 )
-from .opt_utils import AsyncTask, to_local
+from .opt_utils import AsyncTask, as_scalar_tensor, to_local
 from .muon import muon_update_pre_orthogonalize, muon_update_post_orthogonalize
 
 
@@ -151,7 +151,7 @@ class NorMuon(DistributedOrthoBase):
                 lr=group["lr"],
                 momentum=torch.tensor(group["mu"]),
                 muon_beta2=torch.tensor(group["muon_beta2"]),
-                weight_decay=torch.tensor(group["weight_decay"]),
+                weight_decay=as_scalar_tensor(group["weight_decay"]),
                 epsilon=torch.tensor(group["epsilon"]),
                 nesterov=group["nesterov"],
                 flatten=group["flatten"],

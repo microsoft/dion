@@ -13,7 +13,7 @@ from .megabatch_base import (
     adjust_lr_spectral_norm,
     adjust_lr_rms_norm,
 )
-from .opt_utils import AsyncTask, to_local
+from .opt_utils import AsyncTask, as_scalar_tensor, to_local
 
 
 class Dion2(DistributedOrthoBase):
@@ -145,7 +145,7 @@ class Dion2(DistributedOrthoBase):
                 lr=group["lr"],
                 ef_decay=torch.tensor(group["ef_decay"]),
                 fraction=group["fraction"],
-                weight_decay=torch.tensor(group["weight_decay"]),
+                weight_decay=as_scalar_tensor(group["weight_decay"]),
                 epsilon=torch.tensor(group["epsilon"]),
                 flatten=group["flatten"],
                 adjust_lr=group["adjust_lr"],
