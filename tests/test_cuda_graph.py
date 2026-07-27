@@ -11,6 +11,7 @@ check that the wrapper is numerically correct:
   tensor the optimizer reads and the wrapper refreshes before each replay -- rather than
   freezing at the capture-time value.
 """
+import inspect
 import io
 import os
 
@@ -812,3 +813,60 @@ def test_release_restarts_the_warmup_before_any_capture():
 
     wrap.release()
     assert wrap._step_count == 0
+
+
+def test_load_state_dict_accepts_the_state_dict_keyword():
+    # torch's distributed checkpointing calls this by keyword --
+    # `_state_dict_fn(optim, "load_state_dict")(state_dict=...)` in
+    # torch/distributed/checkpoint/state_dict.py::_load_optim_state_dict -- so a wrapper that
+    # renames the parameter is a TypeError on every DCP resume, which is every sharded run.
+    params, source = _build(Dion2)
+    _run(params, source, _grad_seq(params)[:2], source.step)
+    sd = _roundtrip(source)
+    saved_step = source.param_groups[0]["step"]
+
+    params, opt = _build(Dion2)
+    wrap = CudaGraphOptimizer(opt, warmup_steps=WARMUP)
+    fresh_step = wrap.param_groups[0]["step"]
+    wrap.load_state_dict(state_dict=sd)
+
+    # Against the *source* optimizer, not against `opt`: `wrap.param_groups` is
+    # `opt.param_groups` by identity, so asserting those two agree holds whether or not the
+    # keyword call loaded anything. Pinning the fresh value too keeps it that way if a later
+    # checkpoint happens to be taken at step 0.
+    assert saved_step != fresh_step
+    assert wrap.param_groups[0]["step"] == saved_step
+
+
+# Discovered rather than listed: the point of the check below is to catch the *next*
+# signature drift, which may well be in a method overridden after this test was written.
+# ``release`` is not on Optimizer and ``param_groups`` is a property, so both drop out.
+OVERRIDDEN_OPTIMIZER_METHODS = sorted(
+    name
+    for name, attr in vars(CudaGraphOptimizer).items()
+    if callable(attr) and not name.startswith("_") and hasattr(torch.optim.Optimizer, name)
+)
+
+
+def test_the_signature_check_covers_the_overrides():
+    # A parametrize over an empty list collects zero tests and reports success, so a broken
+    # predicate above would silently retire the check. Pin that discovery found something.
+    assert "load_state_dict" in OVERRIDDEN_OPTIMIZER_METHODS, OVERRIDDEN_OPTIMIZER_METHODS
+
+
+@pytest.mark.parametrize("name", OVERRIDDEN_OPTIMIZER_METHODS)
+def test_optimizer_api_signatures_match_torch(name):
+    # Same class of bug as the DCP keyword call above: the wrapper substitutes for a
+    # torch.optim.Optimizer, so callers may use any parameter name the base class documents,
+    # and may pass it positionally or by keyword. Names alone do not pin that -- a
+    # keyword-only ``load_state_dict(self, *, state_dict)`` or a positional-only
+    # ``zero_grad(self, set_to_none, /)`` keeps every name and still breaks half the callers,
+    # which is the same failure this bug was -- so pin the parameter kinds with them.
+    # Defaults deliberately are not pinned: zero_grad's set_to_none defaults to False here
+    # against torch's True, because replay needs stable .grad buffers.
+    base = inspect.signature(getattr(torch.optim.Optimizer, name))
+    wrapper = inspect.signature(getattr(CudaGraphOptimizer, name))
+
+    assert [(p.name, p.kind) for p in wrapper.parameters.values()] == [
+        (p.name, p.kind) for p in base.parameters.values()
+    ]
