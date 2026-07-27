@@ -31,6 +31,15 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- `CudaGraphOptimizer.load_state_dict` named its parameter `sd`, so every distributed
+  checkpoint resume raised `TypeError: got an unexpected keyword argument 'state_dict'`.
+  torch's DCP calls it by keyword (`_load_optim_state_dict` does
+  `_state_dict_fn(optim, "load_state_dict")(state_dict=...)`), so a wrapped optimizer
+  could train but never resume under FSDP2. The parameter now matches
+  `torch.optim.Optimizer`, and a test asserts the wrapper's parameter *names* match the
+  base class for every overridden method, since substituting for an Optimizer means
+  callers may use any name the base class documents.
+
 - `adamw_update_foreach` dropped the cautious-weight-decay correction entirely when it
   was given a device-tensor `weight_decay` on the legacy (`step=`) path: the kernel is
   handed `weight_decay=0` there, and the correction was scaled by that float, so

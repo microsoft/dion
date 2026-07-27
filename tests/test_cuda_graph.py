@@ -812,3 +812,31 @@ def test_release_restarts_the_warmup_before_any_capture():
 
     wrap.release()
     assert wrap._step_count == 0
+
+
+def test_load_state_dict_accepts_the_state_dict_keyword():
+    # torch's distributed checkpointing calls this by keyword --
+    # `_state_dict_fn(optim, "load_state_dict")(state_dict=...)` in
+    # torch/distributed/checkpoint/state_dict.py::_load_optim_state_dict -- so a wrapper that
+    # renames the parameter is a TypeError on every DCP resume, which is every sharded run.
+    params, opt = _build(Dion2)
+    _run(params, opt, _grad_seq(params)[:2], opt.step)
+    sd = _roundtrip(opt)
+
+    params, opt = _build(Dion2)
+    wrap = CudaGraphOptimizer(opt, warmup_steps=WARMUP)
+    wrap.load_state_dict(state_dict=sd)
+
+    assert wrap.param_groups[0]["step"] == opt.param_groups[0]["step"]
+
+
+@pytest.mark.parametrize("name", ["load_state_dict", "state_dict", "add_param_group", "zero_grad", "step"])
+def test_optimizer_api_parameter_names_match_torch(name):
+    # Same class of bug as the DCP keyword call above: the wrapper substitutes for a
+    # torch.optim.Optimizer, so callers may use any parameter name the base class documents.
+    import inspect
+
+    base = inspect.signature(getattr(torch.optim.Optimizer, name))
+    wrapper = inspect.signature(getattr(CudaGraphOptimizer, name))
+
+    assert list(wrapper.parameters) == list(base.parameters)

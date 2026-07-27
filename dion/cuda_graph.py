@@ -158,10 +158,14 @@ class CudaGraphOptimizer(torch.optim.Optimizer):
     def state_dict(self):
         return self.optimizer.state_dict()
 
-    def load_state_dict(self, sd):
+    def load_state_dict(self, state_dict):
+        # The parameter name is load-bearing, not cosmetic: torch's distributed checkpointing
+        # calls this as ``load_state_dict(state_dict=...)`` by keyword
+        # (torch/distributed/checkpoint/state_dict.py::_load_optim_state_dict), so any other
+        # name is a TypeError on every DCP resume. Match torch.optim.Optimizer exactly.
         # Loading new state invalidates any captured graph (buffers may move).
         self.release()
-        return self.optimizer.load_state_dict(sd)
+        return self.optimizer.load_state_dict(state_dict)
 
     def zero_grad(self, set_to_none: bool = False):
         # set_to_none=True would swap .grad for a fresh tensor each step, breaking the
