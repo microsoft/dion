@@ -6,6 +6,18 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- `NorDion2` is now also available as `Dion3` (`from dion import Dion3`, or
+  `from dion.dion3 import Dion3`), and `train.py` accepts `--optimizer dion3`
+  alongside `--optimizer nordion2`. NorDion2 is the third-generation Dion update
+  — Dion2's submatrix selection and error feedback with NorMuon's per-neuron
+  normalization — so it is exposed under the dion3 name too. This is purely
+  additive: `Dion3` is an alias, not a subclass (`Dion3 is NorDion2`), so the
+  two names are interchangeable including for `isinstance`. Parameter groups
+  keep using `algorithm="nordion2"` under either name — that string keys
+  optimizer state and megabatch grouping and is written into
+  `state_dict()["param_groups"]`, so existing checkpoints and param groups load
+  unchanged.
+
 - `CudaGraphOptimizer.release()` drops the captured graph (and restarts the warmup,
   so a later capture is not taken with cold buffers). On the sharded path the graph
   holds the captured megabatch all-to-all, and `dist.destroy_process_group()` blocks
