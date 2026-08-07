@@ -10,10 +10,37 @@ NorDion2 tests in ``test_optimizers.py`` cover the behavior itself.
 
 import argparse
 import pytest
+import sys
 import torch
+
+from pathlib import Path
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CUDA_AVAILABLE = torch.cuda.is_available()
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _import_train():
+    """Import the top-level ``train`` module, or skip if it is unavailable.
+
+    ``train.py`` sits at the repo root and is deliberately not part of the
+    installed package (``setup.py`` packages only ``dion*``), so it is importable
+    only when the repo root is on ``sys.path``. That happens by accident under
+    ``python -m pytest`` from the repo root, but not under a bare ``pytest`` or
+    from any other working directory -- so put the repo root on the path
+    explicitly rather than depending on how the suite was invoked.
+
+    ``importorskip`` then covers train.py's optional imports as a set (``wandb``,
+    ``yaml``, ``tqdm``), which ship with the ``dion[train]`` extra and not with
+    ``dion[dev]``. Guarding on any single one of them would let the others turn a
+    dev-only install into an error instead of a skip.
+    """
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    return pytest.importorskip(
+        "train", reason="train.py and its deps need the dion[train] extra"
+    )
 
 
 def test_dion3_is_nordion2():
@@ -63,8 +90,7 @@ def test_train_optimizer_string_builds_nordion2(optimizer_name):
     Mirrors ``init_optimizer``'s DDP path, which only reads
     ``ddp_model.process_group``, so a stub stands in for a real DDP wrapper.
     """
-    pytest.importorskip("wandb", reason="train.py deps need the dion[train] extra")
-    import train
+    train = _import_train()
     from dion import NorDion2
 
     class _StubModel(torch.nn.Module):
