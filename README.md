@@ -164,6 +164,7 @@ We include optimizer implementations in the `dion/` directory of this repo.
 * `muon.py`: High-performance version of Muon. For sharded matrices, all-to-all communication is used to simultaneously unshard and distribute a batch of matrices. For replicated matrices, Muon will distribute work across all devices and all-gather final results.
 * **`dion2.py`**: High-performance implementation of Dion2, using a similar all-to-all communication pattern for distributed orthonormalization. Only an α-fraction of the momentum matrix is communicated and orthonormalized, significantly reducing both communication overhead and computation cost.
 * `normuon.py`: A variant of the Muon optimizer that introduces neuron-wise normalization to improve stability and convergence efficiency, modified to take similar arguments as `muon.py`. See [the paper](https://arxiv.org/abs/2510.05491) for more details.
+* `nordion2.py`: Combines the two above, applying Dion2's submatrix selection and error feedback to the NorMuon update. As the third-generation Dion update, it is also exported under the name `Dion3` (`from dion import Dion3`). This is an alias rather than a subclass, so `Dion3 is NorDion2` and the two names are fully interchangeable; likewise `--optimizer dion3` and `--optimizer nordion2` are equivalent in `train.py`. Parameter groups use `algorithm="nordion2"` under either name.
 
 We also provide some reference implementations:
 

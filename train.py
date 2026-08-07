@@ -502,11 +502,14 @@ def init_optimizer(
             use_polar_express=cli_args.use_polar_express,
         )
 
-    elif hp.optimizer == "nordion2":
+    elif hp.optimizer in ("nordion2", "dion3"):
+        # Dion3 is an alias for NorDion2, so both names build the same optimizer.
+        # Print out whichever name was requested.
+        opt_name = "Dion3" if hp.optimizer == "dion3" else "NorDion2"
         if device_mesh is not None:
             # Ensure that we have a supported device mesh configuration for NorDion2
             if inner_shard_mesh is not None and inner_shard_mesh.size() > 1:
-                raise ValueError("Tensor parallel is not supported by NorDion2.")
+                raise ValueError(f"Tensor parallel is not supported by {opt_name}.")
             distributed_mesh = (
                 outer_shard_mesh if outer_shard_mesh.size() > 1 else replicate_mesh
             )
@@ -515,9 +518,9 @@ def init_optimizer(
             assert ddp_model is not None
             distributed_mesh = ddp_model.process_group  # using ProcessGroup for DDP
             comm_method = "all-gather"
-        print0(f"NorDion2 LR adjust method: {hp.adjust_lr}")
+        print0(f"{opt_name} LR adjust method: {hp.adjust_lr}")
         print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
-        print0(f"Distributed NorDion2 using: {comm_method}")
+        print0(f"Distributed {opt_name} using: {comm_method}")
         opt = NorDion2(
             param_groups,
             distributed_mesh=distributed_mesh,
