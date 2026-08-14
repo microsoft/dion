@@ -3,7 +3,7 @@
 This repository provides efficient implementations of orthonormal optimizers for distributed ML training.
 You can find the following optimizers:
 * [Muon](https://kellerjordan.github.io/posts/muon/)
-* [Dion3](https://arxiv.org/abs/2608.11612) and [Dion](https://arxiv.org/pdf/2504.05295) (Dion is a legacy optimizer; we recommend using Dion3)
+* [Dion2/Dion3](https://arxiv.org/abs/2608.11612) and [Dion](https://arxiv.org/pdf/2504.05295) (Dion is a legacy optimizer; we recommend using Dion2 or Dion3)
 * [NorMuon](https://arxiv.org/abs/2510.05491) 
 
 
@@ -142,7 +142,7 @@ Optimization algorithms are essential to training neural networks, converting gr
 
 The practical effectiveness of orthonormal optimizers was first demonstrated by [Muon](https://kellerjordan.github.io/posts/muon/) in the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt), and has since been validated at scale by models such as [Kimi K2](https://arxiv.org/abs/2507.20534) and [GLM-4.5](https://z.ai/blog/glm-4.5). Muon implements orthonormalization via *Newton-Schulz iterations*, which relies on repeated matrix-matrix multiplications. However, large-scale training relies on model sharding, where weight matrices and optimizer states are distributed across multiple processes. As discussed by [Essential AI](https://www.essential.ai/blog/infra), orthonormalizing a sharded matrix with Newton-Schulz iterations involves the communication-intensive procedure of reconstructing the full matrices from their individual shards.
 
-**Dion/Dion2** are our methods for building a **scalable, communication-efficient** optimizer. Like Muon, they compute weight updates via matrix orthonormalization. The key difference is that Dion and Dion2 **shrink the matrix before orthonormalization**, reducing both computational and communication costs. Dion uses power iteration to compute a low-rank approximation, while Dion2 applies a simple submatrix-selection procedure. To reduce information loss, both methods include an error-feedback mechanism that tracks the compression error.
+**Dion/Dion2** are our methods for building a **scalable, communication-efficient** optimizer. Like Muon, they compute matrix weight updates based on matrix orthonormalization and share similar practical benefits. The key difference is that Dion and Dion2 **shrink the matrix before orthonormalization**, reducing both computational and communication costs. Dion uses power iteration to compute a low-rank approximation, while Dion2 applies a simple submatrix-selection procedure. To reduce information loss, both methods include an error-feedback mechanism that tracks the discrepancy between the original matrix and its compressed approximation.
 
 
 ## Optimizers
@@ -531,7 +531,7 @@ Triton kernels can be enabled in Muon with the option `use_triton=True`. Note th
 
 # Citation 
 
-If you use Dion/Dion3 in your research, please cite:
+If you use Dion/Dion2/Dion3 in your research, please cite:
 
 ```bash
 @article{amsel2026dion3,
