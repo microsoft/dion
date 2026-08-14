@@ -33,6 +33,14 @@ dp_size: null      # data‐parallel size
 fs_size: null      # FSDP size
 
 # — Optimizer & Hyperparameters —
+# These values are carried over from dion2_160m.yaml as a starting point, not
+# as a translation. Dion3 (NorDion2) normalizes per neuron, and the rescale that
+# follows preserves the update's Frobenius norm, not the spectral norm that
+# adjust_lr: spectral_norm assumes -- so the same total step is redistributed
+# across rows and the best lr need not be Dion2's. Note also that train.py feeds
+# mu to Dion2 as ef_decay (error-feedback decay) but to Dion3 as mu (momentum),
+# and that Dion3's second-moment muon_beta2 is fixed at 0.95 in train.py with no
+# key here. Retune rather than assuming parity with the Dion2 config.
 optimizer: dion3
 scalar_opt: adamw
 mu: 0.95

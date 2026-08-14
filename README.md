@@ -83,7 +83,7 @@ torchrun --standalone --nproc_per_node=4 train.py --config configs/dion2_160m.ya
 ```
 This will launch Distributed Data Parallel (DDP) training.
 
-To train with Dion3 instead, swap in `configs/dion3_160m.yaml`. It is the Dion2 config with `optimizer: dion3`, since NorDion2 takes the same `ortho_fraction`, `mu`, `weight_decay`, and `adjust_lr` knobs. The FSDP and HSDP examples below accept it as well; tensor parallelism does not (see below).
+To train with Dion3 instead, swap in `configs/dion3_160m.yaml`. Its hyperparameters are carried over from the Dion2 config as a starting point rather than a translation — Dion3's per-neuron normalization redistributes the update across rows, and `mu` feeds Dion2's error-feedback decay but Dion3's momentum — so read the comments in the file before tuning. The FSDP and HSDP examples below accept it as well; tensor parallelism does not (see below).
 
 ### Distributed Training: FSDP / TP / Hybrid Sharding
 

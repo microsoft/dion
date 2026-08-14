@@ -7,6 +7,11 @@ dropped: the run starts, uses the dataclass default, and nothing reports it.
 ``ortho_fraction`` typo'd in a config would train at 0.25 instead of 0.5 with no
 warning at all, so these tests assert the merged hyperparameters, not just that
 the YAML parses.
+
+They pin the merge, not the tuning. Nothing here asserts a particular
+hyperparameter value or compares one config against another -- the sample
+configs are free to diverge, and two of them sharing a value today is not a
+property worth freezing.
 """
 
 import sys
@@ -94,34 +99,23 @@ def test_config_optimizer_is_dispatchable(config_path):
     }, f"{config_path.name} selects unknown optimizer {hp.optimizer!r}"
 
 
-def test_dion3_config_matches_dion2_except_optimizer():
-    """Dion3 is Dion2's selection plus NorMuon normalization, so the sample
-    configs must stay in sync -- a hyperparameter tuned in one and not the other
-    turns the pair into an unintended A/B."""
-    dion2 = _merged_hyperparameters(CONFIG_DIR / "dion2_160m.yaml")
-    dion3 = _merged_hyperparameters(CONFIG_DIR / "dion3_160m.yaml")
+@pytest.mark.parametrize("config_path", CONFIGS, ids=lambda p: p.name)
+def test_config_values_survive_the_merge(config_path):
+    """What the file declares is what the optimizer gets.
 
-    assert dion3.optimizer == "dion3"
-    assert dion2.optimizer == "dion2"
+    Deliberately value-agnostic: it compares each key against the file rather
+    than against a hardcoded number or against another config, so retuning any
+    config cannot fail it. A silently dropped key still fails, since the merged
+    value then falls back to the dataclass default instead of the file's.
+    """
+    train = _import_train()
+    with config_path.open("r") as f:
+        yaml_cfg = yaml.safe_load(f)
 
-    differing = {
-        field
-        for field in type(dion2).__dataclass_fields__
-        if field != "optimizer" and getattr(dion2, field) != getattr(dion3, field)
-    }
-    assert (
-        not differing
-    ), f"dion3_160m.yaml drifted from dion2_160m.yaml: {sorted(differing)}"
-
-
-def test_dion3_config_sets_the_hyperparameters_nordion2_reads():
-    """The values init_optimizer passes to NorDion2 must come from the file, not
-    from Hyperparameters defaults -- that is what a dropped key would look like."""
-    hp = _merged_hyperparameters(CONFIG_DIR / "dion3_160m.yaml")
-
-    assert hp.ortho_fraction == 0.5
-    assert hp.mu == 0.95
-    assert hp.weight_decay == 0.01
-    assert hp.adjust_lr == "spectral_norm"
-    assert hp.lr == 0.02
-    assert hp.scalar_opt == "adamw"
+    hp = _merged_hyperparameters(config_path)
+    for key, value in yaml_cfg.items():
+        # override_args_from_cli skips None, leaving the dataclass default.
+        if key in train.Hyperparameters.__dataclass_fields__ and value is not None:
+            assert (
+                getattr(hp, key) == value
+            ), f"{config_path.name}: {key} did not survive the merge"

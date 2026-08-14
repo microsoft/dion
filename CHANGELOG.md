@@ -16,9 +16,11 @@ All notable changes to this project are documented in this file.
   keep using `algorithm="nordion2"` under either name — that string keys
   optimizer state and megabatch grouping and is written into
   `state_dict()["param_groups"]`, so existing checkpoints and param groups load
-  unchanged. A sample config is included at `configs/dion3_160m.yaml`, identical
-  to `configs/dion2_160m.yaml` apart from `optimizer: dion3` — NorDion2 reads the
-  same `ortho_fraction`, `mu`, `weight_decay`, and `adjust_lr` hyperparameters.
+  unchanged. A sample config is included at `configs/dion3_160m.yaml`. Its
+  hyperparameters are carried over from `configs/dion2_160m.yaml` as a starting
+  point, not a translation: `mu` feeds Dion2's error-feedback decay but
+  NorDion2's momentum, NorDion2's `muon_beta2` has no config key, and per-neuron
+  normalization redistributes the update across rows, so expect to retune.
 
 - `CudaGraphOptimizer.release()` drops the captured graph (and restarts the warmup,
   so a later capture is not taken with cold buffers). On the sharded path the graph
