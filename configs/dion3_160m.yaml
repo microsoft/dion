@@ -1,0 +1,42 @@
+
+# — Model —
+model_dim: 768
+n_layer: 12
+n_head: 6
+sequence_length: 1024
+
+# — Batching & Training —
+batch_size: 1024
+device_batch_size: 32
+num_iterations: 3000
+
+# — Learning‐rate schedule —
+warmup_ratio: 0.0
+warmdown_ratio: 0.2
+
+# — Validation & Checkpointing —
+val_loss_every: 125
+val_tokens: 10485760
+
+# — Weights & Biases logging —
+wandb_project_name: gpt-train
+wandb_job_name: null
+no_wandb: false
+
+# — Miscellaneous flags —
+debug: false
+no_compile: false
+no_triton: false
+
+# — Distributed training —
+dp_size: null      # data‐parallel size
+fs_size: null      # FSDP size
+
+# — Optimizer & Hyperparameters —
+optimizer: dion3
+scalar_opt: adamw
+mu: 0.95
+weight_decay: 0.01
+ortho_fraction: 0.5
+adjust_lr: spectral_norm
+lr: 0.02
