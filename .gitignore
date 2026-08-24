@@ -9,3 +9,5 @@ output/
 submit.ipynb
 aztool/
 dion.egg-info/
+dist/
+build/

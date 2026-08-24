@@ -1,0 +1,145 @@
+name: Release
+
+# Builds and validates the distributions on every change that can affect
+# packaging, and publishes to PyPI when a v* tag is pushed. Publishing uses
+# PyPI Trusted Publishing (OIDC), so there is no API token stored in this repo.
+# See RELEASING.md for the one-time PyPI-side setup and the release steps.
+#
+# Third-party actions are pinned to a commit SHA rather than a tag or branch:
+# the publish job holds an OIDC identity that PyPI trusts to upload as `dion`,
+# so a moved tag in someone else's repository must not be able to run new code
+# inside it. .github/dependabot.yml keeps the pins current.
+
+on:
+  push:
+    tags:
+      - "v*"
+  pull_request:
+    paths:
+      - "setup.py"
+      - "pyproject.toml"
+      - "MANIFEST.in"
+      - "requirements_*.txt"
+      # long_description, and the files MANIFEST.in ships.
+      - "README.md"
+      - "LICENSE"
+      - "NOTICE.md"
+      - "CHANGELOG.md"
+      # find_packages() decides what lands in the wheel, so the package layout
+      # is packaging input too -- a new subdirectory without an __init__.py is
+      # silently dropped from the distribution.
+      - "dion/**"
+      - "tests/test_packaging.py"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and validate distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade build twine pytest packaging
+
+      - name: Check packaging metadata
+        run: python -m pytest tests/test_packaging.py -v
+
+      # The bare `python -m build` is load-bearing: with no flags it builds the
+      # sdist from the source tree and then the wheel *from that sdist*, which
+      # is the round trip that exposes an sdist missing its requirements files.
+      # `python -m build --sdist --wheel` builds both from the source tree
+      # instead and would leave the wheel checks below passing on a broken sdist.
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Check distribution metadata
+        run: python -m twine check --strict dist/*
+
+      # twine check only renders the long description. These re-run the
+      # packaging tests against the actual artifacts, which is what catches an
+      # sdist that dropped its requirements files.
+      - name: Check built artifacts
+        env:
+          DION_DIST_DIR: dist
+        run: python -m pytest tests/test_packaging.py -v
+
+      # Checks the version baked into the built filenames -- the one that will
+      # actually be uploaded -- rather than re-reading setup.py, so the gate
+      # cannot drift from what the publish job pushes to PyPI.
+      - name: Verify the tag matches the built distributions
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          from packaging.utils import parse_sdist_filename, parse_wheel_filename
+          from packaging.version import InvalidVersion, Version
+
+
+          def fail(message):
+              print(f"::error::{message}")
+              raise SystemExit(1)
+
+
+          def only(pattern):
+              matches = sorted(pathlib.Path("dist").glob(pattern))
+              if len(matches) != 1:
+                  fail(f"expected exactly one {pattern} in dist/, found {[p.name for p in matches]}")
+              return matches[0]
+
+
+          built = {
+              parse_wheel_filename(only("*.whl").name)[1],
+              parse_sdist_filename(only("*.tar.gz").name)[1],
+          }
+          if len(built) != 1:
+              fail(f"sdist and wheel disagree on the version: {sorted(str(v) for v in built)}")
+          packaged = built.pop()
+
+          tag = os.environ["TAG_NAME"]
+          try:
+              tagged = Version(tag[1:])
+          except InvalidVersion:
+              fail(f"tag {tag} is not a PEP 440 version, so it cannot name a release")
+          if tagged != packaged:
+              fail(f"tag {tag} would publish version {packaged}; bump setup.py or retag")
+          print(f"tag {tag} matches the built version {packaged}")
+          PY
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # The environment gates the OIDC identity that PyPI trusts, and is where a
+    # manual approval can be required before anything reaches PyPI.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/dion
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2

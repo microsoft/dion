@@ -1,0 +1,9 @@
+# The release workflow pins its actions to commit SHAs so that a moved tag in
+# someone else's repository cannot run new code in the job that holds the PyPI
+# OIDC identity. Dependabot is what keeps those pins from going stale.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"

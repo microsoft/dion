@@ -1,0 +1,6 @@
+# Package metadata lives in setup.py. This file exists so that builds go through
+# PEP 517 (`python -m build`, `pip install .`) with a declared, isolated build
+# environment, rather than the deprecated `python setup.py bdist_wheel` path.
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
