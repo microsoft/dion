@@ -47,6 +47,15 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- With `flatten=True`, orthogonalization megabatches now preserve each
+  parameter's matrix geometry: stacked convolution weights become
+  `[N, out, prod(rest)]`, not `[N, numel]`. This fixes layer mixing for
+  Conv1d/2d/3d and stacked Linear weights, and makes Newton-Schulz agree with
+  the existing learning-rate adjustment computed from each parameter's shape.
+  Singleton dispatch, `flatten=False`, and row splitting are unchanged.
+  Correct convolution orthogonalization can cost more than the erroneous
+  layer-mixing operation; previous step times are not equivalent-work baselines.
+
 - `NorDion2` / `Dion3` failed to compile on PyTorch 2.13 as soon as a model had more
   than one parameter shape group (reported in #115).
   `nordion2_normalize_selected_stacked` ran the gather of the selected variance rows,

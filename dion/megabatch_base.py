@@ -866,6 +866,7 @@ def megabatch_orthogonalize_async(
             epsilon=epsilon,
             split_sizes=split_sizes,
             split_scales=split_scales,
+            has_megabatch_dim=False,
         )
         return _finalize(out.unsqueeze(0))
 
@@ -891,7 +892,8 @@ def muon_update_newton_schulz(
     epsilon: Tensor,
     split_sizes: Optional[Tuple[int, ...]] = None,
     split_scales: Optional[Tuple[float, ...]] = None,
-    has_megabatch_dim: bool = False,
+    *,
+    has_megabatch_dim: bool,
 ) -> Tensor:
     """
     Flatten the input tensor if needed and call the Newton-Schulz function.
@@ -899,7 +901,8 @@ def muon_update_newton_schulz(
     With ``flatten=True``, reshape ``[N, out, ...]`` to ``[N, out, -1]``
     (or ``[out, ...]`` to ``[out, -1]`` without a stack). A stack of 2D
     parameters is already a batch of matrices and must remain unchanged.
-    With ``split_sizes``, orthogonalize row blocks of dim -2 independently.
+    With ``split_sizes``, orthogonalize row blocks of dim -2 independently;
+    ``has_megabatch_dim`` is ignored on that path.
     """
     if split_sizes is not None:
         assert not flatten, "split_sizes is incompatible with flatten=True"
@@ -912,6 +915,7 @@ def muon_update_newton_schulz(
     if flatten and param_ndim >= 3:
         X = X.flatten(start_dim=1 + int(has_megabatch_dim))
     elif X.ndim >= 4:
+        # Deliberately use raw ndim: trailing-two-dim matrices need at most 3D.
         X = X.flatten(end_dim=-3)
 
     return newton_schulz_func(X, epsilon=epsilon).reshape(original_shape)
