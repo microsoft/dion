@@ -250,13 +250,16 @@ def test_real_polar_express_matches_independent_convolutions(shape, monkeypatch)
     explicitly_flattened = torch.stack([x.reshape(shape[0], -1) for x in inputs])
     expected = polar_express(explicitly_flattened, epsilon=epsilon).reshape(3, *shape)
     torch.testing.assert_close(torch.stack(actual), expected, rtol=0, atol=0)
-    # Compiled batched/unbatched BF16 graphs have different fusion/rounding.
-    # Eager GEMM and BMM can also select different accumulation orders. Only
-    # the production batched-vs-batched comparison above is bitwise exact.
+    # BF16 GEMM and BMM rounding can diverge through the PE iterations (even
+    # eagerly on A100). Test layer independence with all other layers zeroed,
+    # retaining the BMM shape rather than assuming unbatched numerical parity.
+    # Independent unbatched references are covered by the FP64 tests above.
     eager = polar_express._torchdynamo_orig_callable
     eager_actual = _orthogonalize(inputs, func=eager)
-    for x, a in zip(inputs, eager_actual):
-        reference = eager(x.reshape(shape[0], -1), epsilon=epsilon).reshape(shape)
+    for index, a in enumerate(eager_actual):
+        isolated = torch.zeros_like(explicitly_flattened)
+        isolated[index].copy_(explicitly_flattened[index])
+        reference = eager(isolated, epsilon=epsilon)[index].reshape(shape)
         torch.testing.assert_close(a, reference, rtol=2e-2, atol=2e-3)
         assert torch.isfinite(a).all()
 
