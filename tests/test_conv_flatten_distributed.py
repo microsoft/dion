@@ -28,6 +28,14 @@ CASES = [(1, 8, 1), (1, 5, 5), (2, 8, 3),
          (2, 1, 5), (3, 8, 3), (3, 5, 5)]
 
 
+@pytest.fixture(scope="module", autouse=True)
+def isolated_compiler_state():
+    # Isolate parent-process CUDA-graph cases; spawned workers are already fresh.
+    torch._dynamo.reset()
+    yield
+    torch._dynamo.reset()
+
+
 def _port():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))

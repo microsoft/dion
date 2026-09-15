@@ -21,6 +21,14 @@ from dion.megabatch_base import (
 CUDA_DEVICE_COUNT = torch.cuda.device_count() if torch.cuda.is_available() else 0
 
 
+@pytest.fixture(scope="module", autouse=True)
+def isolated_compiler_state():
+    # Shape sweeps must neither inherit nor leak compiled specializations.
+    torch._dynamo.reset()
+    yield
+    torch._dynamo.reset()
+
+
 def _drain(generator):
     while True:
         try:

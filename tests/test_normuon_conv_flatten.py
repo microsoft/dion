@@ -17,6 +17,15 @@ CONV_SHAPES = [(6, 3, 5), (8, 4, 3, 3), (6, 2, 3, 3, 3),
                (12, 2, 1, 1), (8, 1, 3, 3), (4, 1, 1, 1)]
 
 
+@pytest.fixture(scope="module", autouse=True)
+def isolated_compiler_state():
+    # Shape sweeps must neither inherit nor leak compiled specializations.
+    # Keep compilation enabled while making the budget independent of order.
+    torch._dynamo.reset()
+    yield
+    torch._dynamo.reset()
+
+
 def polynomial_ns(x, epsilon):
     x = x.double()
     x = x / (x.norm(dim=(-2, -1), keepdim=True) + epsilon)
