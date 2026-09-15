@@ -19,6 +19,7 @@ from .dion2 import (
     dion2_post_orthogonalize,
     dion2_pre_accumulate,
     _make_select_and_orthogonalize,
+    _reject_flattened_convolutions,
 )
 from .normuon import normuon_normalization_stacked, _normuon_normalization_core
 
@@ -46,7 +47,9 @@ class NorDion2(DistributedOrthoBase):
             "rms_norm": Adjust based on RMS norm, for learning rate compatibility with Adam/AdamW.
             None: Do not adjust the learning rate.
         flatten: Whether to flatten 3D+ tensors to 2D for Muon updates.
-            True: Tensors with 3+ dimensions are flattened to 2D. Use this for convolutional layers.
+            True: A no-op for 2D parameters. 3D+ parameters are unsupported and
+                raise NotImplementedError at step(): submatrix selection is not
+                flatten-aware. Use Muon or NorMuon for flattened convolutions.
             False: Tensors are not flattened. 3D+ tensors are treated as batches of 2D matrices.
         use_gram_newton_schulz: Whether to use Gram Newton-Schulz for orthogonalization.
         use_triton: Whether to use Triton kernel for Newton-Schulz. Ignored if custom function is provided.
@@ -135,8 +138,8 @@ class NorDion2(DistributedOrthoBase):
                 )
         self._triton_post_ortho = triton_post_ortho
 
-    def _get_or_initialize_state(self, param: Tensor, algo: str) -> dict:
-        state = super()._get_or_initialize_state(param, algo)
+    def _get_or_initialize_state(self, param: Tensor, algo: str, group: dict) -> dict:
+        state = super()._get_or_initialize_state(param, algo, group)
         if algo == self._algo_name and "variance_neuron" not in state:
             # V stored in param dtype (bf16); upcast to fp32 for compute, truncated back on write
             state["variance_neuron"] = torch.zeros_like(param[..., 0:1])
@@ -159,6 +162,7 @@ class NorDion2(DistributedOrthoBase):
         Mega-batched NorDion2 task creation: groups ALL same-shape parameters
         into a single task to minimize communication rounds and kernel launches.
         """
+        _reject_flattened_convolutions(param_groups, type(self).__name__)
         for group in param_groups:
             assert group["algorithm"] == self._algo_name
             assert all(
@@ -199,7 +203,7 @@ class NorDion2(DistributedOrthoBase):
 
             for (_shape, _sharding, _dtype), params in shape_groups.items():
                 gradients = [p.grad for p in params]
-                states = [self._get_or_initialize_state(p, self._algo_name) for p in params]
+                states = [self._get_or_initialize_state(p, self._algo_name, group) for p in params]
                 momentums = [s["momentum"] for s in states]
                 variances_neuron = [s["variance_neuron"] for s in states]
 

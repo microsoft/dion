@@ -47,6 +47,23 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- `NorMuon(flatten=True)` now computes neuron variance and normalization using
+  each convolution's `[out, prod(rest)]` geometry, matching orthogonalization
+  and LR adjustment. Conv1d/2d/3d are supported unsharded, replicated, and
+  sharded on output channels (dim 0); other convolution shard axes are rejected.
+  FSDP normalization still preserves the norm per local shard, not globally.
+  Affected variance buffers have shape `[out, 1, ...]` and layout version 1.
+  Old flattened-convolution optimizer checkpoints are explicitly rejected,
+  even when singleton dimensions make the buffer shapes coincide. To restart,
+  load model weights and create a fresh optimizer; no automatic state migration
+  or reset is performed. Linear and `flatten=False` states are unchanged.
+
+- `Dion2` and `NorDion2` / `Dion3` now reject `flatten=True` for 3D+ parameters
+  before updating any weights, including configurations with grad-less parameters.
+  Their submatrix selection and error feedback are not flatten-aware. Use Muon
+  or NorMuon for flattened convolutions. `flatten=False` retains its distinct
+  batch-of-spatial-matrices meaning; AdamW/Lion fallback groups are unaffected.
+
 - With `flatten=True`, orthogonalization megabatches now preserve each
   parameter's matrix geometry: stacked convolution weights become
   `[N, out, prod(rest)]`, not `[N, numel]`. This fixes layer mixing for

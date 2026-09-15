@@ -139,7 +139,7 @@ class DistributedOrthoBase(Optimizer):
     def _prepopulate_group_state(self, group: dict) -> None:
         algo = group["algorithm"]
         for p in group["params"]:
-            self._get_or_initialize_state(p, algo)
+            self._get_or_initialize_state(p, algo, group)
 
     def add_param_group(self, param_group: dict) -> None:
         super().add_param_group(param_group)
@@ -195,8 +195,8 @@ class DistributedOrthoBase(Optimizer):
 
         return loss
 
-    def _get_or_initialize_state(self, param: Tensor, algo: str) -> dict:
-        """Get optimizer state, or lazy-initialize if it doesn't exist."""
+    def _get_or_initialize_state(self, param: Tensor, algo: str, group: dict) -> dict:
+        """Initialize state using its owning group's geometry (e.g. flatten)."""
         state = self.state[param]
         if not state:
             state["momentum"] = torch.zeros_like(param)
@@ -585,7 +585,7 @@ class DistributedOrthoBase(Optimizer):
             if not params:
                 continue
             gradients = [p.grad for p in params]
-            states = [self._get_or_initialize_state(p, "lion") for p in params]
+            states = [self._get_or_initialize_state(p, "lion", group) for p in params]
             momentums = [s["momentum"] for s in states]
 
             yield AsyncTask(
@@ -610,7 +610,7 @@ class DistributedOrthoBase(Optimizer):
             if not params:
                 continue
             gradients = [p.grad for p in params]
-            states = [self._get_or_initialize_state(p, "adamw") for p in params]
+            states = [self._get_or_initialize_state(p, "adamw", group) for p in params]
             momentums = [s["momentum"] for s in states]
             variances = [s["variance"] for s in states]
             step_tensors = [s["step_dev"] for s in states]

@@ -151,7 +151,7 @@ class Muon(DistributedOrthoBase):
 
             for (_shape, _sharding, _dtype), params in shape_groups.items():
                 gradients = [p.grad for p in params]
-                states = [self._get_or_initialize_state(p, "muon") for p in params]
+                states = [self._get_or_initialize_state(p, "muon", group) for p in params]
                 momentums = [s["momentum"] for s in states]
 
                 split_args = {}
