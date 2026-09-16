@@ -19,6 +19,12 @@ from .opt_utils import AsyncRuntime, AsyncTask, as_scalar_tensor, to_local
 from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
 
 
+# Algorithms handled by the elementwise fallback paths. They never
+# orthogonalize, so orthogonalization-geometry constraints do not apply to a
+# group running one of them.
+FALLBACK_ALGORITHMS = frozenset({"adamw", "lion"})
+
+
 class DistributedOrthoBase(Optimizer):
     """
     Shared base class for distributed orthogonalization optimizers (NorMuon, Dion2).
@@ -27,6 +33,13 @@ class DistributedOrthoBase(Optimizer):
 
     Subclasses must implement ``_create_ortho_tasks()``.
     """
+
+    # Whether this optimizer's orthogonalization understands ``flatten=True``
+    # for 3D+ parameters. Subclasses whose submatrix selection or error
+    # feedback works on the trailing two dimensions -- and so would silently
+    # operate on the wrong axes of a flattened convolution -- set this False
+    # and are rejected by _reject_flattened_3d_params at construction.
+    _supports_flattened_3d: bool = True
 
     def __init__(
         self,
@@ -141,8 +154,40 @@ class DistributedOrthoBase(Optimizer):
         for p in group["params"]:
             self._get_or_initialize_state(p, algo, group)
 
+    def _reject_flattened_3d_params(self, group: dict) -> None:
+        """Reject ``flatten=True`` on 3D+ params where it is not supported.
+
+        Called from ``add_param_group`` -- so at construction, before any
+        forward pass -- rather than from task creation. ``flatten`` and
+        ``p.ndim`` are both known this early, so an unsupported configuration
+        costs a second instead of a full training step, and no parameter can
+        have been updated by the time it surfaces. Checking here also keeps the
+        per-step path free of a scan over every parameter.
+
+        Reads ``group["algorithm"]`` rather than ``self._algo_name``: during
+        ``Optimizer.__init__`` this runs before the subclass assigns that
+        attribute.
+        """
+        if self._supports_flattened_3d:
+            return
+        if group["algorithm"] in FALLBACK_ALGORITHMS:
+            return
+        if not group["flatten"]:
+            return
+        if any(p.ndim > 2 for p in group["params"]):
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support flatten=True for 3D+ "
+                "parameters: submatrix selection and error feedback use the "
+                "trailing matrix dimensions, not the flattened output-channel "
+                "geometry, so the top-k would rank kernel slices instead of "
+                "output channels. Use Muon or NorMuon for flattened "
+                "convolutions. flatten=False uses a different, "
+                "batch-of-spatial-matrices geometry."
+            )
+
     def add_param_group(self, param_group: dict) -> None:
         super().add_param_group(param_group)
+        self._reject_flattened_3d_params(self.param_groups[-1])
         # Keep the pre-population invariant for groups added after construction
         # so state_dict() stays complete and rank-symmetric. The guard skips the
         # add_param_group calls that Optimizer.__init__ makes before this class

@@ -217,20 +217,58 @@ def test_changing_live_flatten_is_rejected(flatten):
 @pytest.mark.parametrize("cls", [Dion2, NorDion2, Dion3])
 @pytest.mark.parametrize("shape", [(6, 3, 5), (8, 4, 3, 3), (6, 2, 3, 3, 3)])
 @pytest.mark.parametrize("has_grad", [False, True])
-def test_low_rank_rejects_before_any_weight_or_momentum_update(cls, shape, has_grad):
+def test_low_rank_rejects_at_construction(cls, shape, has_grad):
+    """The guard fires before a forward pass, not at the first step()."""
     matrix = torch.nn.Parameter(torch.randn(5, 7, dtype=torch.float64))
     conv = torch.nn.Parameter(torch.randn(shape, dtype=torch.float64))
-    opt = cls([dict(params=[matrix]), dict(params=[conv])], lr=7e-4,
-              flatten=True, newton_schulz_func=polynomial_ns)
     matrix.grad = torch.randn_like(matrix)
     if has_grad:
         conv.grad = torch.randn_like(conv)
-    before = [p.detach().clone() for p in (matrix, conv)]
     with pytest.raises(NotImplementedError, match="flatten=True"):
-        opt.step()
-    for p, original in zip((matrix, conv), before):
-        torch.testing.assert_close(p, original, rtol=0, atol=0)
-        assert torch.count_nonzero(opt.state[p]["momentum"]) == 0
+        cls([dict(params=[matrix]), dict(params=[conv])], lr=7e-4,
+            flatten=True, newton_schulz_func=polynomial_ns)
+
+
+@pytest.mark.parametrize("cls", [Dion2, NorDion2, Dion3])
+def test_low_rank_rejects_late_added_group(cls):
+    """add_param_group is the same funnel, so it is guarded too."""
+    matrix = torch.nn.Parameter(torch.randn(5, 7, dtype=torch.float64))
+    conv = torch.nn.Parameter(torch.randn(8, 4, 3, 3, dtype=torch.float64))
+    opt = cls([matrix], lr=7e-4, flatten=True, newton_schulz_func=polynomial_ns)
+    with pytest.raises(NotImplementedError, match="flatten=True"):
+        opt.add_param_group(dict(params=[conv], flatten=True))
+
+
+@pytest.mark.parametrize("cls", [Dion2, NorDion2])
+@pytest.mark.parametrize("scope", ["local", "global"])
+def test_low_rank_flatten_would_have_used_the_wrong_axes(cls, scope, monkeypatch):
+    """Why the guard exists, not just that it fires.
+
+    Neutralizing the guard, a flattened convolution does NOT receive the update
+    its equivalent [out, prod(rest)] matrix receives. select_dim is derived from
+    the raw trailing two dimensions before any flattening, so for a 3D+
+    parameter the top-k ranks kernel slices instead of output channels, and the
+    error-feedback mask lands on those same wrong axes. The megabatch
+    Newton-Schulz fix does not reach this: selection happens first, in
+    dion2_pre_orthogonalize, on the unflattened tensor.
+    """
+    monkeypatch.setattr(cls, "_supports_flattened_3d", True)
+    shape = (8, 4, 5, 3)
+    torch.manual_seed(0)
+    init = torch.randn(shape, dtype=torch.float64)
+    conv = torch.nn.Parameter(init.clone())
+    matrix = torch.nn.Parameter(init.flatten(1).clone())
+    options = dict(lr=1e-2, fraction=0.5, selection_scope=scope,
+                   newton_schulz_func=polynomial_ns)
+    flattened = cls([conv], flatten=True, **options)
+    reference = cls([matrix], flatten=False, **options)
+    for _ in range(2):
+        g = torch.randn(shape, dtype=torch.float64)
+        conv.grad, matrix.grad = g, g.flatten(1)
+        flattened.step()
+        reference.step()
+    assert not torch.allclose(conv.detach().flatten(1), matrix.detach(),
+                              rtol=1e-6, atol=1e-8)
 
 
 @pytest.mark.parametrize("cls", [Dion2, NorDion2, Dion3])

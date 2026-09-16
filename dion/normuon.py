@@ -1,4 +1,6 @@
 import math
+import operator
+
 import torch
 from collections import defaultdict
 from torch import Tensor
@@ -17,6 +19,34 @@ from .megabatch_base import (
 )
 from .opt_utils import AsyncTask, as_scalar_tensor, to_local
 from .muon import muon_update_pre_orthogonalize, muon_update_post_orthogonalize
+
+
+# Returned by _layout_version for a marker that is present but not a usable
+# integer. Distinct from None (absent) and from any real version number.
+_INVALID_LAYOUT_VERSION = -1
+
+
+def _layout_version(state: dict):
+    """Read the variance layout marker, or None when it is absent.
+
+    The marker is stored as a plain Python int, the same way torch's own
+    AdamW stores a non-capturable ``step``: it needs no device round-trip and
+    survives torch.save and DCP. Some checkpoint backends still hand small
+    scalars back as a 0-d tensor or a numpy integer, so accept any exact
+    integer and funnel everything else to a sentinel the caller rejects,
+    rather than failing an identity check on the type.
+    """
+    version = state.get("variance_neuron_layout_version")
+    if version is None:
+        return None
+    if isinstance(version, Tensor):
+        version = version.item() if version.numel() == 1 else _INVALID_LAYOUT_VERSION
+    if isinstance(version, bool):
+        return _INVALID_LAYOUT_VERSION
+    try:
+        return operator.index(version)
+    except TypeError:
+        return _INVALID_LAYOUT_VERSION
 
 
 def neuron_variance_buffer(param: Tensor, flatten: bool) -> Tensor:
@@ -143,6 +173,11 @@ class NorMuon(DistributedOrthoBase):
         if algo == self._algo_name and "variance_neuron" not in state:
             state["variance_neuron"] = neuron_variance_buffer(param, group["flatten"])
             if group["flatten"] and param.ndim > 2:
+                # Plain int, not a device tensor: unlike ``step_dev`` this is
+                # never read by a kernel and never advances under graph replay,
+                # so it needs no device round-trip. It is written only when the
+                # flattened layout is used, so an unflattened state keeps
+                # exactly the key set it had before this marker existed.
                 state["variance_neuron_layout_version"] = 1
         if algo == self._algo_name and param.ndim > 2:
             self._validate_variance_state(param, state, group["flatten"])
@@ -151,11 +186,11 @@ class NorMuon(DistributedOrthoBase):
     @staticmethod
     def _validate_variance_state(param: Tensor, state: dict, flatten: bool) -> None:
         flattened = flatten and param.ndim > 2
-        version = state.get("variance_neuron_layout_version")
+        version = _layout_version(state)
         expected = ((param.shape[0],) + (1,) * (param.ndim - 1)
                     if flattened else tuple(param.shape[:-1]) + (1,))
         variance = state.get("variance_neuron")
-        if (flattened and (type(version) is not int or version != 1)) or (
+        if (flattened and version != 1) or (
             not flattened and version is not None
         ) or (variance is not None and tuple(variance.shape) != expected) or (
             flattened and variance is None
@@ -178,12 +213,19 @@ class NorMuon(DistributedOrthoBase):
         for saved, current in zip(saved_groups, self.param_groups):
             if len(saved["params"]) != len(current["params"]):
                 raise ValueError("loaded state dict has a mismatched parameter group size")
-            if saved["algorithm"] != self._algo_name:
+            # A checkpoint written by other tooling, or by an older version of
+            # this optimizer, may omit keys that only exist because they are in
+            # ``defaults``. Fall back to the live group, which is what
+            # Optimizer.load_state_dict leaves in place for a key the saved
+            # group does not carry.
+            if saved.get("algorithm", current.get("algorithm")) != self._algo_name:
                 continue
+            flatten = saved.get("flatten", current.get("flatten", False))
+            shard_group = {**saved, "flatten": flatten}
             for key, param in zip(saved["params"], current["params"]):
-                self._get_shard_info(param, saved)
+                self._get_shard_info(param, shard_group)
                 self._validate_variance_state(
-                    param, state_dict["state"].get(key, {}), saved["flatten"]
+                    param, state_dict["state"].get(key, {}), flatten
                 )
         return super().load_state_dict(state_dict)
 
@@ -211,15 +253,28 @@ class NorMuon(DistributedOrthoBase):
         Mega-batched NorMuon task creation: groups ALL same-shape parameters
         into a single task to minimize communication rounds and kernel launches.
         """
-        # Validate all existing states before yielding any update task, including
-        # grad-less parameters and groups whose flatten option was changed.
+        # Catch a group whose ``flatten`` was changed after its state was built,
+        # before yielding any task, so a later invalid group cannot leave
+        # earlier parameters half-updated. Grad-less parameters are included.
+        #
+        # Only the layout marker is compared here. Everything else the full
+        # validator checks is immutable once the state exists: the buffer shape
+        # is fixed at creation, and a parameter's placements cannot change
+        # between steps. Those are enforced where state is created
+        # (_get_or_initialize_state, reached from __init__ and add_param_group)
+        # and where it is replaced (load_state_dict). Re-deriving
+        # _get_shard_info for every parameter on every step cost a DTensor
+        # process-group lookup per parameter and could never report anything
+        # the construction-time check had not already rejected.
         for group in param_groups:
+            flatten = bool(group["flatten"])
             for p in group["params"]:
                 if p.ndim > 2:
-                    self._get_shard_info(p, group)
                     state = self.state.get(p)
-                    if state:
-                        self._validate_variance_state(p, state, group["flatten"])
+                    if state and ("variance_neuron_layout_version" in state) != flatten:
+                        # Disagrees with the layout the state was built for;
+                        # defer to the full validator for the error message.
+                        self._validate_variance_state(p, state, flatten)
         for group in param_groups:
             assert group["algorithm"] == self._algo_name
             assert all(

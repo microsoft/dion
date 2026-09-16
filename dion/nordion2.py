@@ -19,7 +19,6 @@ from .dion2 import (
     dion2_post_orthogonalize,
     dion2_pre_accumulate,
     _make_select_and_orthogonalize,
-    _reject_flattened_convolutions,
 )
 from .normuon import normuon_normalization_stacked, _normuon_normalization_core
 
@@ -66,6 +65,9 @@ class NorDion2(DistributedOrthoBase):
 
     NorDion2 optimizer applying Dion2 update to NorMuon
     """
+
+    # Same selection geometry as Dion2; see the note there.
+    _supports_flattened_3d = False
 
     def __init__(
         self,
@@ -162,7 +164,6 @@ class NorDion2(DistributedOrthoBase):
         Mega-batched NorDion2 task creation: groups ALL same-shape parameters
         into a single task to minimize communication rounds and kernel launches.
         """
-        _reject_flattened_convolutions(param_groups, type(self).__name__)
         for group in param_groups:
             assert group["algorithm"] == self._algo_name
             assert all(
