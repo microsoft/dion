@@ -1,3 +1,4 @@
+import math
 import torch
 from collections import defaultdict
 from torch import Tensor
@@ -16,6 +17,17 @@ from .megabatch_base import (
 )
 from .opt_utils import AsyncTask, as_scalar_tensor, to_local
 from .muon import muon_update_pre_orthogonalize, muon_update_post_orthogonalize
+
+
+def neuron_variance_buffer(param: Tensor, flatten: bool) -> Tensor:
+    """One variance per matrix row, retaining parameter rank and DTensor layout."""
+    if flatten and param.ndim > 2:
+        rows = param
+        # Supported row shards remain row shards; no flatten across a shard.
+        for dim in range(1, param.ndim):
+            rows = rows.narrow(dim, 0, 1)
+        return torch.zeros_like(rows)
+    return torch.zeros_like(param[..., :1])
 
 
 class NorMuon(DistributedOrthoBase):
@@ -42,7 +54,11 @@ class NorMuon(DistributedOrthoBase):
             "rms_norm": Adjust based on RMS norm, for learning rate compatibility with Adam/AdamW.
             None: Do not adjust the learning rate.
         flatten: Whether to flatten 3D+ tensors to 2D for Muon updates.
-            True: Tensors with 3+ dimensions are flattened to 2D. Use this for convolutional layers.
+            True: Each 3D+ parameter is a single [out, prod(rest)] matrix for
+                both orthogonalization and neuron normalization. Sharded
+                parameters must use dim 0; column shards are unsupported.
+                Old flattened-convolution optimizer checkpoints are rejected;
+                retain model weights and construct a fresh optimizer instead.
             False: Tensors are not flattened. 3D+ tensors are treated as batches of 2D matrices.
         use_gram_newton_schulz: Whether to use Gram Newton-Schulz for orthogonalization.
         use_triton: Whether to use Triton kernel for Newton-Schulz. Ignored if custom function is provided.
@@ -119,15 +135,73 @@ class NorMuon(DistributedOrthoBase):
             newton_schulz_func=newton_schulz_func,
         )
 
-    def _get_or_initialize_state(self, param: Tensor, algo: str) -> dict:
-        state = super()._get_or_initialize_state(param, algo)
+    def _get_or_initialize_state(self, param: Tensor, algo: str, group: dict) -> dict:
+        if algo == self._algo_name and group["flatten"] and param.ndim > 2:
+            # Validate before narrow() can redistribute an unsupported column shard.
+            self._get_shard_info(param, group)
+        state = super()._get_or_initialize_state(param, algo, group)
         if algo == self._algo_name and "variance_neuron" not in state:
-            state["variance_neuron"] = torch.zeros_like(param[..., 0:1])
+            state["variance_neuron"] = neuron_variance_buffer(param, group["flatten"])
+            if group["flatten"] and param.ndim > 2:
+                # Plain int, not a device tensor: unlike ``step_dev`` this is
+                # never read by a kernel and never advances under graph replay,
+                # so it needs no device round-trip. It is written only when the
+                # flattened layout is used, so an unflattened state keeps
+                # exactly the key set it had before this marker existed.
+                state["variance_neuron_layout_version"] = 1
+        if algo == self._algo_name and param.ndim > 2:
+            self._validate_variance_state(param, state, group["flatten"])
         return state
+
+    @staticmethod
+    def _validate_variance_state(param: Tensor, state: dict, flatten: bool) -> None:
+        flattened = flatten and param.ndim > 2
+        version = state.get("variance_neuron_layout_version")
+        expected = ((param.shape[0],) + (1,) * (param.ndim - 1)
+                    if flattened else tuple(param.shape[:-1]) + (1,))
+        variance = state.get("variance_neuron")
+        if (flattened and (type(version) is not int or version != 1)) or (
+            not flattened and version is not None
+        ) or (variance is not None and tuple(variance.shape) != expected) or (
+            flattened and variance is None
+        ):
+            raise ValueError(
+                "Incompatible NorMuon variance_neuron state for "
+                f"shape {tuple(param.shape)}, flatten={flatten}: expected "
+                f"shape {expected} and {'layout version 1' if flattened else 'unflattened layout'}. "
+                "Old flattened-convolution checkpoints used different statistics "
+                "and cannot be migrated exactly. Load model weights only and "
+                "construct a fresh optimizer; do not change flatten on live state."
+            )
+
+    def load_state_dict(self, state_dict):
+        # Check before Optimizer.load_state_dict replaces any live state/groups.
+        # A version is necessary: old and new shapes coincide for some 1x1 kernels.
+        saved_groups = state_dict["param_groups"]
+        if len(saved_groups) != len(self.param_groups):
+            raise ValueError("loaded state dict has a different number of parameter groups")
+        for saved, current in zip(saved_groups, self.param_groups):
+            if len(saved["params"]) != len(current["params"]):
+                raise ValueError("loaded state dict has a mismatched parameter group size")
+            if saved["algorithm"] != self._algo_name:
+                continue
+            for key, param in zip(saved["params"], current["params"]):
+                self._get_shard_info(param, saved)
+                self._validate_variance_state(
+                    param, state_dict["state"].get(key, {}), saved["flatten"]
+                )
+        return super().load_state_dict(state_dict)
 
     def _get_shard_info(self, param: Tensor, group: dict):
         result = super()._get_shard_info(param, group)
         _, is_matrix_sharded, sharded_tensor_dim = result
+        if (is_matrix_sharded and group["flatten"] and param.ndim > 2
+                and sharded_tensor_dim != 0):
+            raise NotImplementedError(
+                "NorMuon with flatten=True requires 3D+ parameters to be sharded "
+                f"at dim 0, not dim {sharded_tensor_dim}: other dimensions split "
+                "a neuron's columns across ranks."
+            )
         if is_matrix_sharded and sharded_tensor_dim == param.ndim - 1:
             raise NotImplementedError(
                 "NorMuon currently does not support parameters sharded along the last dimension. "
@@ -142,6 +216,23 @@ class NorMuon(DistributedOrthoBase):
         Mega-batched NorMuon task creation: groups ALL same-shape parameters
         into a single task to minimize communication rounds and kernel launches.
         """
+        # Catch a group whose ``flatten`` was changed after its state was built,
+        # before yielding any task, so a later invalid group cannot leave
+        # earlier parameters half-updated. Grad-less parameters are included.
+        #
+        # This pre-pass only compares layout-marker presence. Full sharding and
+        # variance validation remains in _get_or_initialize_state (construction,
+        # added groups, and active parameters below) and load_state_dict. Avoid
+        # repeating that work for every grad-less parameter on every step.
+        for group in param_groups:
+            flatten = bool(group["flatten"])
+            for p in group["params"]:
+                if p.ndim > 2:
+                    state = self.state.get(p)
+                    if state and ("variance_neuron_layout_version" in state) != flatten:
+                        # Disagrees with the layout the state was built for;
+                        # defer to the full validator for the error message.
+                        self._validate_variance_state(p, state, flatten)
         for group in param_groups:
             assert group["algorithm"] == self._algo_name
             assert all(
@@ -178,7 +269,7 @@ class NorMuon(DistributedOrthoBase):
 
             for (_shape, _sharding, _dtype), params in shape_groups.items():
                 gradients = [p.grad for p in params]
-                states = [self._get_or_initialize_state(p, self._algo_name) for p in params]
+                states = [self._get_or_initialize_state(p, self._algo_name, group) for p in params]
                 momentums = [s["momentum"] for s in states]
                 variances_neuron = [s["variance_neuron"] for s in states]
 
@@ -322,9 +413,19 @@ def normuon_update_megabatch_async(
     )
     V_local = to_local(V)
     V_stacked = torch.stack(V_local)
+    flatten_rows = flatten and U_stacked.ndim > 3
+    if flatten_rows:
+        U_shape, V_shape = U_stacked.shape, V_stacked.shape
+        # Explicit columns also work on empty output-channel shards, where
+        # reshape(N, 0, -1) is ambiguous. Retain the existing shard-local rescale.
+        U_stacked = U_stacked.reshape(U_shape[0], U_shape[1], math.prod(U_shape[2:]))
+        V_stacked = V_stacked.reshape(V_shape[0], V_shape[1], 1)
     U_stacked, V_stacked = normuon_normalization_stacked(
         U_stacked, V_stacked, muon_beta2, split_sizes=norm_split_sizes
     )
+    if flatten_rows:
+        U_stacked = U_stacked.reshape(U_shape)
+        V_stacked = V_stacked.reshape(V_shape)
     # Write the updated variance buffers back into the persistent per-param
     # state in a single multi-tensor kernel instead of N separate copy_
     # launches, and unbind U in one dispatch instead of N selects. Both are

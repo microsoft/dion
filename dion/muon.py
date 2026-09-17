@@ -40,7 +40,7 @@ class Muon(DistributedOrthoBase):
             "rms_norm": Adjust based on RMS norm, for learning rate compatibility with Adam/AdamW.
             None: Do not adjust the learning rate.
         flatten: Whether to flatten 3D+ tensors to 2D for Muon updates.
-            True: Tensors with 3+ dimensions are flattened to 2D. Use this for convolutional layers.
+            True: Each parameter with 3+ dimensions is flattened to 2D. Use this for convolutional layers.
             False: Tensors are not flattened. 3D+ tensors are treated as batches of 2D matrices.
         use_triton: Whether to use Triton kernel for Newton-Schulz. Ignored if custom function is provided.
         use_gram_newton_schulz: Whether to use Gram Newton-Schulz for orthogonalization.
@@ -151,7 +151,7 @@ class Muon(DistributedOrthoBase):
 
             for (_shape, _sharding, _dtype), params in shape_groups.items():
                 gradients = [p.grad for p in params]
-                states = [self._get_or_initialize_state(p, "muon") for p in params]
+                states = [self._get_or_initialize_state(p, "muon", group) for p in params]
                 momentums = [s["momentum"] for s in states]
 
                 split_args = {}

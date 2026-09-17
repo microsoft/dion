@@ -410,10 +410,11 @@ class TestDion2:
         assert not torch.equal(params[0].data, before)
 
     def test_3d_params_flatten(self):
-        """3D params with flatten=True should flatten to 2D for ortho."""
+        """Reject flattened 3D params until submatrix selection is flatten-aware."""
         from dion import Dion2
         params = _make_params([(4, 32, 128)])
-        _run_steps(Dion2, params, dict(lr=0.01, flatten=True), n_steps=3)
+        with pytest.raises(NotImplementedError, match="flatten=True"):
+            _run_steps(Dion2, params, dict(lr=0.01, flatten=True), n_steps=3)
 
     def test_3d_megabatch(self):
         """Multiple 3D params with same shape should be megabatched."""

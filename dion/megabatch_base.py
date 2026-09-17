@@ -19,6 +19,12 @@ from .opt_utils import AsyncRuntime, AsyncTask, as_scalar_tensor, to_local
 from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
 
 
+# Algorithms handled by the elementwise fallback paths. They never
+# orthogonalize, so orthogonalization-geometry constraints do not apply to a
+# group running one of them.
+FALLBACK_ALGORITHMS = frozenset({"adamw", "lion"})
+
+
 class DistributedOrthoBase(Optimizer):
     """
     Shared base class for distributed orthogonalization optimizers (NorMuon, Dion2).
@@ -27,6 +33,13 @@ class DistributedOrthoBase(Optimizer):
 
     Subclasses must implement ``_create_ortho_tasks()``.
     """
+
+    # Whether this optimizer's orthogonalization understands ``flatten=True``
+    # for 3D+ parameters. Subclasses whose submatrix selection or error
+    # feedback works on the trailing two dimensions -- and so would silently
+    # operate on the wrong axes of a flattened convolution -- set this False
+    # and are checked at construction and before creating update tasks.
+    _supports_flattened_3d: bool = True
 
     def __init__(
         self,
@@ -139,10 +152,46 @@ class DistributedOrthoBase(Optimizer):
     def _prepopulate_group_state(self, group: dict) -> None:
         algo = group["algorithm"]
         for p in group["params"]:
-            self._get_or_initialize_state(p, algo)
+            self._get_or_initialize_state(p, algo, group)
+
+    def _reject_flattened_3d_params(self, group: dict) -> None:
+        """Reject ``flatten=True`` on 3D+ params where it is not supported.
+
+        Called from ``add_param_group`` for early errors and from task creation
+        to catch unsupported groups restored from a checkpoint or changed by
+        the caller. Task creation checks all groups before yielding any task,
+        including parameters without gradients.
+
+        Reads ``group["algorithm"]`` rather than ``self._algo_name``: during
+        ``Optimizer.__init__`` this runs before the subclass assigns that
+        attribute.
+        """
+        if self._supports_flattened_3d:
+            return
+        if group["algorithm"] in FALLBACK_ALGORITHMS:
+            return
+        if not group["flatten"]:
+            return
+        if any(p.ndim > 2 for p in group["params"]):
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support flatten=True for 3D+ "
+                "parameters: submatrix selection and error feedback use the "
+                "trailing matrix dimensions, not the flattened output-channel "
+                "geometry, so the top-k would rank kernel slices instead of "
+                "output channels. Use Muon or NorMuon for flattened "
+                "convolutions. flatten=False uses a different, "
+                "batch-of-spatial-matrices geometry."
+            )
 
     def add_param_group(self, param_group: dict) -> None:
         super().add_param_group(param_group)
+        try:
+            self._reject_flattened_3d_params(self.param_groups[-1])
+        except NotImplementedError:
+            # Let PyTorch normalize params/defaults, but do not retain a group
+            # rejected by our geometry check. No state or caches exist for it yet.
+            self.param_groups.pop()
+            raise
         # Keep the pre-population invariant for groups added after construction
         # so state_dict() stays complete and rank-symmetric. The guard skips the
         # add_param_group calls that Optimizer.__init__ makes before this class
@@ -195,8 +244,8 @@ class DistributedOrthoBase(Optimizer):
 
         return loss
 
-    def _get_or_initialize_state(self, param: Tensor, algo: str) -> dict:
-        """Get optimizer state, or lazy-initialize if it doesn't exist."""
+    def _get_or_initialize_state(self, param: Tensor, algo: str, group: dict) -> dict:
+        """Initialize state using its owning group's geometry (e.g. flatten)."""
         state = self.state[param]
         if not state:
             state["momentum"] = torch.zeros_like(param)
@@ -585,7 +634,7 @@ class DistributedOrthoBase(Optimizer):
             if not params:
                 continue
             gradients = [p.grad for p in params]
-            states = [self._get_or_initialize_state(p, "lion") for p in params]
+            states = [self._get_or_initialize_state(p, "lion", group) for p in params]
             momentums = [s["momentum"] for s in states]
 
             yield AsyncTask(
@@ -610,7 +659,7 @@ class DistributedOrthoBase(Optimizer):
             if not params:
                 continue
             gradients = [p.grad for p in params]
-            states = [self._get_or_initialize_state(p, "adamw") for p in params]
+            states = [self._get_or_initialize_state(p, "adamw", group) for p in params]
             momentums = [s["momentum"] for s in states]
             variances = [s["variance"] for s in states]
             step_tensors = [s["step_dev"] for s in states]
@@ -805,6 +854,7 @@ def megabatch_orthogonalize_async(
             epsilon=epsilon,
             split_sizes=split_sizes,
             split_scales=split_scales,
+            has_megabatch_dim=True,
         )
 
         split_chunks = [
@@ -844,6 +894,7 @@ def megabatch_orthogonalize_async(
             epsilon=epsilon,
             split_sizes=split_sizes,
             split_scales=split_scales,
+            has_megabatch_dim=True,
         )
 
         all_chunks = [torch.empty_like(my_matrices) for _ in range(world_size)]
@@ -864,6 +915,7 @@ def megabatch_orthogonalize_async(
             epsilon=epsilon,
             split_sizes=split_sizes,
             split_scales=split_scales,
+            has_megabatch_dim=False,
         )
         return _finalize(out.unsqueeze(0))
 
@@ -877,6 +929,7 @@ def megabatch_orthogonalize_async(
             epsilon=epsilon,
             split_sizes=split_sizes,
             split_scales=split_scales,
+            has_megabatch_dim=True,
         )
         return _finalize(stacked)
 
@@ -888,10 +941,17 @@ def muon_update_newton_schulz(
     epsilon: Tensor,
     split_sizes: Optional[Tuple[int, ...]] = None,
     split_scales: Optional[Tuple[float, ...]] = None,
+    *,
+    has_megabatch_dim: bool,
 ) -> Tensor:
     """
     Flatten the input tensor if needed and call the Newton-Schulz function.
-    With ``split_sizes``, orthogonalize row blocks of dim -2 independently.
+    ``has_megabatch_dim`` marks a leading stack axis, not a parameter axis.
+    With ``flatten=True``, reshape ``[N, out, ...]`` to ``[N, out, -1]``
+    (or ``[out, ...]`` to ``[out, -1]`` without a stack). A stack of 2D
+    parameters is already a batch of matrices and must remain unchanged.
+    With ``split_sizes``, orthogonalize row blocks of dim -2 independently;
+    ``has_megabatch_dim`` is ignored on that path.
     """
     if split_sizes is not None:
         assert not flatten, "split_sizes is incompatible with flatten=True"
@@ -900,9 +960,11 @@ def muon_update_newton_schulz(
         )
 
     original_shape = X.shape
-    if flatten and X.ndim >= 3:
-        X = X.flatten(start_dim=1)
+    param_ndim = X.ndim - int(has_megabatch_dim)
+    if flatten and param_ndim >= 3:
+        X = X.flatten(start_dim=1 + int(has_megabatch_dim))
     elif X.ndim >= 4:
+        # Deliberately use raw ndim: trailing-two-dim matrices need at most 3D.
         X = X.flatten(end_dim=-3)
 
     return newton_schulz_func(X, epsilon=epsilon).reshape(original_shape)

@@ -47,6 +47,42 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- `NorMuon(flatten=True)` now computes neuron variance and normalization using
+  each convolution's `[out, prod(rest)]` geometry, matching orthogonalization
+  and LR adjustment. Conv1d/2d/3d are supported unsharded, replicated, and
+  sharded on output channels (dim 0); other convolution shard axes are rejected.
+  FSDP normalization still preserves the norm per local shard, not globally.
+  Affected variance buffers have shape `[out, 1, ...]` and layout version 1.
+  Old flattened-convolution optimizer checkpoints are explicitly rejected,
+  even when singleton dimensions make the buffer shapes coincide. To restart,
+  load model weights and create a fresh optimizer; no automatic state migration
+  or reset is performed. Linear and `flatten=False` states are unchanged.
+
+- `Dion2` and `NorDion2` / `Dion3` now reject `flatten=True` for 3D+ parameters
+  at construction and from `add_param_group`; rejected additions leave the
+  optimizer's groups, state, and hyperparameter caches unchanged. Runtime checks
+  remain before any weight update, including grad-less parameters, to catch
+  checkpoint or live-group changes. In both `selection_scope="local"` and
+  `"global"`, submatrix selection derives its axis from the raw trailing two
+  dimensions before flattening, so selection and error feedback use the wrong
+  geometry. Use Muon or NorMuon for flattened convolutions. `flatten=False`
+  retains its distinct batch-of-spatial-matrices meaning; AdamW/Lion fallback
+  groups are unaffected.
+
+- NorMuon's per-step pre-pass checks for live `flatten` changes without repeating
+  full sharding and variance validation for every parameter. Full checks remain
+  during state initialization, active-parameter processing, and checkpoint load;
+  the checkpoint format and compatibility rules are unchanged.
+
+- With `flatten=True`, orthogonalization megabatches now preserve each
+  parameter's matrix geometry: stacked convolution weights become
+  `[N, out, prod(rest)]`, not `[N, numel]`. This fixes layer mixing for
+  Conv1d/2d/3d and stacked Linear weights, and makes Newton-Schulz agree with
+  the existing learning-rate adjustment computed from each parameter's shape.
+  Singleton dispatch, `flatten=False`, and row splitting are unchanged.
+  Correct convolution orthogonalization can cost more than the erroneous
+  layer-mixing operation; previous step times are not equivalent-work baselines.
+
 - `NorDion2` / `Dion3` failed to compile on PyTorch 2.13 as soon as a model had more
   than one parameter shape group (reported in #115).
   `nordion2_normalize_selected_stacked` ran the gather of the selected variance rows,
