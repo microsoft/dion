@@ -59,10 +59,20 @@ All notable changes to this project are documented in this file.
   or reset is performed. Linear and `flatten=False` states are unchanged.
 
 - `Dion2` and `NorDion2` / `Dion3` now reject `flatten=True` for 3D+ parameters
-  before updating any weights, including configurations with grad-less parameters.
-  Their submatrix selection and error feedback are not flatten-aware. Use Muon
-  or NorMuon for flattened convolutions. `flatten=False` retains its distinct
-  batch-of-spatial-matrices meaning; AdamW/Lion fallback groups are unaffected.
+  at construction and from `add_param_group`; rejected additions leave the
+  optimizer's groups, state, and hyperparameter caches unchanged. Runtime checks
+  remain before any weight update, including grad-less parameters, to catch
+  checkpoint or live-group changes. In both `selection_scope="local"` and
+  `"global"`, submatrix selection derives its axis from the raw trailing two
+  dimensions before flattening, so selection and error feedback use the wrong
+  geometry. Use Muon or NorMuon for flattened convolutions. `flatten=False`
+  retains its distinct batch-of-spatial-matrices meaning; AdamW/Lion fallback
+  groups are unaffected.
+
+- NorMuon's per-step pre-pass checks for live `flatten` changes without repeating
+  full sharding and variance validation for every parameter. Full checks remain
+  during state initialization, active-parameter processing, and checkpoint load;
+  the checkpoint format and compatibility rules are unchanged.
 
 - With `flatten=True`, orthogonalization megabatches now preserve each
   parameter's matrix geometry: stacked convolution weights become

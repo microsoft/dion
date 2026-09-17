@@ -181,7 +181,8 @@ def test_checkpoint_roundtrip(shape, flatten):
 
 
 @pytest.mark.parametrize("shape", [(8, 4, 3, 3), (4, 1, 1, 1)])
-@pytest.mark.parametrize("corruption", ["legacy", "shape", "version", "missing_variance"])
+@pytest.mark.parametrize("corruption", ["legacy", "shape", "version", "missing_variance",
+                                       "tensor_version", "missing_algorithm", "missing_flatten"])
 def test_incompatible_checkpoint_rejected_without_mutation(shape, corruption):
     p = torch.nn.Parameter(torch.randn(shape, dtype=torch.float64))
     opt = make_optimizer([p])
@@ -197,50 +198,164 @@ def test_incompatible_checkpoint_rejected_without_mutation(shape, corruption):
         state["variance_neuron"] = torch.zeros(shape[0], 2, dtype=p.dtype)
     elif corruption == "version":
         state["variance_neuron_layout_version"] = 99
-    else:
+    elif corruption == "missing_variance":
         del state["variance_neuron"]
+    elif corruption == "tensor_version":
+        state["variance_neuron_layout_version"] = torch.tensor(1)
+    else:
+        del bad["param_groups"][0][corruption.removeprefix("missing_")]
     bad["param_groups"][0]["lr"] = 9.0
-    with pytest.raises(ValueError, match="Incompatible NorMuon"):
+    error = KeyError if corruption in ("missing_algorithm", "missing_flatten") else ValueError
+    message = corruption.removeprefix("missing_") if error is KeyError else "Incompatible NorMuon"
+    with pytest.raises(error, match=message):
         opt.load_state_dict(bad)
     assert_nested_equal(opt.state_dict(), before)
 
 
 @pytest.mark.parametrize("flatten", [False, True])
-def test_changing_live_flatten_is_rejected(flatten):
+@pytest.mark.parametrize("has_grad", [False, True])
+def test_changing_live_flatten_is_rejected(flatten, has_grad):
+    matrix = torch.nn.Parameter(torch.randn(5, 7, dtype=torch.float64))
     p = torch.nn.Parameter(torch.randn(4, 1, 1, 1, dtype=torch.float64))
-    opt = make_optimizer([p], flatten=flatten)
-    opt.param_groups[0]["flatten"] = not flatten
+    opt = make_optimizer([dict(params=[matrix]), dict(params=[p])], flatten=flatten)
+    matrix.grad = torch.randn_like(matrix)
+    if has_grad:
+        p.grad = torch.randn_like(p)
+    opt.param_groups[1]["flatten"] = not flatten
+    weights = [param.detach().clone() for param in (matrix, p)]
+    states = [copy.deepcopy(opt.state[param]) for param in (matrix, p)]
     with pytest.raises(ValueError, match="Incompatible NorMuon"):
         opt.step()
+    for param, weight, state in zip((matrix, p), weights, states):
+        torch.testing.assert_close(param, weight, rtol=0, atol=0)
+        assert_nested_equal(opt.state[param], state)
 
 
 @pytest.mark.parametrize("cls", [Dion2, NorDion2, Dion3])
 @pytest.mark.parametrize("shape", [(6, 3, 5), (8, 4, 3, 3), (6, 2, 3, 3, 3)])
 @pytest.mark.parametrize("has_grad", [False, True])
-def test_low_rank_rejects_before_any_weight_or_momentum_update(cls, shape, has_grad):
+def test_low_rank_rejects_at_construction(cls, shape, has_grad):
+    """The guard fires before a forward pass, not at the first step()."""
     matrix = torch.nn.Parameter(torch.randn(5, 7, dtype=torch.float64))
     conv = torch.nn.Parameter(torch.randn(shape, dtype=torch.float64))
-    opt = cls([dict(params=[matrix]), dict(params=[conv])], lr=7e-4,
-              flatten=True, newton_schulz_func=polynomial_ns)
     matrix.grad = torch.randn_like(matrix)
     if has_grad:
         conv.grad = torch.randn_like(conv)
-    before = [p.detach().clone() for p in (matrix, conv)]
     with pytest.raises(NotImplementedError, match="flatten=True"):
-        opt.step()
-    for p, original in zip((matrix, conv), before):
-        torch.testing.assert_close(p, original, rtol=0, atol=0)
-        assert torch.count_nonzero(opt.state[p]["momentum"]) == 0
+        cls([dict(params=[matrix]), dict(params=[conv])], lr=7e-4,
+            flatten=True, newton_schulz_func=polynomial_ns)
 
 
 @pytest.mark.parametrize("cls", [Dion2, NorDion2, Dion3])
-def test_low_rank_guard_exempts_fallback_groups(cls):
+def test_low_rank_rejects_late_added_group(cls):
+    """A rejected group must not remain installed or acquire state/caches."""
     matrix = torch.nn.Parameter(torch.randn(5, 7, dtype=torch.float64))
-    fallback = torch.nn.Parameter(torch.randn(8, 4, 3, 3, dtype=torch.float64))
-    opt = cls([dict(params=[matrix]), dict(params=[fallback], algorithm="adamw")],
+    conv = torch.nn.Parameter(torch.randn(8, 4, 3, 3, dtype=torch.float64))
+    opt = cls([matrix], lr=7e-4, weight_decay=torch.tensor(1e-2),
+              flatten=True, newton_schulz_func=polynomial_ns)
+    before = copy.deepcopy(opt.state_dict())
+    cache_before = copy.deepcopy(opt._hyperparam_tensors)
+    cache_ids = {key: id(value) for key, value in opt._hyperparam_tensors.items()}
+    live_before = copy.deepcopy(opt._live_hyperparams_by_group)
+    group = opt.param_groups[0]
+    with pytest.raises(NotImplementedError, match="flatten=True"):
+        # Exercise PyTorch's iterable normalization as well as default flatten.
+        opt.add_param_group(dict(params=(p for p in [conv])))
+    assert len(opt.param_groups) == 1 and opt.param_groups[0] is group
+    assert conv not in opt.state
+    assert_nested_equal(opt.state_dict(), before)
+    assert_nested_equal(opt._hyperparam_tensors, cache_before)
+    assert {key: id(value) for key, value in opt._hyperparam_tensors.items()} == cache_ids
+    assert_nested_equal(opt._live_hyperparams_by_group, live_before)
+
+    # Subsequent valid additions and updates must work with the correct indices.
+    late = torch.nn.Parameter(torch.randn_like(matrix))
+    opt.add_param_group(dict(params=[late]))
+    weights = [p.detach().clone() for p in (matrix, late, conv)]
+    for p in (matrix, late, conv):
+        p.grad = torch.randn_like(p)
+    opt.step()
+    for p, original in zip((matrix, late), weights):
+        assert not torch.equal(p, original)
+        assert torch.count_nonzero(opt.state[p]["momentum"]) > 0
+    torch.testing.assert_close(conv, weights[-1], rtol=0, atol=0)
+    assert conv not in opt.state
+
+
+@pytest.mark.parametrize("cls", [Dion2, NorDion2, Dion3])
+@pytest.mark.parametrize("shape", [(6, 3, 5), (8, 4, 3, 3), (6, 2, 3, 3, 3)])
+@pytest.mark.parametrize("has_grad", [False, True])
+@pytest.mark.parametrize("source", ["live_group", "checkpoint"])
+def test_low_rank_runtime_guard_prevents_partial_updates(cls, shape, has_grad, source):
+    matrix = torch.nn.Parameter(torch.randn(5, 7, dtype=torch.float64))
+    conv = torch.nn.Parameter(torch.randn(shape, dtype=torch.float64))
+    opt = cls([dict(params=[matrix]), dict(params=[conv], flatten=False)],
               lr=7e-4, flatten=True, newton_schulz_func=polynomial_ns)
     matrix.grad = torch.randn_like(matrix)
+    opt.step()  # Give the earlier valid group nonzero state before rejection.
+    if has_grad:
+        conv.grad = torch.randn_like(conv)
+    if source == "live_group":
+        opt.param_groups[1]["flatten"] = True
+    else:
+        legacy = copy.deepcopy(opt.state_dict())
+        legacy["param_groups"][1]["flatten"] = True
+        opt.load_state_dict(legacy)
+    weights = [p.detach().clone() for p in (matrix, conv)]
+    states = [copy.deepcopy(opt.state[p]) for p in (matrix, conv)]
+    with pytest.raises(NotImplementedError, match="flatten=True"):
+        opt.step()
+    for p, weight, state in zip((matrix, conv), weights, states):
+        torch.testing.assert_close(p, weight, rtol=0, atol=0)
+        # Group step counters may advance, but weights/momentum/variance may not.
+        assert_nested_equal(opt.state[p], state)
+
+
+@pytest.mark.parametrize("cls", [Dion2, NorDion2])
+@pytest.mark.parametrize("scope", ["local", "global"])
+def test_low_rank_flatten_would_have_used_the_wrong_axes(cls, scope, monkeypatch):
+    """Why the guard exists, not just that it fires.
+
+    Neutralizing the guard, a flattened convolution does NOT receive the update
+    its equivalent [out, prod(rest)] matrix receives. select_dim is derived from
+    the raw trailing two dimensions before any flattening, so for a 3D+
+    parameter the top-k ranks kernel slices instead of output channels, and the
+    error-feedback mask lands on those same wrong axes. The megabatch
+    Newton-Schulz fix does not reach this: selection happens first, in
+    dion2_pre_orthogonalize, on the unflattened tensor.
+    """
+    monkeypatch.setattr(cls, "_supports_flattened_3d", True)
+    shape = (8, 4, 5, 3)
+    torch.manual_seed(0)
+    init = torch.randn(shape, dtype=torch.float64)
+    conv = torch.nn.Parameter(init.clone())
+    matrix = torch.nn.Parameter(init.flatten(1).clone())
+    options = dict(lr=1e-2, fraction=0.5, selection_scope=scope,
+                   newton_schulz_func=polynomial_ns)
+    flattened = cls([conv], flatten=True, **options)
+    reference = cls([matrix], flatten=False, **options)
+    for _ in range(2):
+        g = torch.randn(shape, dtype=torch.float64)
+        conv.grad, matrix.grad = g, g.flatten(1)
+        flattened.step()
+        reference.step()
+    assert not torch.allclose(conv.detach().flatten(1), matrix.detach(),
+                              rtol=1e-6, atol=1e-8)
+
+
+@pytest.mark.parametrize("cls", [Dion2, NorDion2, Dion3])
+@pytest.mark.parametrize("algorithm", ["adamw", "lion"])
+def test_low_rank_guard_exempts_fallback_groups(cls, algorithm):
+    matrix = torch.nn.Parameter(torch.randn(5, 7, dtype=torch.float64))
+    fallback = torch.nn.Parameter(torch.randn(8, 4, 3, 3, dtype=torch.float64))
+    opt = cls([dict(params=[matrix]), dict(params=[fallback], algorithm=algorithm)],
+              lr=7e-4, flatten=True, newton_schulz_func=polynomial_ns)
+    before = fallback.detach().clone()
+    matrix.grad = torch.randn_like(matrix)
+    fallback.grad = torch.randn_like(fallback)
     opt.step()
+    assert not torch.equal(fallback, before)
+    assert torch.count_nonzero(opt.state[fallback]["momentum"]) > 0
 
 
 @pytest.mark.parametrize("cls", [Dion2, NorDion2])

@@ -19,7 +19,6 @@ from .dion2 import (
     dion2_post_orthogonalize,
     dion2_pre_accumulate,
     _make_select_and_orthogonalize,
-    _reject_flattened_convolutions,
 )
 from .normuon import normuon_normalization_stacked, _normuon_normalization_core
 
@@ -48,8 +47,10 @@ class NorDion2(DistributedOrthoBase):
             None: Do not adjust the learning rate.
         flatten: Whether to flatten 3D+ tensors to 2D for Muon updates.
             True: A no-op for 2D parameters. 3D+ parameters are unsupported and
-                raise NotImplementedError at step(): submatrix selection is not
-                flatten-aware. Use Muon or NorMuon for flattened convolutions.
+                raise NotImplementedError at construction or add_param_group().
+                step() also checks before updating any weights, since submatrix
+                selection is not flatten-aware in either selection scope.
+                Use Muon or NorMuon for flattened convolutions.
             False: Tensors are not flattened. 3D+ tensors are treated as batches of 2D matrices.
         use_gram_newton_schulz: Whether to use Gram Newton-Schulz for orthogonalization.
         use_triton: Whether to use Triton kernel for Newton-Schulz. Ignored if custom function is provided.
@@ -66,6 +67,9 @@ class NorDion2(DistributedOrthoBase):
 
     NorDion2 optimizer applying Dion2 update to NorMuon
     """
+
+    # Same selection geometry as Dion2; see the note there.
+    _supports_flattened_3d = False
 
     def __init__(
         self,
@@ -162,7 +166,10 @@ class NorDion2(DistributedOrthoBase):
         Mega-batched NorDion2 task creation: groups ALL same-shape parameters
         into a single task to minimize communication rounds and kernel launches.
         """
-        _reject_flattened_convolutions(param_groups, type(self).__name__)
+        # Recheck all groups, including grad-less params, before yielding any
+        # task: checkpoint loading or live edits can bypass construction checks.
+        for group in param_groups:
+            self._reject_flattened_3d_params(group)
         for group in param_groups:
             assert group["algorithm"] == self._algo_name
             assert all(

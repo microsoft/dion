@@ -39,8 +39,10 @@ class Dion2(DistributedOrthoBase):
             None: Do not adjust the learning rate.
         flatten: Whether to flatten 3D+ tensors to 2D for Muon updates.
             True: A no-op for 2D parameters. 3D+ parameters are unsupported and
-                raise NotImplementedError at step(): submatrix selection is not
-                flatten-aware. Use Muon or NorMuon for flattened convolutions.
+                raise NotImplementedError at construction or add_param_group().
+                step() also checks before updating any weights, since submatrix
+                selection is not flatten-aware in either selection scope.
+                Use Muon or NorMuon for flattened convolutions.
             False: Tensors are not flattened. 3D+ tensors are treated as batches of 2D matrices.
         use_gram_newton_schulz: Whether to use Gram Newton-Schulz for orthogonalization.
         use_triton: Whether to use Triton kernel for Newton-Schulz. Ignored if custom function is provided.
@@ -58,6 +60,12 @@ class Dion2(DistributedOrthoBase):
 
     Dion2 optimizer by Ahn et al.: TBD
     """
+
+    # Submatrix selection derives select_dim (and, when sharded, comm_dim) from
+    # the raw trailing two dimensions, before any flattening. For a 3D+
+    # parameter those are kernel axes, so the top-k ranks kernel slices rather
+    # than output channels and the error-feedback mask lands on the wrong axes.
+    _supports_flattened_3d = False
 
     def __init__(
         self,
@@ -135,7 +143,10 @@ class Dion2(DistributedOrthoBase):
         Mega-batched Dion2 task creation: groups ALL same-shape parameters
         into a single task to minimize communication rounds and kernel launches.
         """
-        _reject_flattened_convolutions(param_groups, type(self).__name__)
+        # Recheck all groups, including grad-less params, before yielding any
+        # task: checkpoint loading or live edits can bypass construction checks.
+        for group in param_groups:
+            self._reject_flattened_3d_params(group)
         for group in param_groups:
             assert group["algorithm"] == self._algo_name
             assert all(
@@ -203,20 +214,6 @@ class Dion2(DistributedOrthoBase):
                         **megabatch_args,
                     )
                 )
-
-
-def _reject_flattened_convolutions(param_groups, optimizer_name):
-    # Check every group before yielding any task: a later invalid group must
-    # not leave earlier parameters partially updated. Include grad-less params.
-    for group in param_groups:
-        if group["flatten"] and any(p.ndim > 2 for p in group["params"]):
-            raise NotImplementedError(
-                f"{optimizer_name} does not support flatten=True for 3D+ parameters: "
-                "submatrix selection and error feedback use the trailing matrix "
-                "dimensions, not the flattened output-channel geometry. "
-                "Use Muon or NorMuon for flattened convolutions. flatten=False "
-                "uses a different, batch-of-spatial-matrices geometry."
-            )
 
 
 def dion2_update_megabatch_async(

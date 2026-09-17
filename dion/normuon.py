@@ -143,6 +143,11 @@ class NorMuon(DistributedOrthoBase):
         if algo == self._algo_name and "variance_neuron" not in state:
             state["variance_neuron"] = neuron_variance_buffer(param, group["flatten"])
             if group["flatten"] and param.ndim > 2:
+                # Plain int, not a device tensor: unlike ``step_dev`` this is
+                # never read by a kernel and never advances under graph replay,
+                # so it needs no device round-trip. It is written only when the
+                # flattened layout is used, so an unflattened state keeps
+                # exactly the key set it had before this marker existed.
                 state["variance_neuron_layout_version"] = 1
         if algo == self._algo_name and param.ndim > 2:
             self._validate_variance_state(param, state, group["flatten"])
@@ -211,15 +216,23 @@ class NorMuon(DistributedOrthoBase):
         Mega-batched NorMuon task creation: groups ALL same-shape parameters
         into a single task to minimize communication rounds and kernel launches.
         """
-        # Validate all existing states before yielding any update task, including
-        # grad-less parameters and groups whose flatten option was changed.
+        # Catch a group whose ``flatten`` was changed after its state was built,
+        # before yielding any task, so a later invalid group cannot leave
+        # earlier parameters half-updated. Grad-less parameters are included.
+        #
+        # This pre-pass only compares layout-marker presence. Full sharding and
+        # variance validation remains in _get_or_initialize_state (construction,
+        # added groups, and active parameters below) and load_state_dict. Avoid
+        # repeating that work for every grad-less parameter on every step.
         for group in param_groups:
+            flatten = bool(group["flatten"])
             for p in group["params"]:
                 if p.ndim > 2:
-                    self._get_shard_info(p, group)
                     state = self.state.get(p)
-                    if state:
-                        self._validate_variance_state(p, state, group["flatten"])
+                    if state and ("variance_neuron_layout_version" in state) != flatten:
+                        # Disagrees with the layout the state was built for;
+                        # defer to the full validator for the error message.
+                        self._validate_variance_state(p, state, flatten)
         for group in param_groups:
             assert group["algorithm"] == self._algo_name
             assert all(
