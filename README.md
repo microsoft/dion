@@ -265,6 +265,21 @@ param_groups = [
 
 When `num_heads > 1`, the optimizer views each 2D weight as a batch of `num_heads` matrices of shape `(head_dim, in_features)` internally. The learning-rate adjustment (`spectral_norm` / `rms_norm`) is computed per-head, and Newton-Schulz runs on each head independently. With FSDP, sharding dim 0 along head boundaries (i.e. `num_heads % world_size == 0`) avoids the all-to-all that would otherwise be needed to assemble the fused matrix before NS.
 
+**The per-head split changes the size of the update, not just its direction.** Under the default `adjust_lr="spectral_norm"`, the adjusted learning rate is computed from the per-head shape, so it becomes `lr * sqrt(head_dim / in_features)` instead of `lr * sqrt(out_features / in_features)` — for a square projection, a factor of `1 / sqrt(num_heads)` smaller (about 3.5x at 12 heads). This is deliberate: each head is normalized as the `(head_dim, in_features)` map it actually is. But it means `num_heads` is not a drop-in A/B against the fused path at a fixed `lr`. Retune the learning rate, or give the attention group its own (param groups carry their own `lr`):
+
+```python
+import math
+
+param_groups = [
+    dict(params=attn_proj_params, num_heads=H, lr=base_lr * math.sqrt(H)),
+    ...
+]
+```
+
+With `adjust_lr="rms_norm"` the adjustment is unchanged by the split — `0.2 * sqrt(max(fan_out, fan_in))` is the same whenever `in_features >= head_dim` — so that mode compares the two orthogonalizations at matched update magnitude.
+
+It is worth being precise about what per-head Newton-Schulz actually inflates, since the `spectral_norm` shrink looks larger than the effect it corrects. Before the learning-rate adjustment, the assembled per-head update has the *same* Frobenius norm as the fused one: `num_heads` blocks of `head_dim` unit singular values total `out_features`, exactly as the fused matrix does. What grows is the spectral norm — at most `sqrt(num_heads)`, and about 1.9x at 12 heads for a random gradient. The `spectral_norm` adjustment normalizes the worst case, so the resulting step is smaller in total than the fused path's, not merely rescaled.
+
 Requirements: the parameter must be 2D, `num_heads` must divide dim 0, and when using FSDP it must also divide the world size. Place Q / K / V / gate projections in one group (axis-0 heads); O-projection heads are on axis 1 and are not covered by this option.
 
 ### Per-Block Newton-Schulz for Fused QKV Projections
@@ -280,6 +295,8 @@ param_groups = [
 ```
 
 Each block receives the same update it would as a separate parameter: Newton-Schulz, the learning-rate adjustment (`spectral_norm` / `rms_norm`), and NorMuon's norm-preserving rescale are all computed per block. Blocks of equal size (e.g. K and V) are batched into one Newton-Schulz call. The split happens on the fully assembled matrices after the FSDP all-to-all, so the communication pattern is unchanged from the fused parameter.
+
+The learning-rate caveat described for `num_heads` above applies here too: under `adjust_lr="spectral_norm"` each block's adjusted lr comes from that block's own `(block_size, in_features)` shape, so splitting a matrix lowers the effective step size for those rows. Retune `lr`, or set one on the group, before comparing against the unsplit path.
 
 Requirements: the parameter must be 2D, `split_sizes` must sum to dim 0, and with FSDP dim 0 must be divisible by the world size (so the assembled matrices contain no padding rows). `split_sizes` is mutually exclusive with `num_heads`. With FSDP, NorMuon's norm-preserving rescale operates on local shards (the existing distributed behavior) rather than per block; the per-block learning-rate adjustment is exact on every path, because NorMuon applies it after that rescale.
 

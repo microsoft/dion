@@ -164,6 +164,17 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- **Docs:** the README now spells out that `num_heads` (and `split_sizes`) change the
+  *magnitude* of the update, not just which submatrices get orthogonalized. Under the
+  default `adjust_lr="spectral_norm"` the adjusted learning rate is computed from the
+  per-head shape, so it is `lr * sqrt(head_dim / in_features)` — a factor of
+  `1 / sqrt(num_heads)` smaller than the fused path for a square projection, about 3.5x
+  at 12 heads. That is the intended normalization (each head is scaled as the map it
+  actually is), but it means enabling `num_heads` at a fixed `lr` is not a controlled A/B:
+  the README now recommends retuning, or giving the attention group its own `lr`, and
+  notes that `adjust_lr="rms_norm"` is unaffected by the split and so compares the two
+  orthogonalizations at matched update size. Behavior is unchanged. Reported in #122.
+
 - The FSDP2 row-sharded `selection_scope` default (both `Dion2` and `NorDion2`)
   is now `"local"` (per-shard top-k) again, reverting the `"global"` default from
   #98 while keeping that PR's `global_select_size` padding-correctness fix intact.
