@@ -66,6 +66,16 @@ class Hyperparameters:
     mu: float = 0.95
     weight_decay: float = 0.01
     ortho_fraction: float = 0.25
+    # Scheduled ortho_fraction. "none" holds ortho_fraction for the whole run
+    # (the historical behaviour, bit-identical). "geometric" starts at
+    # ortho_fraction_start, holds it for ortho_warmup_steps, then decays
+    # geometrically to ortho_fraction over ortho_anneal_steps and holds it.
+    # Geometric rather than linear because 1 -> 1/8 is three halvings: linear
+    # spends most of the horizon near 1 and crosses the interesting region fast.
+    ortho_fraction_schedule: str = "none"
+    ortho_fraction_start: float = 1.0
+    ortho_warmup_steps: int = 0
+    ortho_anneal_steps: int = 0
 
     # Optimizer specific hyperparameters
     qr_method: str = "rcqr"
@@ -138,6 +148,22 @@ def parse_cli_args():
     )
     parser.add_argument(
         "--ortho_fraction", type=float, default=None, help="Fraction to orthogonalize for Dion/Dion2"
+    )
+    parser.add_argument(
+        "--ortho_fraction_schedule", type=str, default=None, choices=["none", "geometric"],
+        help="Schedule ortho_fraction over training instead of holding it constant",
+    )
+    parser.add_argument(
+        "--ortho_fraction_start", type=float, default=None,
+        help="Fraction at step 0 when --ortho_fraction_schedule is set (default 1.0, i.e. NorMuon)",
+    )
+    parser.add_argument(
+        "--ortho_warmup_steps", type=int, default=None,
+        help="Steps held at --ortho_fraction_start before the anneal begins",
+    )
+    parser.add_argument(
+        "--ortho_anneal_steps", type=int, default=None,
+        help="Steps over which the fraction anneals from start down to --ortho_fraction",
     )
     parser.add_argument("--mu", type=float, default=None, help="Momentum coefficient")
     parser.add_argument("--weight_decay", type=float, default=None, help="Weight decay")
@@ -862,6 +888,65 @@ def main():
 
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
 
+    # --- ortho_fraction schedule ---------------------------------------------
+    # Dion3 orthogonalizes a fraction f of rows per step. The quality gap over
+    # NorMuon is concentrated early (at 1B/20B it is +0.068 nats at 2.1B tokens
+    # and +0.006 by 14.7B), so paying for f=1 early and annealing to the target
+    # may buy most of the quality at most of the speed. A second mechanism may
+    # matter as much: `variance_neuron` is a plain EMA with no bias correction
+    # that only updates on *selected* rows, so at constant f=1/8 every row's
+    # variance warms up 8x slower from its zero init. Starting at f=1 warms all
+    # rows before the anneal.
+    #
+    # Pure function of the iteration, like get_lr, so a resume replays it
+    # exactly and nothing has to be carried in the checkpoint.
+    def get_ortho_fraction(it):
+        if hp.ortho_fraction_schedule == "none":
+            return hp.ortho_fraction
+        f0, f1 = hp.ortho_fraction_start, hp.ortho_fraction
+        if it < hp.ortho_warmup_steps or hp.ortho_anneal_steps <= 0:
+            return f0 if it < hp.ortho_warmup_steps else f1
+        t = (it - hp.ortho_warmup_steps) / hp.ortho_anneal_steps
+        if t >= 1.0:
+            return f1
+        # geometric interpolation: linear in log f
+        return float(f0 * (f1 / f0) ** t)
+
+    # Only the orthogonalized matrix groups read "fraction"; the AdamW scalar
+    # groups carry it from the optimizer defaults but ignore it.
+    _scalar_algos = {hp.scalar_opt, "adamw"}
+    fraction_groups = [
+        g for g in optimizer.param_groups
+        if "fraction" in g and g.get("algorithm") not in _scalar_algos
+    ]
+    if hp.ortho_fraction_schedule != "none":
+        if not fraction_groups:
+            raise ValueError(
+                "--ortho_fraction_schedule is set but no param group takes a "
+                f"'fraction' (optimizer={hp.optimizer}). The schedule only "
+                "applies to Dion2/Dion3/NorDion2."
+            )
+        print0(
+            f"ortho_fraction schedule: {hp.ortho_fraction_schedule} "
+            f"{hp.ortho_fraction_start} -> {hp.ortho_fraction}, "
+            f"warmup {hp.ortho_warmup_steps} steps, anneal {hp.ortho_anneal_steps} steps "
+            f"(reaches target at step {hp.ortho_warmup_steps + hp.ortho_anneal_steps})"
+        )
+        # k = ceil(fraction * padded_local) is a tensor dim inside the
+        # fullgraph-compiled gather/normalize/scatter. Automatic dynamic shapes
+        # already generalize it after the first recompile (see the docstring on
+        # nordion2_normalize_selected_stacked), but marking it up front makes
+        # that deterministic from step 1 instead of paying a recompile each time
+        # the schedule moves k before promotion kicks in. Off by default, so a
+        # constant-fraction run is untouched.
+        from dion import nordion2 as _nordion2
+        if hasattr(_nordion2, "set_mark_k_dynamic"):
+            _nordion2.set_mark_k_dynamic(True)
+        # The Gram Newton-Schulz kernel needs k 8-aligned. Constant fractions
+        # land aligned by construction; a schedule does not, so require it.
+        if hasattr(_nordion2, "set_k_align"):
+            _nordion2.set_k_align(8)
+
     print0("=" * 80)
 
     # --- Logging initialization ---
@@ -1048,6 +1133,12 @@ def main():
         grad_norm = torch.nn.utils.get_total_norm(
             [p.grad for p in model.parameters() if p.grad is not None]
         )
+        # The fraction this step will actually use. A host float derived from a
+        # host int: no device sync, and the optimizer re-reads group["fraction"]
+        # every step.
+        current_ortho_fraction = get_ortho_fraction(step)
+        for _g in fraction_groups:
+            _g["fraction"] = current_ortho_fraction
         optimizer.step()
         lr_scheduler.step()
         model.zero_grad(set_to_none=True)
@@ -1064,6 +1155,7 @@ def main():
             log_dict = {
                 "train/loss": train_loss.item(),
                 "train/grad_norm": grad_norm.item(),
+                "train/ortho_fraction": current_ortho_fraction,
                 "step": step,
                 "time/training_time_ms": current_training_time_ms,
             }

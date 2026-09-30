@@ -352,6 +352,16 @@ def nordion2_update_megabatch_async(
     if comm_dim is not None:
         padded_local = (global_dim_size + world_size - 1) // world_size
         k = max(1, int(math.ceil(fraction * padded_local)))
+        if _K_ALIGN > 1 and k < padded_local:
+            # The Gram Newton-Schulz CuTe kernel requires the Gram operand's
+            # leading stride to be a multiple of 8 and raises
+            # "Invalid mD.strides[0] ... expected to be divisible by 8"
+            # otherwise. At the fractions used historically (1, 1/4, 1/8 of a
+            # padded_local that is itself a multiple of 8) k lands aligned by
+            # luck; a scheduled fraction sweeps through k values that do not.
+            # Round up so every k on the path is legal, and never past
+            # padded_local, which is the f=1 value and already aligned.
+            k = min(padded_local, ((k + _K_ALIGN - 1) // _K_ALIGN) * _K_ALIGN)
     else:
         k = None
     global_comm_dim_size = global_dim_size
@@ -458,6 +468,37 @@ def _nordion2_scatter_variance(
     return V_full.scatter(dim=-2, index=idx, src=V_sel_new.to(V_full.dtype))
 
 
+# Set by the trainer when ortho_fraction is scheduled rather than constant; see
+# set_mark_k_dynamic. Module-level rather than a parameter because the call site
+# is several frames below the optimizer's public API.
+_MARK_K_DYNAMIC = False
+
+# Round the selected-row count up to a multiple of this. 1 disables it, which is
+# the historical behaviour. Set to 8 by the trainer when ortho_fraction is
+# scheduled; see set_k_align.
+_K_ALIGN = 1
+
+
+def set_k_align(align: int) -> None:
+    """Require the selected-row count k to be a multiple of ``align``.
+
+    The Gram Newton-Schulz kernel rejects unaligned k. Constant-fraction runs
+    have always used aligned k by construction, so this defaults to off.
+    """
+    global _K_ALIGN
+    _K_ALIGN = max(1, int(align))
+
+
+def set_mark_k_dynamic(enabled: bool) -> None:
+    """Mark the selected-row dim dynamic for the compiled normalize path.
+
+    Only needed when ``fraction`` changes during training. Leaving it off keeps
+    the historical behaviour exactly.
+    """
+    global _MARK_K_DYNAMIC
+    _MARK_K_DYNAMIC = bool(enabled)
+
+
 def nordion2_normalize_selected_stacked(
     U: Tensor,  # [N, k, cols]  orthogonalized selected rows
     V_full: Tensor,  # [N, rows, 1]  full per-neuron variance buffer (param dtype)
@@ -495,6 +536,15 @@ def nordion2_normalize_selected_stacked(
     See https://github.com/pytorch/pytorch/issues/194490 and #115.
     """
     idx = indices.unsqueeze(-1)
+    if _MARK_K_DYNAMIC:
+        # k (dim 1 of U and idx) moves when ortho_fraction is scheduled.
+        # Automatic dynamic shapes generalize it after the first recompile
+        # anyway -- see the note above -- but marking it here makes the graph
+        # dynamic in k from the first call, so a moving schedule never pays a
+        # recompile. rows/cols stay static. No-op when the caller never
+        # enables it, so constant-fraction runs are unaffected.
+        torch._dynamo.mark_dynamic(U, 1)
+        torch._dynamo.mark_dynamic(idx, 1)
     U_normed, V_sel_new = _nordion2_gather_and_normalize(U, V_full, idx, muon_beta2)
     return U_normed, _nordion2_scatter_variance(V_full, idx, V_sel_new)
 
