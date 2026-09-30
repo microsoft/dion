@@ -450,6 +450,15 @@ _inductor_workaround = (
 
 @_inductor_workaround
 @torch.compile(fullgraph=True)
+def _get_k_align() -> int:
+    """Read the k alignment set on nordion2, without importing it at module load."""
+    try:
+        from .nordion2 import _K_ALIGN
+        return _K_ALIGN
+    except Exception:
+        return 1
+
+
 def dion2_pre_orthogonalize(
     G: List[Tensor],
     M: List[Tensor],
@@ -496,6 +505,11 @@ def dion2_pre_orthogonalize(
         k = k_override
     else:
         k = max(1, int(math.ceil(fraction * num_select)))
+        _align = _get_k_align()
+        if _align > 1 and k < num_select:
+            # Keep k on the alignment the Gram Newton-Schulz kernel requires.
+            # Mirrors the sharded path in nordion2; see set_k_align there.
+            k = min(num_select, ((k + _align - 1) // _align) * _align)
     k_topk = min(k, num_select)
 
     # Update momentum: M = M + G
