@@ -56,15 +56,34 @@ setup(
     # },
     # Author information:
     author="Ahn, Kwangjun and Xu, Byron and Abreu, Natalie and Langford, John",  # as listed in the paper
-    author_email="{kwangjunahn, byronxu}@microsoft.com",  # left this form to prevent bots from harvesting emails
+    # PyPI validates this field and rejects an unparseable address, so it has to be a
+    # real mailbox. Bug reports belong on the issue tracker (see project_urls) rather
+    # than in a maintainer's inbox.
+    author_email="jcl@microsoft.com",
     # Description of the package:
     description="Dion: Distributed Orthonormal Updates",
     long_description=readme_contents,
     long_description_content_type="text/markdown",
+    project_urls={
+        "Homepage": "https://github.com/microsoft/dion",
+        "Source": "https://github.com/microsoft/dion",
+        "Issues": "https://github.com/microsoft/dion/issues",
+        "Changelog": "https://github.com/microsoft/dion/blob/main/CHANGELOG.md",
+    },
     # Plugins entry point
     classifiers=[
+        "Development Status :: 4 - Beta",
+        "Intended Audience :: Science/Research",
+        "License :: OSI Approved :: MIT License",
+        "Operating System :: OS Independent",
         "Programming Language :: Python",
         "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
+        "Topic :: Scientific/Engineering :: Artificial Intelligence",
     ],
     python_requires=">=3.9",
     license="MIT",

@@ -1,0 +1,11 @@
+# setup.py reads the requirements files at build time to populate
+# install_requires and extras_require. Without them in the sdist,
+# `read_requirements` finds nothing, warns, and returns an empty list -- so
+# building from the sdist yields a wheel that declares no dependencies at all.
+# The glob covers requirements files added later, which an explicit list would
+# not. See tests/test_packaging.py.
+include requirements_*.txt
+include LICENSE
+include NOTICE.md
+include README.md
+include CHANGELOG.md
