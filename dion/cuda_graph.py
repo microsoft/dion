@@ -63,6 +63,13 @@ Requirements / caveats:
     ops outlive the step. ``dist.destroy_process_group()`` blocks while they are alive:
     call ``release()`` before tearing the process group down at the end of a run, or
     shutdown hangs.
+  * Expandable segments: with ``PYTORCH_ALLOC_CONF=expandable_segments:True`` on a sharded
+    mesh, set ``NCCL_GRAPH_REGISTER=0`` before the NCCL communicators are created, or run
+    on the default allocator. Otherwise NCCL's buffer registration for the captured
+    all-to-all can make the replayed step silently differ from eager (slow drift, or NaN
+    parameters after the first replay, with no error). The setting had no measurable
+    effect on step time. See https://github.com/microsoft/dion/issues/125 and NVIDIA's
+    CUDA Graph guide (PyTorch integration, expandable segments).
   * torch.compile is neither needed nor wanted under a graph (the graph already removes
     dispatch, and a fullgraph compile of the unrolled per-matrix loops is what makes the
     first step take minutes at many layers). Disable it for the wrapped optimizer.
