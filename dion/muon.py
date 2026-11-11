@@ -280,7 +280,7 @@ def muon_update_megabatch_async(
     )
 
 
-@torch.compile(fullgraph=True)
+@torch.compile(dynamic=False, fullgraph=True)
 def muon_update_pre_orthogonalize(
     G: List[Tensor],
     M: List[Tensor],
@@ -311,7 +311,7 @@ def muon_update_pre_orthogonalize(
     return U
 
 
-@torch.compile(fullgraph=True)
+@torch.compile(dynamic=False, fullgraph=True)
 def muon_update_post_orthogonalize(
     X: List[Tensor],
     U: List[Tensor],
