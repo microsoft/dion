@@ -514,7 +514,10 @@ def dion2_pre_orthogonalize(
     # torch.compile-safe.
     if num_select == 0:
         U_selected = [m.to(dtype=torch.bfloat16) for m in M]
-        indices_list = [torch.empty(0, dtype=torch.long, device=M[0].device) for _ in M]
+        indices_list = [
+            torch.empty((*m.shape[:-2], 0), dtype=torch.long, device=m.device)
+            for m in M
+        ]
         return U_selected, indices_list
 
     M_stacked = torch.stack(M, dim=0)

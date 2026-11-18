@@ -6,6 +6,13 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- `Dion3` / `NorDion2` accepts 2D and 3D device meshes, including FSDP + TP.
+  Updates temporarily gather column and additional row shards into a single
+  row-sharded layout, then restore persistent weights and state. Same-shaped
+  tensors share redistribution collectives to reduce launch overhead.
+  This adds temporary memory and communication; per-head splitting and
+  flattened 3D+ weights remain unsupported on this path.
+
 - `NorDion2` is now also available as `Dion3` (`from dion import Dion3`, or
   `from dion.dion3 import Dion3`), and `train.py` accepts `--optimizer dion3`
   alongside `--optimizer nordion2`. NorDion2 is the third-generation Dion update

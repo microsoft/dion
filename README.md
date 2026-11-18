@@ -83,7 +83,7 @@ torchrun --standalone --nproc_per_node=4 train.py --config configs/dion2_160m.ya
 ```
 This will launch Distributed Data Parallel (DDP) training.
 
-To train with Dion3 instead, swap in `configs/dion3_160m.yaml`. Its hyperparameters are carried over from the Dion2 config as a starting point rather than a translation — Dion3's per-neuron normalization redistributes the update across rows, and `mu` feeds Dion2's error-feedback decay but Dion3's momentum — so read the comments in the file before tuning. The FSDP and HSDP examples below accept it as well; tensor parallelism does not (see below).
+To train with Dion3 instead, swap in `configs/dion3_160m.yaml`. Its hyperparameters are carried over from the Dion2 config as a starting point rather than a translation — Dion3's per-neuron normalization redistributes the update across rows, and `mu` feeds Dion2's error-feedback decay but Dion3's momentum — so read the comments in the file before tuning. The FSDP, HSDP, and FSDP + tensor parallel examples below accept it as well.
 
 ### Distributed Training: FSDP / TP / Hybrid Sharding
 
@@ -118,7 +118,9 @@ The product `dp_size × fs_size` must equal `world_size`. Any unspecified dimens
 
 #### Tensor Parallelism (TP)
 
-**Note**: Currently, only Dion (our legacy implementation) supports Tensor Parallelism.
+**Note**: Dion and Dion3 support FSDP + Tensor Parallelism. Dion3 uses temporary
+layout redistribution as described below; Dion2, Muon, and NorMuon do not
+support this combination.
 
 You can combine all three parallelism strategies (DP × FSDP × TP). For example, a 2 × 2 × 2 configuration across 8 GPUs:
 ```bash
@@ -136,6 +138,8 @@ This configuration creates:
 - **Total**: 8 GPUs with 2-way DP × 2-way FSDP × 2-way TP
 
 The product `dp_size × fs_size × tp_size` must equal `world_size`. Any unspecified dimension defaults to 1.
+
+For Dion3, use `--config configs/dion3_160m.yaml` in the same command.
 
 
 ## Introduction
@@ -156,7 +160,11 @@ Our current implementations support the following parallelization techniques:
 | Single device      | Yes  |  Yes  |  Yes  | Yes  |   Yes   |
 | PyTorch DDP        | Yes  |  Yes  |  Yes  | Yes  |   Yes   |
 | PyTorch FSDP2      | Yes  |  Yes  |  Yes  | Yes  |   Yes   |
-| PyTorch FSDP2 + TP | Yes  |  No   |  No   | No   |   No    |
+| PyTorch FSDP2 + TP | Yes  |  No   | Yes¹  | No   |   No    |
+
+¹ Dion3 redistributes temporary update tensors to a row-sharded layout; see
+[Multidimensional sharding for Dion3](#multidimensional-sharding-for-dion3) for
+the communication and memory costs.
 
 For faster performance, these optimizers will process parameters in batches and interleave multiple batches to overlap compute with communication.
 
@@ -306,7 +314,9 @@ For our efficient distributed optimizers to work correctly, they need informatio
 
 ### 1D Sharding Configuration (Dion2, Dion3, Muon, NorMuon)
 
-Most optimizers in this codebase (Dion2, Dion3, Muon, NorMuon) currently support only 1D sharding. They accept a single 1D device mesh via the `distributed_mesh` argument and adapt their behavior based on how this mesh is used:
+All four optimizers accept a single 1D device mesh via `distributed_mesh` and
+adapt their behavior based on how this mesh is used. Dion2, Muon, and NorMuon
+require this 1D interface; Dion3 additionally accepts 2D and 3D meshes:
 
 - **If the mesh is used for parameter sharding**: The optimizer efficiently unshards parameters using all-to-all communication
 - **If the mesh is not used for sharding**: The optimizer distributes work across devices and all-gathers the final results
@@ -370,6 +380,55 @@ optimizer = Dion2(                              # or Muon or NorMuon
 ```
 
 
+
+### Multidimensional sharding for Dion3
+
+Pass the full model mesh, or a submesh containing **every sharded axis**, to
+`Dion3`. A 2D mesh can shard rows and columns; a 3D mesh can combine those with
+replication (DP × FSDP × TP), batch/expert sharding, or another row-sharding axis.
+FSDP and TP remain responsible for synchronizing gradients across replicas.
+
+```python
+mesh = init_device_mesh(
+    "cuda", (dp_size, fs_size, tp_size), mesh_dim_names=("dp", "fs", "tp")
+)
+# Apply TP and FSDP to the model first, then build its parameter groups.
+optimizer = Dion3(param_groups, distributed_mesh=mesh, lr=0.02, fraction=0.5)
+```
+
+Weights and momentum remain in the model's original DTensor placements between
+steps. Per-neuron variance follows row/batch sharding and is replicated across
+column-sharding axes, since each statistic describes a complete row. Existing
+scalar AdamW/Lion groups continue to update their local shards.
+
+During a matrix update, Dion3 gathers column shards and any extra row-sharding
+axes into temporary tensors, retains the first active row-sharding axis in mesh
+order, and runs its existing row-sharded update. It then restores weights and
+state to their original placements. Batch-sharding and replica axes are retained.
+Same-shaped tensors are stacked for redistribution, so each tensor family uses
+one collective per gathered mesh axis instead of one per parameter. Layouts
+that already match are reused without packing or copying.
+`selection_scope` keeps its existing behavior along the retained row axis:
+`local` selects within each row shard; `global` selects after assembling rows.
+
+This implementation adds communication and temporary memory for the gathered
+weights, gradients, and state; it is not a distributed 2D Newton–Schulz kernel.
+With no active row-sharding axis, each participating rank temporarily holds
+complete matrices for its local batch. Uneven shards are handled by DTensor
+redistribution. `num_heads > 1` and `split_sizes` are not supported on this path;
+the existing restriction on `flatten=True` for 3D+ weights also remains.
+
+To validate native NCCL on a machine with eight GPUs:
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  python -m pytest -q tests/test_dion3_mesh.py::test_multidimensional_mesh_nccl
+```
+
+The test runs both four-rank and eight-rank layouts, including FSDP + TP
+forward/backward, replica synchronization, uneven/empty shards, and optimizer
+state resume. It uses eager CUDA kernels and native NCCL collectives, without
+the CPU tests' Gloo adapter. Tests skip when there are too few GPUs.
 
 ### 2D-Sharding Support for Dion
   

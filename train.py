@@ -507,13 +507,8 @@ def init_optimizer(
         # Print out whichever name was requested.
         opt_name = "Dion3" if hp.optimizer == "dion3" else "NorDion2"
         if device_mesh is not None:
-            # Ensure that we have a supported device mesh configuration for NorDion2
-            if inner_shard_mesh is not None and inner_shard_mesh.size() > 1:
-                raise ValueError(f"Tensor parallel is not supported by {opt_name}.")
-            distributed_mesh = (
-                outer_shard_mesh if outer_shard_mesh.size() > 1 else replicate_mesh
-            )
-            comm_method = "all-to-all" if outer_shard_mesh.size() > 1 else "all-gather"
+            distributed_mesh = device_mesh
+            comm_method = "mesh redistribution + row-sharded orthogonalization"
         else:
             assert ddp_model is not None
             distributed_mesh = ddp_model.process_group  # using ProcessGroup for DDP

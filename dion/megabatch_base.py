@@ -40,6 +40,7 @@ class DistributedOrthoBase(Optimizer):
     # operate on the wrong axes of a flattened convolution -- set this False
     # and are checked at construction and before creating update tasks.
     _supports_flattened_3d: bool = True
+    _supports_multidim_mesh: bool = False
 
     def __init__(
         self,
@@ -57,14 +58,26 @@ class DistributedOrthoBase(Optimizer):
 
         # Distributed configuration
         if isinstance(distributed_mesh, DeviceMesh):
-            if distributed_mesh.ndim != 1:
+            if distributed_mesh.ndim != 1 and not (
+                self._supports_multidim_mesh and distributed_mesh.ndim in (2, 3)
+            ):
+                if self._supports_multidim_mesh:
+                    raise ValueError(
+                        f"Expected a 1D, 2D or 3D DeviceMesh, got {distributed_mesh.ndim}D"
+                    )
                 raise ValueError(
                     f"Only 1D DeviceMesh supported, but got {distributed_mesh.ndim}D. "
                     f"For HSDP, provide the 1D sharded sub-mesh."
                 )
-            self._device_rank = distributed_mesh.get_local_rank()
-            self._world_size = distributed_mesh.size()
-            self._process_group = distributed_mesh.get_group()
+            if distributed_mesh.ndim == 1:
+                self._device_rank = distributed_mesh.get_local_rank()
+                self._world_size = distributed_mesh.size()
+                self._process_group = distributed_mesh.get_group()
+            else:
+                # The subclass selects a communication axis per parameter.
+                self._device_rank = 0
+                self._world_size = 1
+                self._process_group = None
         elif isinstance(distributed_mesh, ProcessGroup):
             self._device_rank = dist.get_rank(distributed_mesh)
             self._world_size = dist.get_world_size(distributed_mesh)
@@ -897,9 +910,12 @@ def megabatch_orthogonalize_async(
             has_megabatch_dim=True,
         )
 
+        # Orthogonalization may return a transposed layout. NCCL requires
+        # contiguous receive buffers too; empty_like otherwise preserves it.
+        my_matrices = my_matrices.contiguous()
         all_chunks = [torch.empty_like(my_matrices) for _ in range(world_size)]
         work = dist.all_gather(
-            all_chunks, my_matrices.contiguous(), group=process_group, async_op=True
+            all_chunks, my_matrices, group=process_group, async_op=True
         )
         yield
         work.wait()

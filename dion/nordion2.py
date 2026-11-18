@@ -3,7 +3,11 @@ import torch
 from collections import defaultdict
 from torch import Tensor
 from torch.distributed import ProcessGroup
-from torch.distributed.tensor import DeviceMesh, DTensor
+from torch.distributed.tensor import DeviceMesh, DTensor, Replicate, Shard
+try:
+    from torch.distributed.tensor.placement_types import _StridedShard
+except ImportError:
+    _StridedShard = None
 from torch.optim.optimizer import ParamsT
 from typing import Callable, Generator, List, Optional, Tuple, Union
 
@@ -23,6 +27,12 @@ from .dion2 import (
 from .normuon import normuon_normalization_stacked, _normuon_normalization_core
 
 
+def _is_storage_shard(placement) -> bool:
+    return placement.is_shard() or (
+        _StridedShard is not None and isinstance(placement, _StridedShard)
+    )
+
+
 class NorDion2(DistributedOrthoBase):
     """
     Distributed NorDion2 optimizer for PyTorch FSDP2. Also compatible with DDP.
@@ -31,6 +41,13 @@ class NorDion2(DistributedOrthoBase):
         params: Parameters for the optimizer.
         distributed_mesh: DeviceMesh or ProcessGroup for distributed training.
             Use DeviceMesh for FSDP2 and ProcessGroup for DistributedDataParallel.
+            A 2D/3D mesh may include replicated, row-sharded, column-sharded,
+            and batch-sharded axes. Pass every sharded axis (normally the full
+            model mesh). Updates temporarily redistribute to one row-sharded
+            axis with complete columns; persistent parameters and states retain
+            their original placements. This trades extra communication and
+            temporary memory for compatibility with multidimensional sharding.
+            num_heads is currently unsupported with a multidimensional mesh.
         lr: Base learning rate. For NorDion2, this will be scaled based on the matrix dimensions.
             For element-wise update rules, this is the actual learning rate and no additional scaling is done.
         fraction: Fraction of submatrix to orthogonalize per update (0 < fraction <= 1).
@@ -70,6 +87,7 @@ class NorDion2(DistributedOrthoBase):
 
     # Same selection geometry as Dion2; see the note there.
     _supports_flattened_3d = False
+    _supports_multidim_mesh = True
 
     def __init__(
         self,
@@ -146,8 +164,63 @@ class NorDion2(DistributedOrthoBase):
         state = super()._get_or_initialize_state(param, algo, group)
         if algo == self._algo_name and "variance_neuron" not in state:
             # V stored in param dtype (bf16); upcast to fp32 for compute, truncated back on write
-            state["variance_neuron"] = torch.zeros_like(param[..., 0:1])
+            if isinstance(param, DTensor):
+                # Per-neuron statistics span columns: replicate over column
+                # shards, while retaining row/batch shards. Build zeros locally
+                # so initialization does not gather the parameter just to slice it.
+                placements = tuple(
+                    Replicate()
+                    if _is_storage_shard(p) and p.dim == param.ndim - 1
+                    else p
+                    for p in param.placements
+                )
+                shape = (*param.shape[:-1], 1)
+                local = torch.zeros(
+                    (*param.to_local().shape[:-1], 1),
+                    device=param.device, dtype=param.dtype,
+                )
+                stride = tuple(math.prod(shape[i + 1:]) for i in range(len(shape)))
+                state["variance_neuron"] = DTensor.from_local(
+                    local, param.device_mesh, placements, shape=torch.Size(shape),
+                    stride=stride, run_check=False,
+                )
+            else:
+                state["variance_neuron"] = torch.zeros_like(param[..., 0:1])
         return state
+
+    def _uses_mesh_layout(self, param: Tensor) -> bool:
+        return isinstance(param, DTensor) and isinstance(
+            self._distributed_mesh, DeviceMesh
+        ) and self._distributed_mesh.ndim > 1
+
+    def _work_layout(self, param: DTensor) -> Tuple[tuple, Optional[int]]:
+        """Retain one row shard and batch shards; gather other matrix shards."""
+        mesh = param.device_mesh
+        provided_groups = {
+            self._distributed_mesh.get_group(i)
+            for i in range(self._distributed_mesh.ndim)
+        }
+        row_axis = None
+        target = []
+        for axis, placement in enumerate(param.placements):
+            # Recent PyTorch distinguishes FSDP's interleaved _StridedShard
+            # from Shard in is_shard(); both are storage sharding placements.
+            is_sharded = _is_storage_shard(placement)
+            if not (is_sharded or placement.is_replicate()):
+                raise ValueError("Dion3 parameters must have Shard or Replicate placements")
+            if is_sharded and mesh.size(axis) > 1:
+                if mesh.get_group(axis) not in provided_groups:
+                    raise ValueError(
+                        "Dion3 distributed_mesh must include every sharded parameter "
+                        "mesh axis; pass the full mesh or its sharded submesh."
+                    )
+                if placement.dim == param.ndim - 2 and row_axis is None:
+                    row_axis = axis
+                    placement = Shard(placement.dim)
+                elif placement.dim >= param.ndim - 2:
+                    placement = Replicate()
+            target.append(placement)
+        return tuple(target), row_axis
 
     def _get_shard_info(self, param: Tensor, group: dict):
         result = super()._get_shard_info(param, group)
@@ -170,6 +243,14 @@ class NorDion2(DistributedOrthoBase):
         # task: checkpoint loading or live edits can bypass construction checks.
         for group in param_groups:
             self._reject_flattened_3d_params(group)
+            # Validate all layouts before the first update is launched.
+            for param in group["params"]:
+                if self._uses_mesh_layout(param):
+                    self._work_layout(param)
+                    if self._resolve_num_heads(group) is not None:
+                        raise NotImplementedError(
+                            "Dion3 num_heads is not supported with a multidimensional mesh"
+                        )
         for group in param_groups:
             assert group["algorithm"] == self._algo_name
             assert all(
@@ -200,7 +281,8 @@ class NorDion2(DistributedOrthoBase):
             shape_groups: dict[tuple, list] = defaultdict(list)
             for p in group_params:
                 sharding = p.placements if isinstance(p, DTensor) else None
-                shape_groups[(p.shape, sharding, p.dtype)].append(p)
+                mesh = p.device_mesh if isinstance(p, DTensor) else None
+                shape_groups[(p.shape, sharding, p.dtype, mesh)].append(p)
 
             num_heads = self._resolve_num_heads(group)
             if group.get("split_sizes") is not None:
@@ -208,11 +290,19 @@ class NorDion2(DistributedOrthoBase):
                     "split_sizes is currently supported only by Muon and NorMuon."
                 )
 
-            for (_shape, _sharding, _dtype), params in shape_groups.items():
+            for (_shape, _sharding, _dtype, _mesh), params in shape_groups.items():
                 gradients = [p.grad for p in params]
                 states = [self._get_or_initialize_state(p, self._algo_name, group) for p in params]
                 momentums = [s["momentum"] for s in states]
                 variances_neuron = [s["variance_neuron"] for s in states]
+
+                if self._uses_mesh_layout(params[0]):
+                    placements, row_axis = self._work_layout(params[0])
+                    yield AsyncTask(nordion2_update_mesh_async(
+                        params, gradients, momentums, variances_neuron,
+                        placements, row_axis, update_args,
+                    ))
+                    continue
 
                 if num_heads is not None:
                     params, gradients, momentums, variances_neuron = self._prepare_head_split(
@@ -239,6 +329,85 @@ class NorDion2(DistributedOrthoBase):
                         **megabatch_args,
                     )
                 )
+
+
+def _redistribute_group(tensors: List[DTensor], placements: tuple) -> List[DTensor]:
+    """Redistribute one shape group with a single collective per mesh axis.
+
+    The leading stack dimension is replicated, so DTensor's uneven/strided
+    shard mapping remains unchanged for each individual parameter.
+    """
+    first = tensors[0]
+    if first.placements == placements:
+        return tensors
+    if len(tensors) == 1:
+        return [first.redistribute(placements=placements)]
+
+    def stacked_layout(layout):
+        return tuple(
+            _StridedShard(p.dim + 1, split_factor=p.split_factor)
+            if _StridedShard is not None and isinstance(p, _StridedShard)
+            else Shard(p.dim + 1) if p.is_shard() else p
+            for p in layout
+        )
+
+    shape = first.shape
+    stride = tuple(math.prod(shape[i + 1:]) for i in range(len(shape)))
+    stacked = DTensor.from_local(
+        torch.stack([t.to_local() for t in tensors]),
+        first.device_mesh, stacked_layout(first.placements),
+        shape=torch.Size((len(tensors), *shape)),
+        stride=(math.prod(shape), *stride), run_check=False,
+    )
+    local = stacked.redistribute(placements=stacked_layout(placements)).to_local()
+    return [
+        DTensor.from_local(
+            part, first.device_mesh, placements,
+            shape=shape, stride=stride, run_check=False,
+        )
+        for part in local.unbind(0)
+    ]
+
+
+def nordion2_update_mesh_async(
+    X: List[DTensor],
+    G: List[DTensor],
+    M: List[DTensor],
+    V: List[DTensor],
+    placements: tuple,
+    row_axis: Optional[int],
+    update_args: dict,
+) -> Generator[None, None, None]:
+    """Use a temporary row-sharded layout, then copy back to persistent shards.
+
+    Redistribution gathers columns/additional row axes, never replica axes.
+    The existing kernel retains its local/global selection and normalization
+    semantics along the remaining row axis. DTensor handles uneven and empty
+    shards and the reverse mapping, including repeated sharding of one axis.
+    """
+    work = [
+        _redistribute_group(tensors, placements)
+        for tensors in (X, G, M, V)
+    ]
+    # A batch-sharded rank with no matrices has no work, including no row-axis
+    # collectives: all ranks in that row group share the empty batch extent.
+    if math.prod(work[0][0].to_local().shape[:-2]) == 0:
+        return
+    mesh = X[0].device_mesh
+    args = dict(update_args)
+    args.update(
+        shard_dim=X[0].ndim - 2 if row_axis is not None else None,
+        process_group=mesh.get_group(row_axis) if row_axis is not None else None,
+        device_rank=mesh.get_local_rank(row_axis) if row_axis is not None else 0,
+        world_size=mesh.size(row_axis) if row_axis is not None else 1,
+    )
+    yield from nordion2_update_megabatch_async(
+        X=work[0], G=work[1], M=work[2], V=work[3], **args,
+    )
+    for originals, updated in ((X, work[0]), (M, work[2]), (V, work[3])):
+        if updated is not originals:
+            restored = _redistribute_group(updated, originals[0].placements)
+            torch._foreach_copy_(to_local(originals), to_local(restored))
 
 
 def nordion2_update_megabatch_async(
